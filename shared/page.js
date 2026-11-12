@@ -19,6 +19,7 @@
  * cluster-render themes live). Plain Node 8 (the car's 8.16.2).
  */
 const G = require('./kit/gauges');
+const { t, getLanguage } = require('./kit/i18n');
 const themes = require('./kit/themes');
 const previews = require('./previews');
 const sensors = require('./sensors');
@@ -113,9 +114,9 @@ class Page {
         }
         const cluster = this.cfg.what === 'cluster';
         this.confirm = {
-            title: scr.otherName + ' is on',
+            title: scr.otherName + ' ' + t('is on'),
             lines: cluster
-                ? ['A cluster theme and the HUD can\'t show at the same time.', 'Turn HUD Widgets off so ' + this.layoutName(v) + ' shows?']
+                ? ['A cluster theme and the HUD can\'t show at the same time.', getLanguage() === 'zh-CN' ? '关闭 HUD Widgets 并显示' + this.layoutName(v) + '？' : 'Turn HUD Widgets off so ' + this.layoutName(v) + ' shows?']
                 : ['The HUD and a cluster theme can\'t show at the same time.', 'Turn the cluster theme off so ' + this.layoutName(v) + ' shows?'],
             yes: cluster ? 'Turn HUD off' : 'Turn theme off',
             run: () => { scr.claim(); this.set(key, v); },
@@ -171,8 +172,8 @@ class Page {
                 cv.roundRect(x, y + 12, 4, h - 24, 2, C.blue);
             }
             icon(cv, (TAB[id] || {}).icon, x + 34, y + h / 2, sel ? C.text : C.dim);
-            cv.text(this.tabName(id), x + 64, y + 30 - dy, 21, sel ? '#ffffff' : C.text, { font: 'bold', literal: true });
-            cv.text(this.tabValue(id), x + 64, y + 53 - dy * 1.5, 15, sel ? A(C.blueHi, 0.95) : C.dim, { literal: true });
+            cv.text(this.tabName(id), x + 64, y + 30 - dy, 21, sel ? '#ffffff' : C.text, { font: 'bold' });
+            cv.text(this.tabValue(id), x + 64, y + 53 - dy * 1.5, 15, sel ? A(C.blueHi, 0.95) : C.dim, {});
             cv.target(x, y, w, h, () => { this.tab = id; this.picker = null; this.kick(); }, 'tab:' + id, 12);
         });
     }
@@ -185,7 +186,7 @@ class Page {
             return (p.x || p.y ? 'moved' : 'centred') + ' · ' + Math.round(p.scale * 100) + ' %';
         }
         if (id === 'map') return this.get('mapInTheme') ? 'Waze map · on' : 'Waze map · off';
-        if (id === 'badge') return badges.text(this.get('badge'), this.get('badgeBMW') === true) || 'none';
+        if (id === 'badge') return badges.text(this.get('badge'), this.get('badgeBMW') === true) || t('none');
         if (id === 'alerts') { const n = WARN_KEYS.filter((k) => this.get(k) > 0).length; return n ? n + ' warning' + (n > 1 ? 's' : '') + ' on' : 'warnings off'; }
         if (id === 'gmeter') return this.optLabel('gRange', this.get('gRange')) + ' · trail ' + this.optLabel('gTrail', this.get('gTrail')).toLowerCase();
         if (id === 'colours') return this.valueText('hudTheme').replace(/ \(.*\)$/, '');
@@ -207,8 +208,8 @@ class Page {
         this.picture(cv, shown, 'big', px, py, pw, ph);
         // right: name, tag line, the drive modes side by side
         const rx = px + pw + 28, rw = CR - rx;
-        cv.text(this.layoutName(shown), rx, py + 32, 34, '#ffffff', { font: 'bold', literal: true });
-        cv.text(this.yieldNote() || this.tag(shown), rx, py + 58, 17, this.yieldNote() ? '#e0a340' : C.dim, { literal: true });
+        cv.text(this.layoutName(shown), rx, py + 32, 34, '#ffffff', { font: 'bold' });
+        cv.text(this.yieldNote() || this.tag(shown), rx, py + 58, 17, this.yieldNote() ? '#e0a340' : C.dim, {});
         const y = this.toggleRow(cv, rx, py + 72, rw, 'Change with the drive mode', 'byMode', 46);
         if (this.get('byMode') === true) {
             const now = MODE_KEY[this.hud.driveMode], cw = (rw - 24) / 3;
@@ -222,8 +223,8 @@ class Page {
             glass(cv, x, yy, gw, gh, sel);
             const ih = Math.min(gh - 34, (gw - 16) * 0.375), iw = ih / 0.375;
             this.picture(cv, v, 'small', x + (gw - iw) / 2, yy + 8, iw, ih);
-            cv.text(this.layoutName(v), x + 12, yy + gh - 10, 16, '#ffffff', { font: 'bold', literal: true });
-            cv.text(this.tag(v), x + gw - 12, yy + gh - 10, 13, C.dim, { align: 'right', literal: true });
+            cv.text(this.layoutName(v), x + 12, yy + gh - 10, 16, '#ffffff', { font: 'bold' });
+            cv.text(this.tag(v), x + gw - 12, yy + gh - 10, 13, C.dim, { align: 'right' });
             cv.target(x, yy, gw, gh, () => this.chooseLayout(this.lookKey(), v), 'look:' + v, 16);
         });
     }
@@ -232,8 +233,8 @@ class Page {
     modeCell(cv, x, y, w, name, key) {
         const h = 52;
         glass(cv, x, y, w, h, false);
-        cv.text(name, x + 14, y + 20, 14, C.dim, { literal: true });
-        cv.text(this.layoutName(this.get(key)), x + 14, y + 42, 18, C.blueHi, { font: 'bold', literal: true });
+        cv.text(name, x + 14, y + 20, 14, C.dim, {});
+        cv.text(this.layoutName(this.get(key)), x + 14, y + 42, 18, C.blueHi, { font: 'bold' });
         chevron(cv, x + w - 18, y + h / 2, C.dim);
         cv.target(x, y, w, h, () => { this.picker = { key, title: name, fmt: (v) => this.layoutName(v) }; this.kick(); }, 'set:' + key, 14);
     }
@@ -250,12 +251,12 @@ class Page {
             const ih = Math.min(ch - 82, (cw - 20) * 0.624), iw = ih / 0.624;
             this.picture(cv, v, 'big', x + (cw - iw) / 2, y + 10, iw, ih);
             const ty = y + 10 + ih + 22;
-            cv.text(v === 'off' ? 'Off' : this.layoutName(v), x + 12, ty, 17, '#ffffff', { font: 'bold', literal: true });
-            cv.text(this.tag(v), x + cw - 12, ty, 12, C.dim, { align: 'right', literal: true });
+            cv.text(v === 'off' ? 'Off' : this.layoutName(v), x + 12, ty, 17, '#ffffff', { font: 'bold' });
+            cv.text(this.tag(v), x + cw - 12, ty, 12, C.dim, { align: 'right' });
             if (v === 'off') {
                 // the off switch: BMW's own HUD in every drive mode
                 cv.target(x, y, cw, ch, () => { this.set('byMode', false); this.chooseLayout('hudLayout', 'off'); }, 'look:off', 16);
-                cv.text(sel ? 'HUD is off' : 'Tap to turn the HUD off', x + 12, ty + 30, 14, sel ? C.blueHi : C.dim, { literal: true });
+                cv.text(sel ? 'HUD is off' : 'Tap to turn the HUD off', x + 12, ty + 30, 14, sel ? C.blueHi : C.dim, {});
                 return;
             }
             cv.target(x, y, cw, ih + 20, () => this.chooseLayout(this.lookKey(), v), 'look:' + v, 16);
@@ -279,7 +280,7 @@ class Page {
         cv.roundRect(x, y, w, h, 10, '#000000');
         const p = name !== 'off' && previews.get(name, size);
         if (p) cv.image(p.id, x, y, w, h);
-        else cv.text(name === 'off' ? "BMW's own " + this.cfg.what : this.layoutName(name), x + w / 2, y + h / 2 + 7, 18, C.dim, { align: 'center', literal: true });
+        else cv.text(name === 'off' ? "BMW's own " + this.cfg.what : this.layoutName(name), x + w / 2, y + h / 2 + 7, 18, C.dim, { align: 'center' });
         cv.strokeRoundRect(x, y, w, h, 10, 1, '#ffffff10');
     }
 
@@ -309,7 +310,7 @@ class Page {
         label(cv, CX, 70, this.layoutName(lay) + ' · readout slots');
         let cx = CX;
         this.slotLayouts().forEach((v) => { cx += chip(cv, cx, 82, this.layoutName(v), v === lay, () => { this.slotLayout = v; this.kick(); }, 'slots:' + v) + 8; });
-        const rw = cv.textWidth('Reset slots', 16, { font: 'bold', literal: true }) + 30;
+        const rw = cv.textWidth('Reset slots', 16, { font: 'bold' }) + 30;
         chip(cv, CX + 700 - rw, 82, 'Reset slots', false, () => { slots.forEach((x) => this.hud.setSlot(lay, x.id, null)); this.kick(); }, 'slots:reset');
         // the slots
         // more than 8 slots (Dyno's 13): two columns of compact rows, the name and value only
@@ -322,12 +323,12 @@ class Page {
             cv.circle(x + 26, y + rh / 2, 14, sel ? C.blue : A(C.blue, 0.75));
             cv.text(String(i + 1), x + 26, y + rh / 2 + 6, 15, '#ffffff', { align: 'center', font: 'bold', literal: true });
             if (two) {
-                cv.text(sn ? sn.head : '--', x + 50, y + rh / 2 - 1, 17, '#ffffff', { font: 'bold', literal: true });
-                cv.text(sl.where || '', x + 50, y + rh / 2 + 16, 13, C.dim, { literal: true });
+                cv.text(sn ? sn.head : '--', x + 50, y + rh / 2 - 1, 17, '#ffffff', { font: 'bold' });
+                cv.text(sl.where || '', x + 50, y + rh / 2 + 16, 13, C.dim, {});
                 cv.text(this.sensorText(sn), x + sw - 32, y + rh / 2 + 6, 17, C.live, { align: 'right', font: 'bold', literal: true });
             } else {
-                cv.text(sn ? sn.name : '--', x + 60, y + rh / 2 - 1, 19, '#ffffff', { font: 'bold', literal: true });
-                cv.text(sl.where || '', x + 60, y + rh / 2 + 18, 14, C.dim, { literal: true });
+                cv.text(sn ? sn.name : '--', x + 60, y + rh / 2 - 1, 19, '#ffffff', { font: 'bold' });
+                cv.text(sl.where || '', x + 60, y + rh / 2 + 18, 14, C.dim, {});
                 cv.text(this.sensorText(sn), x + sw - 40, y + rh / 2 + 7, 20, C.live, { align: 'right', font: 'bold', literal: true });
             }
             chevron(cv, x + sw - 18, y + rh / 2, C.dim);
@@ -346,7 +347,7 @@ class Page {
             const y = py + 94 + i * lh, sel = cur && cur.id === sn.id;
             if (sel) cv.roundRect(px + 10, y, pw - 20, lh - 4, 10, A(C.blue, 0.35));
             else if (i) cv.fillRect(px + 20, y - 2, pw - 40, 1, C.line);
-            cv.text(sn.name, px + 24, y + lh / 2 + 4, 18, sel ? '#ffffff' : C.text, { font: sel ? 'bold' : 'label', literal: true });
+            cv.text(sn.name, px + 24, y + lh / 2 + 4, 18, sel ? '#ffffff' : C.text, { font: sel ? 'bold' : 'label' });
             cv.text(this.sensorText(sn), px + pw - 24, y + lh / 2 + 4, 17, sel ? '#ffffff' : C.dim, { align: 'right', literal: true });
             cv.target(px + 10, y, pw - 20, lh - 4, () => { this.hud.setSlot(lay, this.slot, sn.id); this.kick(); }, 'sensor:' + sn.id, 10);
         });
@@ -367,7 +368,7 @@ class Page {
             cv.clip(bx, by, bw, bh);
             cv.image(pic.id, bx + (cx * (1 - s) + p.x) * k, by + (cy * (1 - s) + p.y) * k, 800 * k * s, 480 * k * s);
             cv.noclip();
-        } else cv.text(shown === 'off' ? "BMW's own HUD" : 'no picture', bx + bw / 2, by + bh / 2 + 7, 18, C.dim, { align: 'center', literal: true });
+        } else cv.text(shown === 'off' ? "BMW's own HUD" : 'no picture', bx + bw / 2, by + bh / 2 + 7, 18, C.dim, { align: 'center' });
         const v = visible.HUD_WINDOW;
         dashed(cv, bx + v.x * k, by + v.y * k, v.w * k, v.h * k, A(C.blueHi, 0.9));
         cv.strokeRoundRect(bx, by, bw, bh, 10, 1, '#ffffff14');
@@ -401,7 +402,7 @@ class Page {
         if (this.get('mapInTheme') && !this.hud.mapLayout && this.hud.activeName !== 'off') text = 'This theme has no map version (GT3, Sport and M do)';
         glass(cv, CX, y, w, 46, false);
         cv.circle(CX + 26, y + 23, 7, info.up ? C.live : info.ok ? C.dim : '#e0a340');
-        cv.text(text, CX + 46, y + 30, 18, info.up ? C.live : C.text, { literal: true });
+        cv.text(text, CX + 46, y + 30, 18, info.up ? C.live : C.text, {});
         y += 54;
         note(cv, CX, y + 26, [
             'On: GT3, Sport and M open a window in the middle and Waze on Cluster draws its map in it, above',
@@ -434,11 +435,11 @@ class Page {
         label(cv, rx, 70, 'On the cluster');
         cv.card(rx, 82, rw, 110, 16, [[0, '#000000'], [1, '#05070a']]);
         cv.strokeRoundRect(rx, 82, rw, 110, 16, 1, C.line);
-        cv.text(shown || 'No badge', rx + rw / 2, 148, shown ? 34 : 22, shown ? '#ffffff' : C.dim, { align: 'center', font: 'bold', literal: true });
+        cv.text(shown || t('No badge'), rx + rw / 2, 148, shown ? 34 : 22, shown ? '#ffffff' : C.dim, { align: 'center', font: 'bold', literal: true });
         let y = 204;
         y = this.toggleRow(cv, rx, y, rw, 'BMW lettering', 'badgeBMW');
         glass(cv, rx, y, rw, 56, model === 'none');
-        cv.text('No badge', rx + 18, y + 35, 19, C.text, { literal: true });
+        cv.text('No badge', rx + 18, y + 35, 19, C.text, {});
         cv.target(rx, y, rw, 56, () => this.set('badge', 'none'), 'badge:none', 14);
         note(cv, rx, y + 92, ['Drawn as text in the theme\'s own font.', 'GT3: top left. Sport and M: bottom centre.']);
     }
@@ -456,9 +457,10 @@ class Page {
         const testing = this.hud.shiftTesting && this.hud.shiftTesting();
         const d = this.hud.car && this.hud.car.data(), moving = d && !d.demo && d.speed > 3;
         this.rowBox(cv, CX, y, w, 'Test the shift lights', 56);
-        const bt = testing ? 'Running' : moving ? 'Stop the car first' : 'Run test', bw = cv.textWidth(bt, 16, { font: 'bold', literal: true }) + 40;
+        const bt = testing ? 'Running' : moving ? 'Stop the car first' : 'Run test';
+        const bw = cv.textWidth(bt, 16, { font: 'bold' }) + 40;
         cv.roundRect(CX + w - bw - 14, y + 10, bw, 36, 18, testing || moving ? '#ffffff12' : C.blue);
-        cv.text(bt, CX + w - 14 - bw / 2, y + 34, 16, testing || moving ? C.dim : '#ffffff', { align: 'center', font: 'bold', literal: true });
+        cv.text(bt, CX + w - 14 - bw / 2, y + 34, 16, testing || moving ? C.dim : '#ffffff', { align: 'center', font: 'bold' });
         if (!testing && !moving) {
             cv.target(CX, y, w, 56, () => {
                 if (this.hud.testShift()) { this.kick(); setTimeout(() => this.kick(), 4000); }
@@ -483,17 +485,17 @@ class Page {
         y = this.toggleRow(cv, CX + hw + 12, y, hw, 'Brake on top', 'gFlipLong');
         // the bests this drive (the car's left / right: gFlipLat turns its sign round)
         glass(cv, CX, y, lw, 104, false);
-        cv.text('BEST THIS DRIVE, IN G', CX + 18, y + 26, 13, C.label, { font: 'bold', spacing: 2, literal: true });
+        cv.text('BEST THIS DRIVE, IN G', CX + 18, y + 26, 13, C.label, { font: 'bold', spacing: 2 });
         const b = g ? g.best : null, sw = this.get('gFlipLat') === true;
         const cols = [['Left', b && (sw ? b.right : b.left)], ['Right', b && (sw ? b.left : b.right)], ['Accel', b && b.accel], ['Brake', b && b.brake], ['Peak', b && b.total]];
         cols.forEach((c, i) => {
             const x = CX + 18 + i * 118;
             cv.text(c[1] > 0 ? c[1].toFixed(2) : '--', x, y + 66, 28, i === 4 ? '#ffffff' : C.text, { font: 'bold', literal: true });
-            cv.text(c[0], x, y + 90, 15, C.dim, { literal: true });
+            cv.text(c[0], x, y + 90, 15, C.dim, {});
         });
         const bw = 150, bx = CX + lw - bw - 18, by = y + 34;
         cv.roundRect(bx, by, bw, 40, 20, '#ffffff14');
-        cv.text('Reset', bx + bw / 2, by + 26, 17, C.text, { align: 'center', font: 'bold', literal: true });
+        cv.text('Reset', bx + bw / 2, by + 26, 17, C.text, { align: 'center', font: 'bold' });
         cv.target(bx, by, bw, 40, () => { if (this.hud.resetG) this.hud.resetG(); this.kick(); }, 'g:reset', 20);
         y += 112;
         note(cv, CX, y + 22, [
@@ -517,8 +519,8 @@ class Page {
         cv.line(cx, cy - r + 8, cx, cy + r - 8, 1, '#ffffff30');
         cv.text(max.toFixed(1) + ' g', cx + r * 0.72 + 4, cy - r * 0.72 - 2, 14, C.dim, { literal: true });
         const flipL = this.get('gFlipLong') === true;
-        cv.text(flipL ? 'BRAKE' : 'ACCEL', cx, cy - r + 26, 13, C.label, { align: 'center', font: 'bold', spacing: 1.5, literal: true });
-        cv.text(flipL ? 'ACCEL' : 'BRAKE', cx, cy + r - 14, 13, C.label, { align: 'center', font: 'bold', spacing: 1.5, literal: true });
+        cv.text(flipL ? 'BRAKE' : 'ACCEL', cx, cy - r + 26, 13, C.label, { align: 'center', font: 'bold', spacing: 1.5 });
+        cv.text(flipL ? 'ACCEL' : 'BRAKE', cx, cy + r - 14, 13, C.label, { align: 'center', font: 'bold', spacing: 1.5 });
         cv.text('L', cx - r + 16, cy - 6, 13, C.label, { align: 'center', font: 'bold', literal: true });
         cv.text('R', cx + r - 16, cy - 6, 13, C.label, { align: 'center', font: 'bold', literal: true });
         const P = (x, y) => { const m = Math.sqrt(x * x + y * y), s = m > max ? max / m : 1; return [cx + x * s * k, cy + y * s * k]; };
@@ -566,7 +568,7 @@ class Page {
             else this.pickRow(cv, x, y, colW, s.label, k);
         });
         // what the engine says it is doing (layers, pixel memory, why nothing shows): for checking on the car
-        cv.text(this.hud.lastStatus || '', CX, bottom - 6, 15, C.label, { literal: true });
+        cv.text(this.hud.lastStatus || '', CX, bottom - 6, 15, C.label, {});
     }
 
     /* ---------- rows ---------- */
@@ -574,7 +576,7 @@ class Page {
     rowBox(cv, x, y, w, name, h) {
         glass(cv, x, y, w, h, false);
         const base = y + h / 2 + 7;
-        cv.text(name, x + 18, base, 19, C.text, { literal: true });
+        cv.text(name, x + 18, base, 19, C.text, {});
         return base;
     }
     toggleRow(cv, x, y, w, name, key, h) {
@@ -590,7 +592,7 @@ class Page {
         h = h || 56;
         const base = this.rowBox(cv, x, y, w, name, h);
         const v = this.get(key), text = fmt ? fmt(v) : this.valueText(key);
-        cv.text(text, x + w - 40, base, 19, C.blueHi, { align: 'right', font: 'bold', literal: true });
+        cv.text(text, x + w - 40, base, 19, C.blueHi, { align: 'right', font: 'bold' });
         chevron(cv, x + w - 24, y + h / 2, C.dim);
         cv.target(x, y, w, h, () => { this.picker = { key, title: name, fmt }; this.kick(); }, 'set:' + key, 14);
         return y + h + (h < 56 ? 6 : 8);
@@ -600,13 +602,13 @@ class Page {
         const s = this.item(key), steps = s.steps || [], i = steps.indexOf(this.get(key));
         const bx = x + w - 66, ax = bx - 236;
         stepBtn(cv, ax, y + 9, '-', i > 0, () => this.set(key, steps[i - 1]), 'dn:' + key);
-        cv.text(fmt ? fmt(this.get(key)) : this.valueText(key), ax + 140, y + 35, 19, C.blueHi, { align: 'center', font: 'bold', literal: true });
+        cv.text(fmt ? fmt(this.get(key)) : this.valueText(key), ax + 140, y + 35, 19, C.blueHi, { align: 'center', font: 'bold' });
         stepBtn(cv, bx, y + 9, '+', i < steps.length - 1, () => this.set(key, steps[i + 1]), 'up:' + key);
         return y + 64;
     }
     chipRow(cv, x, y, w, name, key) {
         glass(cv, x, y, w, 64, false);
-        cv.text(name, x + 18, y + 39, 19, C.text, { literal: true });
+        cv.text(name, x + 18, y + 39, 19, C.text, {});
         const s = this.item(key), v = this.get(key);
         let cx = x + 220;
         (s.options || []).forEach((o) => { cx += chip(cv, cx, y + 14, o[1], o[0] === v, () => this.set(key, o[0]), 'opt:' + key + ':' + o[0]) + 10; });
@@ -620,13 +622,13 @@ class Page {
         const w = 620, rh = 58, h = 76 + opts.length * rh, x = (W - w) / 2, y = Math.max(52, (bottom + 44 - h) / 2);
         cv.card(x, y, w, h, 18, [[0, '#18233a'], [1, '#0c111b']]);
         cv.strokeRoundRect(x, y, w, h, 18, 1, A(C.blueHi, 0.3));
-        cv.text(p.title.toUpperCase(), x + 26, y + 42, 15, C.label, { font: 'bold', spacing: 2.4, literal: true });
+        cv.text(p.title.toUpperCase(), x + 26, y + 42, 15, C.label, { font: 'bold', spacing: 2.4 });
         const v = this.get(p.key);
         opts.forEach((o, i) => {
             const ry = y + 60 + i * rh, sel = o[0] === v;
             if (sel) cv.roundRect(x + 12, ry, w - 24, rh - 6, 12, A(C.blue, 0.35));
             const text = p.fmt ? p.fmt(o[0]) : o[1] !== null ? o[1] : fmtInt(o[0]) + ' rpm';
-            cv.text(text, x + 30, ry + 34, 20, sel ? '#ffffff' : C.text, { font: sel ? 'bold' : 'label', literal: true });
+            cv.text(text, x + 30, ry + 34, 20, sel ? '#ffffff' : C.text, { font: sel ? 'bold' : 'label' });
             if (sel) check(cv, x + w - 50, ry + 26, '#ffffff');
             cv.target(x + 12, ry, w - 24, rh - 6, () => {
                 this.picker = null;
@@ -643,16 +645,16 @@ class Page {
         const w = 720, h = 96 + q.lines.length * 30 + 84, x = (W - w) / 2, y = Math.max(52, (bottom + 44 - h) / 2);
         cv.card(x, y, w, h, 18, [[0, '#18233a'], [1, '#0c111b']]);
         cv.strokeRoundRect(x, y, w, h, 18, 1, A(C.blueHi, 0.3));
-        cv.text(q.title, x + 32, y + 56, 28, '#ffffff', { font: 'bold', literal: true });
-        q.lines.forEach((s, i) => cv.text(s, x + 32, y + 98 + i * 30, 19, C.text, { literal: true }));
+        cv.text(q.title, x + 32, y + 56, 28, '#ffffff', { font: 'bold' });
+        q.lines.forEach((s, i) => cv.text(s, x + 32, y + 98 + i * 30, 19, C.text, {}));
         const bh = 52, by = y + h - bh - 24;
-        const yw = cv.textWidth(q.yes, 18, { font: 'bold', literal: true }) + 56, yx = x + w - 32 - yw;
+        const yw = cv.textWidth(q.yes, 18, { font: 'bold' }) + 56, yx = x + w - 32 - yw;
         cv.roundRect(yx, by, yw, bh, bh / 2, C.blue);
-        cv.text(q.yes, yx + yw / 2, by + 33, 18, '#ffffff', { align: 'center', font: 'bold', literal: true });
+        cv.text(q.yes, yx + yw / 2, by + 33, 18, '#ffffff', { align: 'center', font: 'bold' });
         cv.target(yx, by, yw, bh, () => { this.confirm = null; q.run(); this.kick(); }, 'confirm:yes', bh / 2);
         const nw = 150, nx = yx - 16 - nw;
         cv.roundRect(nx, by, nw, bh, bh / 2, '#ffffff14');
-        cv.text('Cancel', nx + nw / 2, by + 33, 18, C.text, { align: 'center', font: 'bold', literal: true });
+        cv.text('Cancel', nx + nw / 2, by + 33, 18, C.text, { align: 'center', font: 'bold' });
         cv.target(nx, by, nw, bh, close, 'confirm:no', bh / 2);
         cv.target(0, 36, W, bottom, close, 'confirm:close');
     }
@@ -670,8 +672,8 @@ function warnText(k, v, us) {
 /** a "timeZone" setting value as the row shows it (shared/tz.js) */
 function tzText(v) { return tz.name(v); }
 function fmtInt(n) { return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
-function label(cv, x, y, s) { cv.text(s.toUpperCase(), x, y, 14, C.label, { font: 'bold', spacing: 2.4, literal: true }); }
-function note(cv, x, y, lines) { lines.forEach((s, i) => cv.text(s, x, y + i * 26, 17, C.dim, { literal: true })); }
+function label(cv, x, y, s) { cv.text(s.toUpperCase(), x, y, 14, C.label, { font: 'bold', spacing: 2.4 }); }
+function note(cv, x, y, lines) { lines.forEach((s, i) => cv.text(s, x, y + i * 26, 17, C.dim, {})); }
 function glass(cv, x, y, w, h, sel) {
     if (sel) {
         cv.card(x, y, w, h, 16, [[0, A(C.blue, 0.16)], [1, A(C.blueDeep, 0.05)]]);
@@ -682,17 +684,17 @@ function glass(cv, x, y, w, h, sel) {
     }
 }
 function chip(cv, x, y, text, on, run, key) {
-    const w = cv.textWidth(text, 16, { font: 'bold', literal: true }) + 30, h = 36;
+    const w = cv.textWidth(text, 16, { font: 'bold' }) + 30, h = 36;
     cv.roundRect(x, y, w, h, h / 2, on ? C.blue : '#ffffff12');
-    cv.text(text, x + w / 2, y + 24, 16, on ? '#ffffff' : C.off, { align: 'center', font: 'bold', literal: true });
+    cv.text(text, x + w / 2, y + 24, 16, on ? '#ffffff' : C.off, { align: 'center', font: 'bold' });
     cv.target(x, y, w, h, run, key, h / 2);
     return w;
 }
 /** A small chip (the HUD cards' drive modes). */
 function miniChip(cv, x, y, text, on, run, key) {
-    const w = cv.textWidth(text, 13, { font: 'bold', literal: true }) + 18, h = 28;
+    const w = cv.textWidth(text, 13, { font: 'bold' }) + 18, h = 28;
     cv.roundRect(x, y, w, h, h / 2, on ? C.blue : '#ffffff12');
-    cv.text(text, x + w / 2, y + 19, 13, on ? '#ffffff' : C.off, { align: 'center', font: 'bold', literal: true });
+    cv.text(text, x + w / 2, y + 19, 13, on ? '#ffffff' : C.off, { align: 'center', font: 'bold' });
     cv.target(x, y, w, h, run, key, h / 2);
     return w;
 }
@@ -720,7 +722,7 @@ function padBtn(cv, x, y, s, what, run, key) {
     else if (what === 'down') cv.quad([[cx, cy + a], [cx - a, cy - a * 0.7], [cx, cy - a * 0.7], [cx + a, cy - a * 0.7]], c);
     else if (what === 'left') cv.quad([[cx - a, cy], [cx + a * 0.7, cy - a], [cx + a * 0.7, cy], [cx + a * 0.7, cy + a]], c);
     else if (what === 'right') cv.quad([[cx + a, cy], [cx - a * 0.7, cy + a], [cx - a * 0.7, cy], [cx - a * 0.7, cy - a]], c);
-    else cv.text('Centre', cx, cy + 6, 17, C.blueHi, { align: 'center', font: 'bold', literal: true });
+    else cv.text('Centre', cx, cy + 6, 17, C.blueHi, { align: 'center', font: 'bold' });
     cv.target(x, y, s, s, run, key, 16);
 }
 function chevron(cv, x, y, c) { cv.line(x - 4, y - 7, x + 3, y, 2.5, c); cv.line(x + 3, y, x - 4, y + 7, 2.5, c); }

@@ -1,5 +1,7 @@
 <h1 align="center">bimmer-lab apps</h1>
 
+[简体中文](README.zh-CN.md)
+
 <p align="center">Apps for BMW iDrive 7 head units (MGU), installed through the community MGU Store.</p>
 
 <p align="center"><img src="docs/images/cluster-gt3.gif" width="900" alt="GT3 race dash on the instrument cluster"></p>
