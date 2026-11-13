@@ -2,7 +2,7 @@
   "id": "idrive_hud_widgets",
   "title": "HUD Widgets",
   "description": "Gear, shift lights, boost, oil, coolant and intake temperatures, a G-meter and trip figures on the windshield HUD, in Classic, M or Night themes",
-  "version": "0.12.8",
+  "version": "0.12.9",
   "vendor": "custom",
   "loggingId": "OAH1",
   "iconGlyph": "HUD",
@@ -26,7 +26,8 @@
     "badges.js",
     "screen.js",
     "runs.js",
-    "tz.js"
+    "tz.js",
+    "holidays.js"
   ],
   "signals": {
     "de.bmw.infotainment.vehicle.CDS": {

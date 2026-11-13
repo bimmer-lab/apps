@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bake the HUD's bitmap font atlases from the Barlow TTFs in tools/fonts-src/.
+"""Bake the HUD's bitmap font atlases from the TTFs in tools/fonts-src/ (Barlow, Michroma, Orbitron, DSEG7, Outfit).
 
     UV_CACHE_DIR=... uv run --no-project --with pillow python tools/bake_fonts.py [app_id ...]
 
@@ -92,6 +92,13 @@ CLUSTER_FONTS = [
     # Cruise: calm, light numbers
     ('c_speed', 'BarlowSemiCondensed-Medium.ttf', 150, DIGITS + '-'),
     ('c_val', 'BarlowSemiCondensed-Medium.ttf', 62, DIGITS + '.:-+°'),
+    # Ribbon: Outfit (SIL OFL), thin and calm: the huge speed, the side readouts, small spaced labels
+    ('b_speed', 'Outfit[wght].ttf', 250, DIGITS + '-', 0, 'ExtraLight'),
+    ('b_val', 'Outfit[wght].ttf', 44, DIGITS + '.:-+°% ' + LOWER + UPPER, 0, 'Light'),
+    ('b_label', 'Outfit[wght].ttf', 20, UPPER + DIGITS + "' .-", 0, 'SemiBold'),
+    ('b_unit', 'Outfit[wght].ttf', 26, UPPER + LOWER + '/', 0, 'Medium'),
+    ('b_gear', 'Outfit[wght].ttf', 32, DIGITS + 'PRNDSM-', 0, 'SemiBold'),
+    ('b_scale', 'Outfit[wght].ttf', 20, DIGITS, 0, 'Medium'),
 ]
 FONTS = {'idrive_hud_widgets': HUD_FONTS, 'cluster_themes': CLUSTER_FONTS}
 PAD = 2

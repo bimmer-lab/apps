@@ -127,6 +127,18 @@
  *             "warn" while its oil / coolant / boost reading is over the warning limit (put "warnFlash": false on
  *             its texts). Roles "fill" (panel), "line", "trackColor" (track); "radius" (8), "border" (1.5), "strip"
  *             (3), "barH" (6) px. The labels and values are text widgets on top.
+ *   ribbon    effect layer (shaders.js ribbon): the Ribbon theme's rev line, one smooth curve under the hood line, panel px:
+ *             y = a u^2 + b u + c with u = (x - cx) / half, "curve" [a, b, c], "span" [x0, x1, cx, half]; lit up to rpm / the bar
+ *             max, coloured by the theme's "ribbon" { stops: 5 rgb, at: [4 of 0..1] } with a glow, a dot at every thousand (the
+ *             last two red). "dip" px: while "Leave room for the driver camera" is on, the middle drops this far (the ends stay)
+ *             so the line passes under the camera. A theme with "bulbs": true draws a string of Christmas bulbs instead.
+ *             Its numbers are text widgets toggled by the virtual setting "ribScale" (thousands on the scale, "c" added
+ *             while the camera dip is on: "7", "7c").
+ *   deco      effect layer (shaders.js deco): the Ribbon theme's whole backdrop: role "bg" over the panel, a rounded frame
+ *             "pill" [x, y, w, h] (role "accent") round the gear, and the theme's holiday art ("deco": 1 snow, 2 Halloween,
+ *             3 Fourth of July, 4 New Year, 5 Thanksgiving; colours "decoColors" [3 rgb]) kept out of "keep" [[x0, y0, x1,
+ *             y1] x up to 4]. The holiday comes from the "holiday" setting (shared/holidays.js): a layout whose theme has
+ *             "holidays": true is drawn in "<theme>_<holiday>" while one is on.
  * Any image widget: "own": true gives it its own image layer instead of a place in a packed sheet (above).
  * Any widget: "conn": 0..3 puts its layer (or its sheet) on that connection to cluster-render. The 8-layer limit
  *   is per connection, so a second socket from the same app gets another 8 (DukeAPenguin saw 28 layers over four
@@ -213,6 +225,7 @@ const Screen = require('./screen');
 const badges = require('./badges');
 const Runs = require('./runs');
 const tz = require('./tz');
+const holidays = require('./holidays');
 // sharing the HUD with other kit apps (Redline, issue #4): kit/runtime/hud_claim.js, from cauliflowermossgrape's kit
 // (MIT). HUD Widgets is a "standing" app, like Cluster functions: it gives way while another app holds a fresh
 // claim, and says it is on so that app hands the HUD back at the car's switch-off.
@@ -592,6 +605,8 @@ class HudApp {
     setting(key) {
         // "mapUp": not saved, the Waze map is showing inside the theme now (the setting on, waze.js says so)
         if (key === 'mapUp') return !!(this.waze && this.waze.up && this.ctx.settings.get('mapInTheme') === true);
+        // "ribScale": not saved, the Ribbon's scale numbers to show: thousands on the bar, "c" while the camera dip is on
+        if (key === 'ribScale') return String(this._barMax() / 1000) + (this._cameraOn() ? 'c' : '');
         const s = this.ctx.settings.item(key);
         const v = this.ctx.settings.get(key);
         if (!s) return v;
@@ -1058,7 +1073,13 @@ class HudApp {
 /* ---------------- theme, units, values ---------------- */
 
     _themeName() {
-        if (this.layoutTheme) return this.layoutTheme;
+        if (this.layoutTheme) {
+            // a theme with holiday editions (Ribbon): "<theme>_<holiday>" while the "holiday" setting picks one
+            const base = THEMES[this.layoutTheme];
+            if (!base || !base.holidays || !this.ctx.settings.item('holiday')) return this.layoutTheme;
+            const d = this._localDate(), h = holidays.pick(this.setting('holiday'), d.y, d.m, d.d);
+            return h && THEMES[this.layoutTheme + '_' + h] ? this.layoutTheme + '_' + h : this.layoutTheme;
+        }
         const t = this.setting('hudTheme');
         if (t !== 'auto') return t;
         return sun.isNight(Date.now(), ...this._sunPlace()) ? 'night' : this.setting('dayTheme');
@@ -1352,6 +1373,8 @@ class HudApp {
             case 'oil': case 'coolant': { const v = this._raw(tok); return fix(isNum(v) ? (us ? v * 9 / 5 + 32 : v) : v, 0); }
             case 'boost': { const v = this._raw('boost'); return us ? fix(isNum(v) ? v * 14.5038 : v, 1) : fix(v, 2); }
             case 'u:boost': return us ? 'PSI' : 'BAR';
+            case 'u:boostLc': return us ? 'psi' : 'bar';
+            case 'holiday': return this.theme.greeting || '';
             case 'u:temp': return us ? '°F' : '°C';
             case 'u:speedLc': return us ? 'mph' : 'km/h';
             case 'u:distLc': return us ? 'mi' : 'km';
@@ -1460,6 +1483,16 @@ class HudApp {
         if (!isNum(off)) return new Date();
         const d = new Date(Date.now() + off * 60000);
         return { getHours: () => d.getUTCHours(), getMinutes: () => d.getUTCMinutes() };
+    }
+
+    /** Today's local date { y, m (1..12), d } by the same time zone as the clock (_now). */
+    _localDate() {
+        const setting = this.ctx.settings.item('timeZone') ? this.setting('timeZone') : TZ_AUTO;
+        const zoned = tz.offset(setting);
+        const off = isNum(zoned) ? zoned : this.config.utcOffsetMinutes;
+        if (!isNum(off)) { const n = new Date(); return { y: n.getFullYear(), m: n.getMonth() + 1, d: n.getDate() }; }
+        const n = new Date(Date.now() + off * 60000);
+        return { y: n.getUTCFullYear(), m: n.getUTCMonth() + 1, d: n.getUTCDate() };
     }
 
     /**
@@ -1870,6 +1903,36 @@ class HudApp {
             c.uniform(ref, 'u_red', rgb(LIGHTS.red));
             c.uniform(ref, 'u_blue', rgb(LIGHTS.blue));
             c.uniform(ref, 'u_off', [w.off === undefined ? 0.14 : w.off]);
+        } else if (w.type === 'ribbon') {
+            const R = t.ribbon || { stops: [t.fg, t.fg, t.fg, t.hot, t.hot], at: [0.5, 0.8, 0.9, 1] };
+            c.uniform(ref, 'u_size', [w.w, w.h]);
+            c.uniform(ref, 'u_org', [w.x, w.y]);
+            c.uniform(ref, 'u_curve', w.curve.concat([this._cameraOn() ? w.dip || 0 : 0]));
+            c.uniform(ref, 'u_span', w.span);
+            [0, 1, 2, 3, 4].forEach((i) => c.uniform(ref, 'u_c' + i, rgb(R.stops[i])));
+            c.uniform(ref, 'u_at', R.at);
+            c.uniform(ref, 'u_track', rgba(t.track));
+            c.uniform(ref, 'u_dot', rgb(t.dim));
+            c.uniform(ref, 'u_red', rgb(t.hot));
+            c.uniform(ref, 'u_wire', rgb(t.wire || t.dim));
+            c.uniform(ref, 'u_n', [this._barMax() / 1000]);
+            c.uniform(ref, 'u_bulbs', [t.bulbs ? 1 : 0]);
+            c.uniform(ref, 'u_value', [0]);
+            c.uniform(ref, 'u_flash', [0]);
+        } else if (w.type === 'deco') {
+            const D = t.decoColors || [t.accent, t.fg, t.dim], keep = (w.keep || []).slice(0, 4);
+            c.uniform(ref, 'u_size', [w.w, w.h]);
+            c.uniform(ref, 'u_mode', [t.deco || 0]);
+            c.uniform(ref, 'u_bg', rgba(color(t, w.color || 'bg')));
+            c.uniform(ref, 'u_a', rgb(D[0]));
+            c.uniform(ref, 'u_b', rgb(D[1]));
+            c.uniform(ref, 'u_c', rgb(D[2]));
+            c.uniform(ref, 'u_pill', w.pill ? [w.pill[0] - w.x, w.pill[1] - w.y, w.pill[2], w.pill[3]] : [0, 0, 0, 0]);
+            c.uniform(ref, 'u_pc', rgb(color(t, 'accent')));
+            [0, 1, 2, 3].forEach((i) => {
+                const k = keep[i];
+                c.uniform(ref, 'u_k' + i, k ? [k[0] - w.x, k[1] - w.y, k[2] - w.x, k[3] - w.y] : [0, 0, 0, 0]);
+            });
         } else if (w.type === 'fill') {
             c.uniform(ref, 'u_size', [w.w, w.h]);
             c.uniform(ref, 'u_color', rgba(color(t, w.color || 'bg')));
@@ -2104,6 +2167,15 @@ class HudApp {
                 x.c.uniform(x.ref, 'u_trail', pts, { type: 'vec4' });
                 x.c.uniform(x.ref, 'u_trailN', [n]);
             }
+        } else if (w.type === 'ribbon') {
+            const rpm = this._raw('rpm');
+            const v = isNum(rpm) ? Math.min(1, Math.max(0, rpm / this._barMax())) : 0;
+            const q = Math.round(v * 400) / 400;                    // 400 steps along the line: smooth, few messages
+            const key = q + (this.flash ? 'f' : '');
+            if (!force && key === x.last) return;
+            x.last = key;
+            x.c.uniform(x.ref, 'u_value', [q]);
+            x.c.uniform(x.ref, 'u_flash', [this.flash ? 1 : 0]);
         } else if (w.type === 'shiftbar' || w.type === 'revarc') {
             const rpm = this._raw('rpm');
             const segs = w.segments || (w.type === 'revarc' ? 30 : 40);
