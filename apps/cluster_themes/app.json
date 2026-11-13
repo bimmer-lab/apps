@@ -2,7 +2,7 @@
   "id": "cluster_themes",
   "title": "Cluster Themes",
   "description": "Redraws the instrument cluster: GT3 race dash, M-style, Sport, Minimal, Roadster, Track, Drag, Rally, Retro 80s, Cruise, Dyno (BMW-coloured readout tiles) or Ribbon (with holiday editions), with shift lights, boost, temps, tyres, a G-meter and a 0-60 timer",
-  "version": "0.15.0",
+  "version": "0.16.0",
   "vendor": "custom",
   "loggingId": "OAC1",
   "iconGlyph": "CLU",
@@ -15,6 +15,7 @@
     "shaders.js",
     "icons.js",
     "shift_score.js",
+    "demo_script.js",
     "sun.js",
     "cluster_render_client.js",
     "calibration.js",
@@ -27,7 +28,11 @@
     "screen.js",
     "runs.js",
     "tz.js",
-    "holidays.js"
+    "holidays.js",
+    "vehicle_state.js",
+    "shift_cue.js",
+    "smart_temps.js",
+    "hud_holiday.js"
   ],
   "signals": {
     "de.bmw.infotainment.vehicle.CDS": {
@@ -78,6 +83,10 @@
     },
     "de.bmw.infrastructure.EnvironmentalInformation": {
       "ExteriorTemperature": "s"
+    },
+    "de.bmw.infrastructure.VehicleCondition": {
+      "VehicleCondition": "s",
+      "_optional": "the car switching off: no new layer while it does (cluster-render's switch-off guard)"
     }
   },
   "screens": [
@@ -587,6 +596,28 @@
       "default": true
     },
     {
+      "key": "shiftCue",
+      "label": "Shift lights",
+      "type": "choice",
+      "default": "countin",
+      "options": [
+        [
+          "countin",
+          "Count in, by how fast the revs climb"
+        ],
+        [
+          "rpm",
+          "Fixed rpm band, as before"
+        ]
+      ]
+    },
+    {
+      "key": "smartTemps",
+      "label": "Show temperatures only when they matter",
+      "type": "bool",
+      "default": false
+    },
+    {
       "key": "showBoost",
       "label": "Show boost",
       "type": "bool",
@@ -621,10 +652,6 @@
         [
           "xmas",
           "Christmas"
-        ],
-        [
-          "halloween",
-          "Halloween"
         ],
         [
           "thanks",

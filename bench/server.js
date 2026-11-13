@@ -250,7 +250,7 @@ const renderServer = net.createServer((sock) => {
                     if (!m.fs) return refuse('layer', m.ref, 'effect without fs');
                     nl.fs = m.fs; nl.time = !!m.time; nl.binds = {};
                     try {
-                        const b = shaderBudget.layer(m.fs, nl.w, nl.h);
+                        const b = shaderBudget.layer(m.fs, nl.w, nl.h, m.target);
                         if (b.level !== 'ok') log('warn', 'layer ' + m.ref + ' (effect ' + nl.w + 'x' + nl.h + ') shader budget: ' + b.text);
                     } catch (e) { log('warn', 'layer ' + m.ref + ': shader budget check failed: ' + e.message); }
                 } else {
@@ -373,7 +373,8 @@ const renderServer = net.createServer((sock) => {
 
 let child = null;
 let signals = { t: 'signals', mode: 'demo', values: {} };
-let drive = { t: 'drive', value: null };   // the drive mode buttons (FES actualValueModeDrivingExperience), null = car hasn't said
+let drive = { t: 'drive', value: null };
+let fakeNav = null;                         // the fake route (POST /nav, fake-nav.js), replayed to a restarted app   // the drive mode buttons (FES actualValueModeDrivingExperience), null = car hasn't said
 let restartTimer = null;
 let stopping = false;
 
@@ -404,6 +405,7 @@ function startApp() {
     child = fork(path.join(__dirname, 'run-app.js'), [STAGE, DATA_DIR], opts);
     const c = child;
     if (drive.value !== null) c.send(drive);
+    if (fakeNav) c.send(fakeNav);
     const pipe = (stream, level) => {
         let rest = '';
         stream.on('data', (d) => {
@@ -507,6 +509,22 @@ const web = http.createServer(async (req, res) => {
         if (!child) { res.writeHead(409); return res.end('app not running'); }
         child.send({ t: 'shiftTest' });
         log('info', 'bench: shift-light test');
+        res.writeHead(204); return res.end();
+    }
+    if (req.method === 'POST' && url === '/nav') {
+        // a fake route for the HUD's directions (fake-nav.js): turn, roundabout, lanes, then, uturn, off
+        const b = await body(req);
+        fakeNav = { t: 'nav', scenario: String(b.scenario || 'off') };
+        if (child) child.send(fakeNav);
+        log('info', 'bench: directions ' + fakeNav.scenario);
+        res.writeHead(204); return res.end();
+    }
+    if (req.method === 'POST' && url === '/demo') {
+        // the page's "Play demo" / "Stop demo" button (hud.playDemo / hud.stopDemo); body { play: true | false, at: ms into the show }
+        const b = await body(req);
+        if (!child) { res.writeHead(409); return res.end('app not running'); }
+        child.send({ t: 'demo', play: b.play !== false, at: Number(b.at) || 0 });
+        log('info', 'bench: ' + (b.play !== false ? 'play' : 'stop') + ' the demo');
         res.writeHead(204); return res.end();
     }
     if (req.method === 'POST' && url === '/restart') {

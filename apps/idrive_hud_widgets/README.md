@@ -90,6 +90,14 @@ Classic, M and Night, plus Auto, which switches to Night at sunset. You choose w
   </tr>
 </table>
 
+## Play demo
+
+The **▶ Play demo** button at the top of the page plays a 60-second show on the glass while the car stands: a full-throttle pull through the gears with the shift lights and graded shifts, the limiter, hard braking and two corners on the G-meter, boost and temperatures moving, the oil warning flashing once, and, with the layouts following the drive mode, a switch from Comfort to Sport. A DEMO tag stays on the HUD the whole time. It stops at the end, when you tap Stop, or as soon as the car moves faster than 5 km/h, and nothing from it is kept (no best times, no G-meter bests, no shift learning).
+
+## Directions
+
+While a route runs, the next turn shows in a corner of the layout: an arrow, its distance, and the street or the lanes under it, with a "then" arrow when the next turn comes close behind. Roundabouts show their exit. Set on the Alerts tab: **While a route runs** (the default), **Near turns** (under 1 km, or whenever there are lanes) or **Off**. Ported from Redline in [cauliflowermossgrape/idrive7-apps](https://github.com/cauliflowermossgrape/idrive7-apps) (MIT). It reads the car's own guidance service and never shows a turn older than 3 seconds. Proven there with CarPlay and Apple Maps; **Waze over CarPlay sends the car no turns**, so it shows none. BMW's own navigation and Android Auto are not checked yet.
+
 ## Off and drive modes
 
 - **Off (BMW's own HUD):** the first card on the Layouts tab. Tap it and the app draws nothing in any drive mode, so BMW's HUD comes back.
@@ -109,6 +117,14 @@ Layout, drive mode switching, which sensor each readout shows, where the HUD sit
 **G-meter:** the range (0.8, 1.0, 1.2, 1.5 or 2.0 g at the edge; 1.2 by default), the trail (off, 1, 2 or 4 seconds), **Swap left / right** (if the dot goes the wrong way in a turn) and **Brake on top**, the best left, right, accelerating, braking and overall g of the drive with a Reset button, and a live copy of the meter. The g comes from the car's own acceleration sensor: parked on level ground it reads 0.00, and a hill adds a little.
 
 **Alerts:** oil, coolant and boost limits (a readout over its limit flashes red; oil 130°C and coolant 115°C by default, boost off), and a button that runs the shift lights up to the shift point for about 4 seconds while the car stands.
+
+**Shift lights:** **Count in** (the default) fills the lights over about the last second before the shift point however fast the revs climb, and flashes early by your reaction time, so the shift lands on the point. The reaction time is learned from your own upshifts (or taken from Redline when it runs). **Fixed rpm band** works as before. Ported from Redline (MIT).
+
+**Temperatures only when they matter** (off by default): oil and coolant show only while cold (blue), warming up (yellow) or over their limit (red). The outside temperature always turns blue at 3°C (37°F) and under, when ice is possible.
+
+**Holiday editions:** Auto (the default) puts on holiday colours by the date: Christmas (red, green and gold, the shift lights as a string of coloured bulbs, and MERRY CHRISTMAS while you're stopped), Thanksgiving, New Year and the Fourth of July. No snow or anything moving on the glass. Or pick one, or Off.
+
+**Switching off:** the app puts nothing new on the HUD while the car is switching on or off, and takes its layers down at switch-off, so cluster-render never counts it against the HUD.
 
 The last line of the Settings tab says what the HUD is doing, the drive mode it sees, and why anything is not drawn (for example "waiting: another app has this display").
 
@@ -130,12 +146,12 @@ BMW keeps drawing its own HUD content over ours, bottom left: the speed and spee
 
 ## On the car
 
-Tested on a 2020 X3 M40i. It runs, the rpm is smooth at idle, the layouts are fitted to the window BMW's own height-adjust frame shows, and Redline and Warm-up were checked on the glass in Sport, next to BMW's own rev band. Still to be checked:
+Tested on a 2020 X3 M40i. It runs, a HUD layout and a cluster theme show together, the rpm is smooth at idle, the layouts are fitted to the window BMW's own height-adjust frame shows, and Redline and Warm-up were checked on the glass in Sport, next to BMW's own rev band. Still to be checked:
 
 - the other layouts on the glass: nothing cut off on the right, nothing under BMW's speed or sign;
-- a HUD layout and a cluster theme showing together (0.12.5);
 - the clock with a named time zone, and the fuel % from the engine unit;
-- how the colours look on the real glass, especially the M blues in sunlight.
+- how the colours look on the real glass, especially the M blues in sunlight;
+- directions, Play demo, the count-in shift lights and the holiday colours (0.13.0).
 
 See [Use at your own risk](../../README.md#use-at-your-own-risk) before installing.
 

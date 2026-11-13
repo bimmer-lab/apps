@@ -17,14 +17,21 @@
  * That is over the 8724 that crashed james10424's display, so tokens alone are no hard limit: past 8748 is only
  * "untested". Texture reads keep their crash mark (no conflicting data).
  *
- * Shown, not judged (no known limit): uniform vectors (a float or vec 1, mat3 3, mat4 4, arrays by length; about 70
- * with 80-step loops restarted a G21, kit Redline README) and loop load: tokens with each constant-bound loop's body
- * counted as often as it runs, times the layer's share of the 1920 x 720 panel. Dyno 0.14.0's whole-panel "tiles"
- * (load 8306) dropped the cluster, yet M's mdash (8748) holds: static counts don't explain Dyno, so they stay numbers.
+ * Uniform vectors, two counts: "declared" (a float, vec or sampler 1, mat3 3, mat4 4, arrays by length: what a driver
+ * that gives every uniform its own vec4 row uses, the worst case) and "packed" (GLSL ES 1.00 Appendix A.7's packing:
+ * vec4 / mat rows whole, vec3s one row each with a float in the 4th column, vec2s two to a row, floats filling what is
+ * left; samplers take texture units, not rows). About 70 with 80-step loops restarted a G21 (kit Redline README), ~22
+ * ran fine; the HUD rule (Nov 13 2026): a HUD shader stays at 20 or fewer, declared, so it holds on any driver. Over
+ * 20 on the HUD target is a warning ("!"); elsewhere uniform vectors are shown, not judged.
+ * Loop load (shown, not judged): tokens with each constant-bound loop's body counted as often as it runs, times the
+ * layer's share of the 1920 x 720 panel. Dyno 0.14.0's whole-panel "tiles" (load 8306) dropped the cluster, yet M's
+ * mdash (8748) holds: static counts don't explain Dyno, so they stay numbers.
  *
  *   node tools/shader_budget.js        every shader in shared/shaders.js: reads, tokens, uniform vectors, loop work
  *                                      (exits 1 if a shader reaches a crash mark, or doesn't compile)
- *   require('./tools/shader_budget').layer(fs, w, h)   one effect layer: { level, text } (the bench uses it)
+ *   node tools/shader_budget.js --uniforms   also a table of every shader's uniform vectors, declared and packed
+ *   require('./tools/shader_budget').layer(fs, w, h, target)   one effect layer: { level, text } (the bench uses it;
+ *                                      target 'hud' applies the HUD's 20 uniform vector rule)
  * glslangValidator (brew install glslang), when installed, also compiles each shader as GLSL ES 1.00.
  *
  * ---
@@ -51,6 +58,7 @@
 const READS_GOOD = 32, READS_CRASH = 38;
 const TOKENS_GOOD = 8748, TOKENS_THEIRS = 8724;   // ours holds (G01), theirs crashed (see the header)
 const PANEL = 1920 * 720;
+const HUD_UNIFORMS = 20;     // the HUD rule (see the header)
 const NAME_COL = 10;
 
 /** The source as the GPU compiles it: no comments, #define NAME / #ifdef / #ifndef / #else / #endif applied. */
@@ -141,25 +149,47 @@ function measure(src) {
         return (memo[name] = total);
     };
     const r = cost('main', []);
-    let uniforms = 0;
-    (code.match(/uniform\s+\w+\s+\w+\s*(\[\s*\d+\s*\])?/g) || []).forEach((u) => {
-        const t = u.split(/\s+/)[1], arr = u.match(/\[\s*(\d+)\s*\]/);
-        uniforms += (t === 'mat3' ? 3 : t === 'mat4' ? 4 : t === 'mat2' ? 2 : 1) * (arr ? Number(arr[1]) : 1);
+    const u = uniformVectors(code);
+    return { reads: r.reads, tokens: r.tokens, work: r.work, uniforms: u.declared, packed: u.packed };
+}
+
+/** { declared, packed } uniform vectors of preprocessed code (see the header). The packing follows GLSL ES 1.00
+ *  Appendix A.7 in its counting: whole rows for vec4, mat2 (2), mat4 (4), mat3 (3) and vec3 (columns 0..2), then vec2s two to a
+ *  row, then floats into the free 4th columns of the vec3 / mat3 rows, the half row a lone vec2 leaves, and new rows. */
+function uniformVectors(code) {
+    let declared = 0, rows = 0, col3 = 0, vec2s = 0, floats = 0;
+    (code.match(/uniform\s+(?:(?:lowp|mediump|highp)\s+)?\w+\s+\w+\s*(\[\s*\d+\s*\])?/g) || []).forEach((d) => {
+        const parts = d.split(/\s+/), t = /^(lowp|mediump|highp)$/.test(parts[1]) ? parts[2] : parts[1];
+        const arr = d.match(/\[\s*(\d+)\s*\]/), n = arr ? Number(arr[1]) : 1;
+        declared += (t === 'mat3' ? 3 : t === 'mat4' ? 4 : t === 'mat2' ? 2 : 1) * n;
+        if (/^sampler/.test(t)) return;
+        if (t === 'mat4') rows += 4 * n;
+        else if (t === 'mat2') rows += 2 * n;
+        else if (/vec4$/.test(t)) rows += n;
+        else if (t === 'mat3') { rows += 3 * n; col3 += 3 * n; }
+        else if (/vec3$/.test(t)) { rows += n; col3 += n; }
+        else if (/vec2$/.test(t)) vec2s += n;
+        else floats += n;
     });
-    return { reads: r.reads, tokens: r.tokens, work: r.work, uniforms };
+    rows += Math.ceil(vec2s / 2);
+    let free = col3 + (vec2s % 2 ? 2 : 0);
+    const left = Math.max(0, floats - free);
+    rows += Math.ceil(left / 4);
+    return { declared, packed: rows };
 }
 
 /** One effect layer: { level 'ok' | 'warn' | 'crash', text, ... } for fragment shader `src` on a w x h layer
  *  (w, h default the whole panel). */
-function layer(src, w, h) {
+function layer(src, w, h, target) {
     const m = measure(src);
-    if (!m) return { level: 'ok', text: 'no main', reads: 0, tokens: 0, work: 0, uniforms: 0, load: 0 };
+    if (!m) return { level: 'ok', text: 'no main', reads: 0, tokens: 0, work: 0, uniforms: 0, packed: 0, load: 0 };
     const share = ((w || 1920) * (h || 720)) / PANEL, load = Math.round(m.work * share);
-    const sum = m.reads + ' reads, ' + m.tokens + ' tokens, ' + m.uniforms + ' uniform vectors, loop load ' + load;
+    const sum = m.reads + ' reads, ' + m.tokens + ' tokens, ' + m.uniforms + ' uniform vectors (' + m.packed + ' packed), loop load ' + load;
     const out = Object.assign({ load }, m);
     if (m.reads >= READS_CRASH) return Object.assign(out, { level: 'crash', text: sum + ': ' + READS_CRASH + ' reads restarted a cluster; cut to ' + READS_GOOD + ' or fewer' });
     const over = [];
     if (m.reads > READS_GOOD) over.push('reads over the ' + READS_GOOD + ' known to hold');
+    if (target === 'hud' && m.uniforms > HUD_UNIFORMS) over.push('uniform vectors over the HUD\'s ' + HUD_UNIFORMS + ' (~70 restarted a cluster)');
     if (m.tokens > TOKENS_GOOD) over.push('size over the ' + TOKENS_GOOD + ' tokens known to hold (M; ' + TOKENS_THEIRS + ' crashed another car)');
     if (over.length) return Object.assign(out, { level: 'warn', text: sum + ': ' + over.join(', ') + '; untested on the car' });
     return Object.assign(out, { level: 'ok', text: sum });
@@ -174,7 +204,7 @@ function compile(src) {
     return { ok: run.status === 0, errors };
 }
 
-module.exports = { measure, layer, compile, READS_GOOD, READS_CRASH, TOKENS_GOOD };
+module.exports = { measure, layer, compile, uniformVectors, READS_GOOD, READS_CRASH, TOKENS_GOOD, HUD_UNIFORMS };
 
 if (require.main === module) {
     // every effect layer of every built-in layout, at its real size (layouts are plain JSON)
@@ -182,7 +212,7 @@ if (require.main === module) {
     const shaders = require('../shared/shaders');
     const root = path.join(__dirname, '..', 'apps');
     let worst = 'ok';
-    const compiled = {};
+    const compiled = {}, used = {};
     let compiler = true;
     fs.readdirSync(root).forEach((app) => {
         const dir = path.join(root, app, 'hud', 'layouts');
@@ -199,7 +229,8 @@ if (require.main === module) {
                     else compiled[w.type] = b;
                 }
                 const b = compiled[w.type], broken = b && !b.ok;
-                const r = layer(src, w.w, w.h);
+                const r = layer(src, w.w, w.h, app === 'idrive_hud_widgets' ? 'hud' : 'panel');
+                (used[w.type] = used[w.type] || new Set()).add(app === 'idrive_hud_widgets' ? 'hud' : 'cluster');
                 if (broken || r.level === 'crash') worst = 'crash';
                 if (r.level === 'ok' && !broken && !process.argv.includes('--all')) return;
                 console.log((broken || r.level === 'crash' ? 'X ' : r.level === 'warn' ? '! ' : '  ') + (app.replace('idrive_hud_widgets', 'hud').replace('cluster_themes', 'cluster') + '/' + f.replace('.json', '') + ' ' + w.id + ' (' + w.type + ' ' + w.w + 'x' + w.h + ')').padEnd(44) + r.text + (broken ? ', does not compile' : ''));
@@ -207,6 +238,16 @@ if (require.main === module) {
             });
         });
     });
+    if (process.argv.includes('--uniforms')) {
+        console.log('uniform vectors per shader (declared / packed; HUD rule: ' + HUD_UNIFORMS + ' or fewer declared):');
+        Object.keys(shaders).forEach((k) => {
+            const m = measure(shaders[k]);
+            if (!m) return;
+            const where = used[k] ? Array.from(used[k]).sort().join(' + ') : 'no built-in layout';
+            const flag = used[k] && used[k].has('hud') && m.uniforms > HUD_UNIFORMS ? '! ' : '  ';
+            console.log(flag + k.padEnd(10) + String(m.uniforms).padStart(4) + ' / ' + String(m.packed).padEnd(4) + where);
+        });
+    }
     console.log(worst === 'crash' ? 'some layers reach a crash mark or do not compile' : 'no layer reaches a crash mark' + (process.argv.includes('--all') ? '' : ' (--all lists every layer)'));
     process.exit(worst === 'crash' ? 1 : 0);
 }
