@@ -224,6 +224,9 @@ const BOOST_SCALE = { factor: 0.01, offset: 0, invalid: 255 }; // see header com
 // the widget types drawn as pixels (image layers, packed into sheets unless "own": true); the rest are shaders
 const IMAGE_TYPES = { text: true, scale: true, stripe: true, badge: true, gridlabels: true, icon: true, swatchimg: true };
 const STATUS_ASK_MS = 2000;      // after a rebuild: ask cluster-render for its own status text
+// an image layer is "stalled" until its first pixels reach cluster-render, which after a rebuild takes a second or two
+// through the upload budget: normal. Only one still stalled this long is logged as a problem (and its recovery)
+const STALL_WARN_MS = 5000;
 const LAYER_BUDGET = 8;          // cluster-render's limit per client connection (CompositorLimits.per_client; confirmed on the car Nov 5 2026)
 const MAX_CONN = 4;              // connections a layout may ask for ("conn"): 32 layers service-wide / 8 per connection
 const PIXEL_BYTES = 16 * 1024 * 1024;   // cluster-render's pixel memory for every app's images together (CompositorLimits.pixel_bytes)
@@ -393,7 +396,8 @@ class HudApp {
         this.socketPath = process.env.HUD_CLUSTER_SOCKET || this.config.socketPath || DEFAULT_PATH;
         this.clients = [];               // the connections to cluster-render: [0] the app's own, more for "conn" widgets
         this.started = false;
-        this.layerStates = new Map();    // "<conn>:<ref>" -> { state, reason } from cluster-render
+        this.layerStates = new Map();    // "<conn>:<ref>" -> { state, reason, since, long } from cluster-render
+        this.stallTimers = new Map();    // "<conn>:<ref>" -> timer: warns if the layer is still stalled after STALL_WARN_MS
         this.client = this._clientAt(0);
         this.target = TARGET_SIZES[this.config.target] ? this.config.target : 'hud';
         this.size = TARGET_SIZES[this.target];
@@ -707,10 +711,24 @@ class HudApp {
         c.on('layer', (ref, state, reason) => {
             const key = ci + ':' + ref;
             const old = this.layerStates.get(key);
-            this.layerStates.set(key, { state, reason });
-            if (state === 'error' || ((state === 'waiting' || state === 'stalled') && (!old || old.state !== state))) {
-                const w = this._widgetOf(ci, ref);
-                this.log.warn('layer ' + ref + tag + (w ? ' (' + w + ')' : '') + ' ' + state + (reason ? ': ' + reason : ''));
+            const same = old && old.state === state;
+            const st = { state, reason, since: same ? old.since : Date.now(), long: same ? old.long : false };
+            this.layerStates.set(key, st);
+            const name = () => { const w = this._widgetOf(ci, ref); return 'layer ' + ref + tag + (w ? ' (' + w + ')' : ''); };
+            if (state === 'error' || (state === 'waiting' && !same)) this.log.warn(name() + ' ' + state + (reason ? ': ' + reason : ''));
+            if (state === 'stalled' && !same) {
+                // normal for a moment after a rebuild (pixels on their way); a problem only if it lasts
+                clearTimeout(this.stallTimers.get(key));
+                this.stallTimers.set(key, setTimeout(() => this._guard('stall check', () => {
+                    this.stallTimers.delete(key);
+                    const now = this.layerStates.get(key);
+                    if (now !== st) return;
+                    st.long = true;
+                    this.log.warn(name() + ' still stalled after ' + STALL_WARN_MS / 1000 + ' s: no pixels reached cluster-render' + (reason ? ' (' + reason + ')' : ''));
+                }), STALL_WARN_MS));
+            } else if (state !== 'stalled') {
+                clearTimeout(this.stallTimers.get(key)); this.stallTimers.delete(key);
+                if (old && old.state === 'stalled' && old.long) this.log.info(name() + ' ' + state + ' after ' + ((Date.now() - old.since) / 1000).toFixed(1) + ' s stalled');
             }
             this._statusSoon();
         });
@@ -832,6 +850,7 @@ class HudApp {
         clearInterval(this.dmeTimer);
         clearInterval(this.claimTimer);
         clearTimeout(this.statusAskT);
+        this.stallTimers.forEach((t) => clearTimeout(t)); this.stallTimers.clear();
         if (this.waze) this._guard('waze stop', () => this.waze.stop());
         this._guard('screen stop', () => this.screen.stop());
         this.clients.forEach((c) => c.close());
@@ -1472,6 +1491,7 @@ class HudApp {
         this.sheets = [];
         this.pixelBytes = 0;
         this.layerStates.clear();
+        this.stallTimers.forEach((t) => clearTimeout(t)); this.stallTimers.clear();
         this.refused = null;
         clearTimeout(this.statusAskT); this.statusAskT = null;
         this.car.setRedline(this.setting('redline'));

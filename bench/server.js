@@ -41,6 +41,9 @@ const PORT = Number(process.env.BENCH_PORT) || 8078;
 // BENCH_LAYER_CAP: the car seems to draw only an app's first 8 layers (photos, Nov 5 2026).
 // 0 = unlimited. Layers past the cap get state 'waiting' and are not drawn. POST /cap sets it live.
 let layerCap = Math.max(0, Number(process.env.BENCH_LAYER_CAP) || 0);
+// BENCH_STALL_MS: an image layer reports "stalled" (no content yet, as cluster-render does until its first pixels are
+// uploaded) for this long after it is made, then "shown". 0 (default) = shown at once.
+const STALL_MS = Math.max(0, Number(process.env.BENCH_STALL_MS) || 0);
 // The service's other two limits, always on (CompositorLimits): 32 layers across every connection, and 16 MiB of
 // pixel memory for every image together, each image counted twice (Compositor::add_image), refused with the
 // service's own words "the service's pixel memory is full". BENCH_PIXEL_MIB overrides the 16 (0 = unlimited).
@@ -249,7 +252,10 @@ const renderServer = net.createServer((sock) => {
                 }
                 layers.set(key, nl);   // its visibility warnings (hood, gear box, belt light, HUD window) ride along in sceneMeta()
                 if (nl.state === 'waiting') writeEv(sock, { ev: 'layer', ref: m.ref, state: 'waiting', reason: nl.reason });
-                else writeEv(sock, { ev: 'layer', ref: m.ref, state: 'shown' });
+                else if (STALL_MS && m.kind === 'image') {
+                    writeEv(sock, { ev: 'layer', ref: m.ref, state: 'stalled', reason: 'bench: no frame yet' });
+                    setTimeout(() => { if (layers.get(key) === nl && !sock.destroyed) writeEv(sock, { ev: 'layer', ref: m.ref, state: 'shown' }); }, STALL_MS);
+                } else writeEv(sock, { ev: 'layer', ref: m.ref, state: 'shown' });
                 sceneChanged();
                 return;
             }
