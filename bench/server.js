@@ -36,6 +36,8 @@ const { fork, execFileSync } = require('child_process');
 // What the driver sees of each target (hood curve, BMW's gear box and belt light, the HUD window):
 // one source of truth, shared with the app's layout check. The page gets it in the 'hello' event.
 const visible = require('../shared/visible');
+// what each effect shader asks of the KOMBI's GPU against shaders that ran or failed on cars (tools/shader_budget.js)
+const shaderBudget = require('../tools/shader_budget');
 
 const PORT = Number(process.env.BENCH_PORT) || 8078;
 // BENCH_LAYER_CAP: the car seems to draw only an app's first 8 layers (photos, Nov 5 2026).
@@ -247,6 +249,10 @@ const renderServer = net.createServer((sock) => {
                 } else if (m.kind === 'effect') {
                     if (!m.fs) return refuse('layer', m.ref, 'effect without fs');
                     nl.fs = m.fs; nl.time = !!m.time; nl.binds = {};
+                    try {
+                        const b = shaderBudget.layer(m.fs, nl.w, nl.h);
+                        if (b.level !== 'ok') log('warn', 'layer ' + m.ref + ' (effect ' + nl.w + 'x' + nl.h + ') shader budget: ' + b.text);
+                    } catch (e) { log('warn', 'layer ' + m.ref + ': shader budget check failed: ' + e.message); }
                 } else {
                     log('warn', 'layer ' + m.ref + ': kind ' + m.kind + ' is not drawn by the bench');
                 }
