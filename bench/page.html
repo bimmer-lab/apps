@@ -210,6 +210,7 @@
   let view = 'hud', VW = 800, VH = 480;
   // what the driver sees, from the server's hello (shared/visible.js, measured from car photos Nov 5 2026)
   let geo = null;
+  let settingVals = {};            // the app's settings as last sent (the car view's camera notch follows one)
   function hoodY(x) {
     const H = geo.HOOD;
     if (x <= H[0][0]) return H[0][1];
@@ -245,6 +246,14 @@
       ctx.fillStyle = 'rgba(232,55,44,.55)'; ctx.fillRect(sx0, sy0, sx1 - sx0, sy1 - sy0);
       ctx.strokeStyle = '#ff8c1a'; ctx.strokeRect(sx0 + .5, sy0 + .5, sx1 - sx0 - 1, sy1 - sy0 - 1);
       labelBox('belt light', sx0 - 10, sy0 - 18, '#ff8c1a');
+      // the driver camera on newer cars (where the model badge sits on cars without it): solid while the app's
+      // "Leave room for the driver camera" is on, so the bench shows what those drivers see; else only outlined
+      if (geo.CAMERA) {
+        const [cx0, cy0, cx1, cy1] = geo.CAMERA;
+        if (settingVals.cameraNotch === true) { ctx.fillStyle = '#000'; ctx.fillRect(cx0, cy0, cx1 - cx0, cy1 - cy0); }
+        ctx.setLineDash([5, 4]); ctx.strokeStyle = '#ff8c1a'; ctx.strokeRect(cx0 + .5, cy0 + .5, cx1 - cx0 - 1, cy1 - cy0 - 1); ctx.setLineDash([]);
+        labelBox('driver camera (newer cars)', cx0 + 4, cy1 + 4, '#ff8c1a');
+      }
     } else if (view === 'hud') {
       // only the window is visible through the windshield; mask the rest
       const w = geo.HUD_WINDOW;
@@ -478,6 +487,7 @@
   });
   document.getElementById('mManual').onclick = () => setMode('manual');
   function renderSettings(m) {
+    settingVals = m.values || {}; dirty = true;
     const box = document.getElementById('settings');
     box.innerHTML = '';
     m.schema.forEach((s) => {

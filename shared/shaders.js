@@ -13,6 +13,8 @@ const SHIFTBAR = `// Segmented shift bar for a cluster-render "effect" layer (GL
 //   u_midAt, u_highAt      where the mid and high zones start (0..1 of the bar)
 //   u_track   unlit segment colour (rgba, straight alpha)
 //   u_flash   1 = at the redline: every lit segment shows the high colour
+//   u_skip    driver camera wings: px from the layer's left (from, to) left empty; then u_segs segments on each
+//             side, mirrored, filling from the outer ends in towards the gap. to <= from: one bar as usual
 // Output is straight alpha. Whether cluster-render blends effect layers as
 // straight or premultiplied alpha is not confirmed yet: check the edges on the car.
 precision mediump float;
@@ -27,13 +29,20 @@ uniform float u_midAt;
 uniform float u_highAt;
 uniform vec4 u_track;
 uniform float u_flash;
+uniform vec2 u_skip;
 
 void main() {
     float gapPx = 3.0;
-    float slot = u_size.x / u_segs;                 // px per segment incl. gap
     float px = v_uv.x * u_size.x;
-    float idx = floor(px / slot);
-    float inSeg = px - idx * slot;                  // px into this slot
+    float slot = u_size.x / u_segs;                 // px per segment incl. gap
+    float local = px;                               // px from where the fill starts
+    if (u_skip.y > u_skip.x) {                      // wings: left from its left end, right mirrored from its right end
+        if (px >= u_skip.x && px < u_skip.y) { gl_FragColor = vec4(0.0); return; }
+        if (px < u_skip.x) slot = u_skip.x / u_segs;
+        else { slot = (u_size.x - u_skip.y) / u_segs; local = u_size.x - px; }
+    }
+    float idx = floor(local / slot);
+    float inSeg = local - idx * slot;               // px into this slot
     float segW = slot - gapPx;
     float py = v_uv.y * u_size.y;           // px from the top
 
@@ -217,7 +226,8 @@ const LIGHTS = `// Shift lights for a cluster-render "effect" layer (GLSL ES 1.0
 // on (they fill from a start rpm up to the shift point); u_strobe 1 = at the shift point: all red.
 // The last u_tail lights are blue instead (the GT3 dash look; 0 = none). u_round 1 = round lights.
 //   u_size px, u_n count, u_lit count (0..u_n), u_tail count, u_strobe 0/1, u_green/u_yellow/u_red/u_blue rgb,
-//   u_off (alpha when off)
+//   u_off (alpha when off), u_skip driver camera wings: px from the layer's left (from, to) left empty, then u_n
+//   lights on each side, mirrored, filling from the outer ends in towards the gap (to <= from: one row as usual)
 precision mediump float;
 varying vec2 v_uv;
 uniform vec2 u_size;
@@ -231,14 +241,21 @@ uniform vec3 u_yellow;
 uniform vec3 u_red;
 uniform vec3 u_blue;
 uniform float u_off;
+uniform vec2 u_skip;
 
 void main() {
     float gapPx = 6.0;
     float slot = (u_size.x + gapPx) / u_n;
     float px = v_uv.x * u_size.x;
     float py = v_uv.y * u_size.y;
-    float idx = floor(px / slot);
-    float inSeg = px - idx * slot;
+    float local = px;                               // px from where the fill starts
+    if (u_skip.y > u_skip.x) {                      // wings: left from its left end, right mirrored from its right end
+        if (px >= u_skip.x && px < u_skip.y) { gl_FragColor = vec4(0.0); return; }
+        if (px < u_skip.x) slot = (u_skip.x + gapPx) / u_n;
+        else { slot = (u_size.x - u_skip.y + gapPx) / u_n; local = u_size.x - px; }
+    }
+    float idx = floor(local / slot);
+    float inSeg = local - idx * slot;
     float segW = slot - gapPx;
     if (inSeg > segW || idx >= u_n) { gl_FragColor = vec4(0.0); return; }
     vec2 hs = vec2(segW, u_size.y) * 0.5;
@@ -1164,6 +1181,8 @@ const REVARC = `// A segmented rev arc for a cluster-render "effect" layer (GLSL
 // to u_r round u_center (layer px, y down), from u_start sweeping u_sweep (radians, clockwise from 12 o'clock), in
 // u_segs segments, the first u_value of it lit: u_low below u_midAt, u_mid up to u_highAt, u_high past it;
 // unlit u_track. u_flash 1: everything lit flashes white (at the redline). v_uv (0,0) is the top-left.
+// u_wing > 0: driver camera wings: the middle 2 x u_wing radians stay empty and u_segs segments sit on each side,
+// mirrored, filling from the two ends in towards the middle.
 precision mediump float;
 varying vec2 v_uv;
 uniform vec2 u_size;
@@ -1181,6 +1200,7 @@ uniform float u_midAt;
 uniform float u_highAt;
 uniform vec4 u_track;
 uniform float u_flash;
+uniform float u_wing;
 
 const float PI = 3.14159265359;
 
@@ -1193,8 +1213,13 @@ void main() {
     float a = atan(d.x, -d.y);                      // clockwise from 12 o'clock
     float rel = mod(a - u_start + 4.0 * PI, 2.0 * PI);
     if (rel > u_sweep) { gl_FragColor = vec4(0.0); return; }
-    float f = rel / u_sweep;
     float slot = u_sweep / u_segs;
+    if (u_wing > 0.0) {
+        float mid = u_sweep * 0.5;
+        if (abs(rel - mid) < u_wing) { gl_FragColor = vec4(0.0); return; }
+        if (rel > mid) rel = u_sweep - rel;         // the right wing, mirrored
+        slot = (mid - u_wing) / u_segs;
+    }
     float i = floor(rel / slot);
     float gap = 5.0 / rr;                           // a 5 px gap between segments at this radius
     float fx = rel - i * slot;

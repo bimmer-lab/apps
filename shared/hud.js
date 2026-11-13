@@ -201,6 +201,7 @@ const { ClusterRender, DEFAULT_PATH } = require('./cluster_render_client.js');
 const Layouts = require('./layouts');
 const { THEMES, M_STRIPE, LIGHTS, VERDICT, color } = require('./hud_themes');
 const ShiftScore = require('./shift_score');
+const visible = require('./visible');
 const sun = require('./sun');
 const textRaster = require('./hud_text');
 const { paintIcon } = require('./icons');
@@ -538,6 +539,25 @@ class HudApp {
         const x1 = Math.max.apply(null, ls.map((l) => l.x + l.w)), y1 = Math.max.apply(null, ls.map((l) => l.y + l.h));
         return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
     }
+    /**
+     * "Leave room for the driver camera" (cluster): a row of shift lights or rev segments that crosses the camera's spot
+     * on newer cars (visible.CAMERA) becomes two mirrored wings either side of it, filling from the outer ends in
+     * towards the camera. The empty middle as { s, e } px from the widget's left; null when off or not crossing it.
+     */
+    _wings(w) {
+        const C = visible.CAMERA;
+        if (!this._cameraOn() || !(w.y < C[3] && w.x < C[0] && w.x + w.w > C[2])) return null;
+        return { s: C[0] - w.x, e: C[2] - w.x };
+    }
+    /** The same for an arc (Rally's revarc, symmetric about 12 o'clock): half the empty middle in radians, 0 = none. */
+    _arcWing(w) {
+        const C = visible.CAMERA;
+        if (!this._cameraOn() || !w.center || w.y + w.center[1] - w.r >= C[3]) return 0;
+        const cx = w.x + w.center[0], half = Math.max(cx - C[0], C[2] - cx), inner = w.r - (w.band || 40);
+        return half < inner ? Math.asin(half / inner) : 0;
+    }
+    _cameraOn() { return this.target === 'panel' && !!this.ctx.settings.item('cameraNotch') && this.setting('cameraNotch') === true; }
+
     /** The cluster's squeeze for "Leave BMW's bottom strip clear": 662 / 720 while it's on, else 1. */
     _stripSy() {
         if (this.target !== 'panel' || !this.ctx.settings.item('stripClear')) return 1;
@@ -1483,6 +1503,7 @@ class HudApp {
         if (this.nightOn) this.theme = dimTheme(this.theme, NIGHT_DIM);
         this.log.info('layout "' + layout.name + '", theme ' + this.theme.name + (this.layoutTheme ? '' : ' (' + this.setting('hudTheme') + ')'));
         const shown = layout.widgets.filter((w) => !(w.toggle && !this._toggleOn(w.toggle)) && !(w.themes && w.themes.indexOf(this.themeName) < 0));
+        this.shown = shown;              // for a scale to find its rev bar (driver camera wings)
         this._setNeeds(shown);
         // plan the layers first (a sheet's size is only known once every member is placed), then make them
         // in that order: within a class and z, cluster-render puts the newer layer on top. Small sheets
@@ -1678,7 +1699,7 @@ class HudApp {
             c.uniform(ref, 'u_bladeB', [b.round || 40, isNum(w.bladeGap) ? w.bladeGap : 14]);
             c.uniform(ref, 'u_line', w.line || [0, -99, 0, 1]);
             c.uniform(ref, 'u_tyre', [ty[0] - w.x, ty[1] - w.y, ty[2] || 0]);
-            c.uniform(ref, 'u_mark', w.mark || [0, 0, 0]);
+            c.uniform(ref, 'u_mark', w.mark && !this._cameraOn() ? w.mark : [0, 0, 0]);   // no M stripes where the driver camera sits
             c.uniform(ref, 'u_red', rgb(t.hot));
             [0, 1, 2, 3].forEach((i) => {
                 const s = bars[i];
@@ -1715,7 +1736,9 @@ class HudApp {
             const max = this._barMax(), red = this.setting('redline');
             const midAt = t.bar.midAt === 'shift' ? (red - 1500) / max : t.bar.midAt;
             c.uniform(ref, 'u_size', [w.w, w.h]);
-            c.uniform(ref, 'u_segs', [w.segments || 40]);
+            const wg = this._wings(w);         // driver camera wings: half the segments on each side
+            c.uniform(ref, 'u_segs', [wg ? Math.round((w.segments || 40) / 2) : w.segments || 40]);
+            c.uniform(ref, 'u_skip', wg ? [wg.s, wg.e] : [0, 0]);
             c.uniform(ref, 'u_low', rgb(t.bar.low));
             c.uniform(ref, 'u_mid', rgb(t.bar.mid));
             c.uniform(ref, 'u_high', rgb(t.bar.high));
@@ -1762,7 +1785,9 @@ class HudApp {
             c.uniform(ref, 'u_w', [w.band || 40]);
             c.uniform(ref, 'u_start', [w.start * Math.PI / 180]);
             c.uniform(ref, 'u_sweep', [w.sweep * Math.PI / 180]);
-            c.uniform(ref, 'u_segs', [w.segments || 30]);
+            const wa = this._arcWing(w);       // driver camera wings: half the segments on each side
+            c.uniform(ref, 'u_segs', [wa ? Math.round((w.segments || 30) / 2) : w.segments || 30]);
+            c.uniform(ref, 'u_wing', [wa]);
             c.uniform(ref, 'u_low', rgb(t.bar.low));
             c.uniform(ref, 'u_mid', rgb(t.bar.mid));
             c.uniform(ref, 'u_high', rgb(t.bar.high));
@@ -1814,8 +1839,11 @@ class HudApp {
             c.uniform(ref, 'u_fg', rgba(t.fg));
         } else if (w.type === 'lights') {
             c.uniform(ref, 'u_size', [w.w, w.h]);
-            c.uniform(ref, 'u_n', [w.count || 12]);
-            c.uniform(ref, 'u_tail', [w.tail || 0]);
+            // driver camera wings: half the lights (and the blue tail) on each side, filling in towards the camera
+            const wg = this._wings(w), n = w.count || 12;
+            c.uniform(ref, 'u_n', [wg ? Math.ceil(n / 2) : n]);
+            c.uniform(ref, 'u_tail', [wg ? Math.ceil((w.tail || 0) / 2) : w.tail || 0]);
+            c.uniform(ref, 'u_skip', wg ? [wg.s, wg.e] : [0, 0]);
             c.uniform(ref, 'u_round', [w.round ? 1 : 0]);
             c.uniform(ref, 'u_green', rgb(LIGHTS.green));
             c.uniform(ref, 'u_yellow', rgb(LIGHTS.yellow));
@@ -2154,7 +2182,7 @@ class HudApp {
             x.c.uniform(x.ref, 'u_peak', [peak]);
             x.c.uniform(x.ref, 'u_shiftNow', [sp.now ? 1 : 0]);
         } else if (w.type === 'lights') {
-            const rpm = this._raw('rpm'), sp = this._shift(), n = w.count || 12;
+            const rpm = this._raw('rpm'), sp = this._shift(), n = this._wings(w) ? Math.ceil((w.count || 12) / 2) : w.count || 12;
             // the lights fill from "from" rpm (3000) up to the shift point; a "from" at or past it means the last 500 rpm
             const from = Math.min(isNum(w.from) ? w.from : 3000, sp.rpm - 500);
             const lit = isNum(rpm) ? Math.floor(Math.min(1, Math.max(0, (rpm - from) / (sp.rpm - from))) * n) : 0;
@@ -2226,6 +2254,10 @@ class HudApp {
     _paintScale(x) {
         const w = x.w, n = this._barMax(w) / 1000 + 1, red = this.setting('redline');
         const m = Buffer.alloc(w.w * w.h, 0), hot = Buffer.alloc(w.w * w.h, 0);
+        // the rev bar right above this scale (same x and width) in driver camera wings: no numbers (they'd only fit one wing)
+        const bar = (this.shown || []).filter((b) => b.type === 'shiftbar' && b.x === w.x && b.w === w.w && b.y < w.y)
+            .sort((a, b) => b.y - a.y)[0];
+        if (bar && this._wings(bar)) { this._blit(x, null, Buffer.alloc(w.w * w.h * 4, 0)); return; }
         for (let i = 0; i < n; i++) {
             const label = String(i);
             const lw = textRaster.measure(label, w.font, 0);

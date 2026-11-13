@@ -2,6 +2,10 @@
 
 Newest first. Dates are when the build was pushed.
 
+## Nov 13 2026
+
+- **Cluster Themes 0.14.8:** a new setting, off by default: **Leave room for the driver camera**, for newer cars with a camera in the top middle of the cluster. The shift lights and rev bars of GT3, Track, Dyno and Rally become two mirrored wings either side of the camera that fill from the outer ends in towards it, Track's rpm numbers are left out and M's logo is hidden. Not yet tested on a car with a camera; please report how it lines up on yours.
+
 ## Nov 12 2026
 
 - **Cluster Themes 0.14.7, HUD Widgets 0.12.7:** shift grades updated to match Redline 2.0.40. LIMITER now means within 25 rpm of the redline (it was 60, which caught good shifts near the shift point). Only shifts aimed at the shift point are graded: an everyday shift more than 1500 rpm under it, or one the gearbox made itself in D or S, is left out and the last grade stays on screen. When Redline 2.0.28 or newer is running, the shift lights and grades use Redline's own shift point for the gear you're in (it learns one per gear) and its grade, read from the file Redline shares for other apps (thanks @biscotit, issue #4). Without Redline, nothing changes.
