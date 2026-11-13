@@ -421,6 +421,7 @@ class HudApp {
         this.driveVariant = null;        // 'plus' (Sport+ / Comfort+ / Eco Pro+), 'individual', or null
         this.carUnits = { press: null, temp: null, psiSeen: false };   // the car's display units, for the TPMS values
         this.program = null;             // 'S' / 'M' from the MDrive gearbox display, else null (D)
+        this.gradeMode = null;           // the same display for the shift grades: D / S / M, null while unknown
         this.fuelL = null; this.rangeKm = null; this.ambient = null;   // KombiIF tank / range, outside temperature
         this.tyres = { p: {}, t: {} };                                  // TPMS pressure (bar) and temperature (C) per corner FL FR RL RR
         this.activeName = null;          // the layout shown now ('off' = nothing)
@@ -605,7 +606,12 @@ class HudApp {
             },
             // S / M next to the gear: the gearbox status carries no programme on some cars, the M drive display does
             'de.bmw.infotainment.misc.MDrive': {
-                dataDisplayGearbox: (v) => { this.program = PROGRAMS[v && v.displayProgramGearbox] || null; },
+                dataDisplayGearbox: (v) => {
+                    const raw = v && v.displayProgramGearbox;
+                    this.program = PROGRAMS[raw] || null;
+                    // for the shift grades (as Redline): D / S (the gearbox shifts: AUTO) or M, null while the car hasn't said
+                    this.gradeMode = PROGRAMS[raw] || (raw === 0 || /^D/i.test(String(raw)) ? 'D' : null);
+                },
             },
             // outside temperature: raw * 0.5 - 40 deg C, 255 = none (car_vitals, MIT)
             'de.bmw.infrastructure.EnvironmentalInformation': {
@@ -654,6 +660,7 @@ class HudApp {
         this.resetG();
         this.score = new ShiftScore(this.car, () => ({
             redline: this.setting('redline'), shiftBefore: this.setting('shiftBefore'), coldGuard: this.setting('coldGuard'),
+            mode: this.car.data().demo ? null : this.gradeMode || null,
         }), this.log);
     }
 

@@ -2,6 +2,10 @@
 
 Newest first. Dates are when the build was pushed.
 
+## Nov 12 2026
+
+- **Cluster Themes 0.14.7, HUD Widgets 0.12.7:** shift grades updated to match Redline 2.0.40. LIMITER now means within 25 rpm of the redline (it was 60, which caught good shifts near the shift point). Only shifts aimed at the shift point are graded: an everyday shift more than 1500 rpm under it, or one the gearbox made itself in D or S, is left out and the last grade stays on screen. When Redline 2.0.28 or newer is running, the shift lights and grades use Redline's own shift point for the gear you're in (it learns one per gear) and its grade, read from the file Redline shares for other apps (thanks @biscotit, issue #4). Without Redline, nothing changes.
+
 ## Nov 11 2026
 
 - **Cluster Themes 0.14.6, HUD Widgets 0.12.6:** the Time zone (clock) setting now also lists named zones (US Eastern, Central, Mountain, Pacific, Alaska, Hawaii, Arizona, Canada Atlantic, Mexico, UK / Ireland / Portugal, Central Europe, Eastern Europe). A named zone switches to and from daylight saving by itself, so you set it once. The plain UTC offsets are still there for everywhere else. Night colours (Auto) now works out sunset for the zone you pick instead of one fixed US city. The apps' reads from the car's control units (boost, intake, fuel %, hybrid battery) now go through the kit's read-only link, which refuses anything that isn't a read before it leaves the head unit. New Cluster Themes setting, off by default: **Leave BMW's bottom strip clear** draws the theme only above BMW's own bottom strip (range, clock, belt light, P), squeezed to fit. One M car owner found that leaving the strip clear stopped BMW drawing black boxes over the theme (issue #5). Not yet tested on a car with this setting; please report how it works on yours. HUD Widgets now makes way for Redline: while Redline holds the HUD, HUD Widgets draws nothing, and it comes back by itself when Redline lets go (it uses the kit's HUD claim, the same one Cluster functions uses).
