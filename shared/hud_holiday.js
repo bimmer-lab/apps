@@ -13,6 +13,10 @@
  * HUD layouts (design/gen_hud.py) carry a "greeting" text widget that stays empty otherwise.
  *
  *   theme(base, key)   a copy of theme `base` in holiday `key`'s colours (base itself is never changed)
+ *   garland(key, target, night)   the light string's colours (garland.js) for a holiday on 'panel' or 'hud':
+ *                      { bulbs: [rgb...] in string order, wire: rgb }, or null. On the HUD dark blue is lifted for the glass
+ *                      and the wire is a little lighter (black shows nothing there); night (Cluster Themes' night colours)
+ *                      takes the bulbs down to 75 %.
  */
 const RED = [255, 42, 42];          // the shift red (hud_themes.js "hot"): also the first bulb
 
@@ -52,6 +56,27 @@ const SETS = {
     },
 };
 
+// the light string (garland.js) per holiday: bulbs in the order they hang, on a thin wire
+const GARLAND = {
+    xmas: { bulbs: [[255, 38, 38], [40, 214, 88], [255, 184, 52], [56, 120, 255], [255, 232, 196]], wire: [24, 66, 36] },
+    newyear: { bulbs: [[255, 196, 70], [255, 238, 206], [246, 216, 150], [255, 214, 110], [255, 246, 228]], wire: [24, 66, 36] },
+    july4: { bulbs: [[255, 40, 48], [244, 246, 255], [52, 104, 255]], wire: [24, 66, 36] },
+    thanks: { bulbs: [[255, 168, 36], [255, 112, 26], [214, 150, 30]], wire: [64, 38, 18] },
+};
+
+/** The light string's colours for holiday `key` on `target`, or null (see the header). */
+function garland(key, target, night) {
+    const g = GARLAND[key];
+    if (!g) return null;
+    const hud = target === 'hud';
+    const lift = (c) => (hud && c[2] > 200 && c[0] < 120 ? [Math.max(c[0], 110), Math.max(c[1], 160), 255] : c);
+    const k = night ? 0.75 : 1;
+    return {
+        bulbs: g.bulbs.map((c) => lift(c).map((v) => Math.round(v * k))),
+        wire: hud ? g.wire.map((v) => Math.min(255, Math.round(v * 1.8))) : g.wire,
+    };
+}
+
 const rgba = (c, a) => [c[0], c[1], c[2], a === undefined ? 255 : a];
 
 /** Theme `base` in holiday `key`'s colours, or base itself for an unknown key. */
@@ -73,4 +98,4 @@ function theme(base, key) {
     return t;
 }
 
-module.exports = { SETS, theme };
+module.exports = { SETS, GARLAND, theme, garland };

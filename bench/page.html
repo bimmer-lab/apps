@@ -294,12 +294,16 @@
     ctx.fillStyle = 'rgba(255,255,255,.55)'; ctx.font = '28px sans-serif'; ctx.fillText('map window', 860, 370);
     [[210, 1], [1710, -1]].forEach(([cx, side]) => {
       ctx.strokeStyle = '#c9ced6'; ctx.lineWidth = 6; ctx.beginPath();
-      ctx.moveTo(cx - 120 * side, 60); ctx.lineTo(cx + 60 * side, 60); ctx.lineTo(cx + 150 * side, 360); ctx.lineTo(cx + 60 * side, 660); ctx.lineTo(cx - 120 * side, 660); ctx.stroke();
+      ctx.moveTo(cx - 120 * side, 60); ctx.lineTo(cx + 60 * side, 60); ctx.lineTo(cx + 150 * side, 360); ctx.lineTo(cx + 60 * side, 640); ctx.lineTo(cx - 120 * side, 640); ctx.stroke();
       ctx.strokeStyle = '#e8372c'; ctx.lineWidth = 18; ctx.beginPath(); ctx.moveTo(cx + 100 * side, 200); ctx.lineTo(cx + 140 * side, 340); ctx.stroke();
     });
     ctx.fillStyle = '#f2c94c'; ctx.beginPath(); ctx.arc(70, 640, 14, 0, 7); ctx.fill();
     ctx.fillStyle = '#e8372c'; ctx.beginPath(); ctx.arc(1850, 640, 14, 0, 7); ctx.fill();
-    ctx.fillStyle = 'rgba(255,255,255,.55)'; ctx.font = '20px sans-serif'; ctx.fillText('warning lights', 20, 700); ctx.fillText('warning lights', 1770, 700);
+    ctx.fillStyle = 'rgba(255,255,255,.55)'; ctx.font = '20px sans-serif'; ctx.fillText('warning lights', 20, 615); ctx.fillText('warning lights', 1770, 615);
+    // BMW's own bottom strip (y ~662..720; car photo Nov 13 2026 with "Leave BMW's bottom strip clear" on): range, clock,
+    // the street, the drive mode, the gear letter, outside temperature. It sits UNDER our layers: a theme drawn over it hides it.
+    ctx.fillStyle = 'rgba(235,238,242,.8)'; ctx.font = '30px sans-serif';
+    [['138 mi', 180], ['4:24 pm', 355], ['Main St', 860], ['COMFORT', 1180], ['P', 1372], ['+54 \u00b0F', 1475]].forEach(([t, x]) => ctx.fillText(t, x, 700));
     // BMW's gear slot: a solid black box the car paints over everything (measured Nov 5 2026)
     const box = geo ? geo.BLACK_BOX : [1406, 342, 1597, 419];
     ctx.fillStyle = '#000'; ctx.fillRect(box[0], box[1], box[2] - box[0], box[3] - box[1]);

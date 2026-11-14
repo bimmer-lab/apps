@@ -773,6 +773,7 @@ uniform vec4 u_hole;      // map window x, y, w, h, already inset (w 0 = none)
 uniform float u_holeR;    // the hole's corner radius px
 uniform vec4 u_strip;     // bottom strip: left end x, top y, height, slant px
 uniform float u_topEnd;   // the top lines run from the bracket to this x (left; mirrored on the right)
+uniform vec4 u_road;      // the road in the middle (BMW's own Sport view draws one): horizon y, px scale, dash phase 0..1, on
 
 const vec3 BLUE_LINE = vec3(0.36, 0.62, 1.0);
 const vec3 BLUE_BAND = vec3(0.13, 0.3, 0.78);
@@ -878,6 +879,20 @@ void main() {
         float hd = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - u_holeR;
         c.a *= clamp(hd + 0.5, 0.0, 1.0);
     } else {
+        // the road while no map shows: a soft blue surface, solid outer lines and dashed lane lines in perspective
+        // from the horizon to the bottom line; the dashes run towards the driver with the speed (u_road.z)
+        if (u_road.w > 0.5 && p.y > u_road.x + 1.0 && p.y < u_geo.z - 3.0) {
+            float dy = p.y - u_road.x;
+            float xw = (p.x - u_size.x * 0.5) * u_road.y / dy;          // across, lanes 1 wide
+            float px = dy / u_road.y;                                   // screen px per lane
+            float fade = smoothstep(0.0, 70.0, dy) * (1.0 - smoothstep(-30.0, 0.0, p.y - u_geo.z + 3.0) * 0.5);
+            c = over(vec4(0.16, 0.36, 0.95, 0.5 * fade * cov((abs(xw) - 1.75) * px) * mix(0.55, 1.0, dy / (u_geo.z - u_road.x))), c);
+            float hw = 1.2 + dy * 0.012;                                // line half width px, wider nearer
+            float edge = cov(abs(abs(xw) - 1.5) * px - hw);
+            float dash = step(fract(u_road.y * 120.0 / dy + u_road.z), 0.5);
+            float lane = cov(abs(abs(xw) - 0.5) * px - hw) * dash;
+            c = over(vec4(0.85, 0.93, 1.0, fade * max(edge, lane)), c);
+        }
         c = bar(p, u_fuelSeg, u_fuel, 0.0, c);
         c = bar(p, u_oilSeg, u_oil, 1.0, c);
     }

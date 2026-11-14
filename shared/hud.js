@@ -76,7 +76,8 @@
  *   mtach     effect layer; the M rev bar: "side" left|right, "max" rpm, and in target px for the LEFT bar
  *             "y0" (0 rpm), "y8" (max), "ym" (the bend), "xm" (outer edge x at the bend; the right bar gives
  *             its own, mirrored), "kTop" / "kBot" (x per y px above / below the bend), "round", "wBot" / "wTop" / "wBend"
- *   sdash     effect layer; the whole Sport theme (shaders.js sdash): "geo" [yTop, yBend, yBottom, xBend] and
+ *   sdash     effect layer; the whole Sport theme (shaders.js sdash), optional "road" [horizonY, scale] (a road in the
+ *             middle while no map shows, its dashes running with the speed): "geo" [yTop, yBend, yBottom, xBend] and
  *             "k" [above, below, round] for the left bracket's outer line (the right one is mirrored), "band"
  *             width, "inner" (the inner line's distance from the outer one), "scale" [y of 0, y of the top mark],
  *             "ticks" [speed, rpm], "rpmMax" (speed follows SPEED_SCALE), "fuelSeg" / "oilSeg" [fullX, fullY,
@@ -191,6 +192,16 @@
  *   dropped at 12 or 5 and under, built again when the car is on.
  * HUD holiday colours (shared/hud_holiday.js, the "holiday" setting on the HUD target): the theme's accents in the holiday's
  *   colours, Christmas lights as a string of bulbs, and {{greeting}} (MERRY CHRISTMAS, ...) only while the car stands.
+ *   garland   image layer(s), never written in a layout: the holiday light string (shared/garland.js, Nov 13 2026). While the
+ *             "holiday" setting picks a holiday (holidays.js, either app) every layout gets one at rebuild time, as the
+ *             demo's DEMO tag: glowing C9 bulbs on a thin wire (colours: hud_holiday.js garland()) hung in swags under the
+ *             hood line on the cluster, along the top of the visible window on the HUD (tiny "fairy lights" in the strip
+ *             above a shift bar that fills the top), kept off every widget, the camera notch ("cameraNotch") and BMW's own
+ *             HUD area; split round what is in the way, smaller bulbs where the top is tight, none without room. Not on
+ *             the calibration layouts nor a theme with its own holiday art (Ribbon). Each stretch is its own image layer
+ *             ("own"), all on the first connection with room for them; past 28 layers in all they share one. Drawn on the
+ *             CPU once; while the car stands (under 3 km/h) a few bulbs dim for a moment (at most 4 redraws a second, only
+ *             those bulbs' rects sent), moving nothing changes. The rebuild log line "holiday lights" gives its boxes.
  * Text "colorBy": "verdict" colours it by the last shift's grade. Text "near": ["speed" | "rpm", i] turns it
  * "nearColor" (fg) while scale label i is the one nearest the value (BMW lights up the label by the needle).
  *
@@ -256,7 +267,9 @@ const ShiftCue = require('./shift_cue');            // the count-in shift lights
 const smartTemps = require('./smart_temps');        // "showWhen": "abnormal", temperature colours, slot bumping
 const hudHoliday = require('./hud_holiday');
 const DemoShow = require('./demo_script');
+const Garland = require('./garland');               // the holiday light string (widget type "garland")
 const DEMO_AMBER = [255, 176, 40];      // the DEMO tag's colour
+const CAL_LAYOUTS = { grid: true, wincal: true, mapcal: true };
 // sharing the HUD with other kit apps (Redline, issue #4): kit/runtime/hud_claim.js, from cauliflowermossgrape's kit
 // (MIT). HUD Widgets is a "standing" app, like Cluster functions: it gives way while another app holds a fresh
 // claim, and says it is on so that app hands the HUD back at the car's switch-off.
@@ -266,7 +279,7 @@ const CLAIM_MS = 1000;
 
 const BOOST_SCALE = { factor: 0.01, offset: 0, invalid: 255 }; // see header comment
 // the widget types drawn as pixels (image layers, packed into sheets unless "own": true); the rest are shaders
-const IMAGE_TYPES = { text: true, scale: true, stripe: true, badge: true, gridlabels: true, icon: true, swatchimg: true, nav: true };
+const IMAGE_TYPES = { text: true, scale: true, stripe: true, badge: true, gridlabels: true, icon: true, swatchimg: true, nav: true, garland: true };
 const STATUS_ASK_MS = 2000;      // after a rebuild: ask cluster-render for its own status text
 // an image layer is "stalled" until its first pixels reach cluster-render, which after a rebuild takes a second or two
 // through the upload budget: normal. Only one still stalled this long is logged as a problem (and its recovery)
@@ -315,6 +328,7 @@ const TILE_BAR = {
 };
 const TILE_MAX = 14;       // half a flash: red, then the normal colour
 // widgets that show the shift cue (the reaction time is learned only while one of them is drawn)
+const ROAD_DASH_M = 12;            // the Sport road: metres per dash and gap (shaders.js sdash u_road)
 const CUE_TYPES = { lights: true, shiftbar: true, revbar: true, revarc: true, ribbon: true, mtach: true, dial: true };
 // the shift-light test (page.js Alerts): rpm climbs from TEST_FROM to just past the shift point, then holds
 const TEST_FROM = 1500, TEST_CLIMB_MS = 2500, TEST_HOLD_MS = 1200;
@@ -825,7 +839,8 @@ class HudApp {
         this.tickTimer = setInterval(() => this._guard('tick', () => this._tick()), TICK_MS);
         // Auto theme: check for sunrise / sunset once a minute; the status line too
         this.themeTimer = setInterval(() => this._guard('theme check', () => {
-            if (this._themeName() !== this.themeName || this._nightDim() !== this.nightOn || this._hudHoliday() !== (this.hudHoliday || null)) this._rebuild();
+            if (this._themeName() !== this.themeName || this._nightDim() !== this.nightOn || this._hudHoliday() !== (this.hudHoliday || null) ||
+                this._holidayNow() !== (this.holidayAt || null)) this._rebuild();
             this._status();
             if (this.client.ready) this.client.status();      // the scene ids (scenesApart) can change: guard, update
         }), 60000);
@@ -1177,6 +1192,33 @@ class HudApp {
         if (this.target !== 'hud' || !this.ctx.settings.item('holiday')) return null;
         const d = this._localDate();
         return holidays.pick(this.setting('holiday'), d.y, d.m, d.d) || null;
+    }
+
+    /** The holiday the "holiday" setting picks today (holidays.js), or null: the light string's, on either target. */
+    _holidayNow() {
+        if (!this.ctx.settings.item('holiday')) return null;
+        const d = this._localDate();
+        return holidays.pick(this.setting('holiday'), d.y, d.m, d.d) || null;
+    }
+
+    /** The holiday whose light string (garland.js) this layout gets, or null: not on a calibration layout, nor on a
+     *  theme with holiday editions of its own (Ribbon hangs its own bulbs). */
+    _garlandHoliday(name, shown) {
+        if (['grid', 'wincal', 'mapcal'].indexOf(name) >= 0 || shown.some((w) => ['grid', 'gridlabels', 'swatch', 'swatchimg'].indexOf(w.type) >= 0)) return null;
+        const base = this.layoutTheme && THEMES[this.layoutTheme];
+        if (base && base.holidays) return null;
+        return this.holidayAt || null;
+    }
+
+    /** The light string's twinkle: while the car stands (under 3 km/h) a few bulbs dim for a moment, only their rects
+     *  sent, at most 4 times a second; while it moves every bulb is lit and nothing is sent. */
+    _garlandTick(x, now) {
+        if (!x.tw) return;
+        const sp = this.car.data().speed;
+        const changed = x.tw.step(now, isNum(sp) && sp < 3);
+        if (!changed.length) return;
+        const rects = x.tw.rects(changed);
+        if (rects.length) this._blit(x, rects, Buffer.concat(rects.map((r) => Garland.paint(x.w, x.tw.lvl, r))));
     }
 
     /** Night colours now: Cluster Themes' "nightDim" on Auto, a theme of the layout's own, and the sun down. */
@@ -1698,6 +1740,7 @@ class HudApp {
         this.car.setRedline(this.setting('redline'));
         const name = this._layoutName();
         this.activeName = name;
+        this.holidayAt = this._holidayNow();     // the light string's holiday (garland.js); the minute timer rebuilds when it changes
         this.mapLayout = false;
         this.mapShown = this.setting('mapUp');
         if (name === 'off') {
@@ -1737,10 +1780,22 @@ class HudApp {
         // that many times its members' own area, so far-apart readouts don't share one mostly empty sheet (pixel
         // memory); relaxed along with the size limit when the layer budget needs it. Without it: the size limit only.
         let waste = isNum(layout.packWaste) ? layout.packWaste : Infinity;
-        // the demo show's DEMO tag (demo_script.js), at a free spot that costs the fewest layers and pixels
-        if (this.demo && this.demo.playing()) {
+        // the demo show's DEMO tag (demo_script.js), at a free spot that costs the fewest layers and pixels. It is in every
+        // layout (drawn empty until the show plays), so pressing Play changes one small image and rebuilds nothing;
+        // the calibration layouts only get it while the show plays (there it would cost a layer)
+        if (this.demo && (this.demo.playing() || !CAL_LAYOUTS[name])) {
             const tag = DemoShow.tagWidget(this.target, shown, (l) => { const p = this._plan(l, Math.floor(area / SHEET_AREA_FRAC), waste); return { over: over(p), layers: p.length, px: p.reduce((a, e) => a + (e.kind === 'sheet' ? e.w * e.h : 0), 0) }; });
             if (tag) shown.push(tag);
+        }
+        // the holiday light string (garland.js): its own image layers on a connection with room for them
+        const gk = this._garlandHoliday(name, shown);
+        if (gk) {
+            const gs = Garland.place(this.target, shown, { camera: this._cameraOn(), colors: hudHoliday.garland(gk, this.target, this.nightOn),
+                cost: (l) => ({ counts: this._connCounts(this._plan(l, Math.floor(area / SHEET_AREA_FRAC), waste)) }) });
+            gs.forEach((g) => shown.push(g));
+            this.log.info('holiday lights (' + gk + '): ' + (gs.length ? gs.length + ' stretch' + (gs.length > 1 ? 'es' : '') + ', ' +
+                gs.reduce((a, g) => a + g.g.bulbs.length, 0) + ' bulbs (' + gs.map((g) => g.w + 'x' + g.h + ' at ' + g.x + ',' + g.y + ' scale ' + g.g.s).join(', ') + ')' +
+                ', connection ' + ((gs[0].conn || 0) + 1) : 'no room'));
         }
         let maxPx = Math.floor(area / SHEET_AREA_FRAC), plan = this._plan(shown, maxPx, waste);
         while (over(plan) && (maxPx !== Infinity || waste !== Infinity)) {
@@ -1898,6 +1953,7 @@ class HudApp {
             }
         } else if (w.type === 'gridlabels') this._paintGridLabels(x);
         else if (w.type === 'nav') this._navCreate(x);
+        else if (w.type === 'garland') { x.tw = new Garland.Twinkle(w); this._blit(x, null, Garland.paint(w, x.tw.lvl, null)); }
         else if (w.type === 'icon') this._blit(x, null, paintIcon(w.icon, w.w, w.h, color(t, w.color || 'fg')));
         else if (w.type === 'sdash') {
             c.uniform(ref, 'u_size', [w.w, w.h]);
@@ -1916,6 +1972,7 @@ class HudApp {
             c.uniform(ref, 'u_holeR', [this._holeRadius(w)]);
             c.uniform(ref, 'u_strip', w.strip);
             c.uniform(ref, 'u_topEnd', [w.topEnd]);
+            c.uniform(ref, 'u_road', w.road ? [w.road[0], w.road[1], 0, 1] : [0, 1, 0, 0]);
         } else if (w.type === 'mdash') {
             const ty = w.tyres || [0, 0, 0], L = w.gaugeL || {}, R = w.gaugeR || {}, b = w.blade || {};
             const bars = Array.isArray(w.segbars) ? w.segbars.slice(0, 4) : [];
@@ -2246,6 +2303,7 @@ class HudApp {
             x.last = s; x.lastPaint = now;
             x.c.uniform(x.ref, 'u_text', this._atlasCodes(x, s), { type: 'vec4' });
         } else if (w.type === 'nav') this._navUpdate(x, now, force);
+        else if (w.type === 'garland') this._garlandTick(x, now);
         else if (w.type === 'text') {
             if (!force && now - x.lastPaint < (w.rate || TEXT_MS)) return;
             const s = (w.navHide && this.navShown) || smartTemps.hidden(this, w) ? '' : this._resolve(w.text);   // nav turn showing / "showWhen": "abnormal"
@@ -2284,7 +2342,7 @@ class HudApp {
             this._blitDiff(x, buf);
         } else if (w.type === 'badge') {
             if (!force && now - x.lastPaint < TEXT_MS) return;
-            const s = w.navHide && this.navShown ? '' : this._resolve(w.text);
+            const s = (w.navHide && this.navShown) || (w.tone === 'demo' && !(this.demo && this.demo.playing())) ? '' : this._resolve(w.text);
             let tone = VERDICT.COLD, fresh = false;
             if (w.tone === 'demo') { tone = DEMO_AMBER; fresh = true; }  // the demo show's DEMO tag
             if (w.tone === 'verdict' && this.score.last) {
@@ -2412,9 +2470,17 @@ class HudApp {
                 q(isNum(fuel) ? fuel : 0),
                 q(isNum(oil) ? (oil - 50) / 100 : 0),
             ];
+            // the road's dashes: one dash and gap per ROAD_DASH_M metres driven, 1/64 steps (so standing still writes nothing)
+            if (w.road) {
+                const now = Date.now(), dt = x.roadT ? Math.min(1, (now - x.roadT) / 1000) : 0;
+                x.roadT = now;
+                x.roadPhase = ((x.roadPhase || 0) + (isNum(sp) ? Math.max(0, sp) / 3.6 : 0) * dt / ROAD_DASH_M) % 1;
+                vals.push(Math.round(x.roadPhase * 64) / 64);
+            }
             const key = vals.join('|');
             if (!force && key === x.last) return;
             x.last = key;
+            if (w.road) x.c.uniform(x.ref, 'u_road', [w.road[0], w.road[1], vals[4], 1]);
             x.c.uniform(x.ref, 'u_speed', [vals[0]]);
             x.c.uniform(x.ref, 'u_rpm', [vals[1]]);
             x.c.uniform(x.ref, 'u_fuel', [vals[2]]);

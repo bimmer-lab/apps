@@ -122,7 +122,7 @@ Layout, drive mode switching, which sensor each readout shows, where the HUD sit
 
 **Temperatures only when they matter** (off by default): oil and coolant show only while cold (blue), warming up (yellow) or over their limit (red). The outside temperature always turns blue at 3°C (37°F) and under, when ice is possible.
 
-**Holiday editions:** Auto (the default) puts on holiday colours by the date: Christmas (red, green and gold, the shift lights as a string of coloured bulbs, and MERRY CHRISTMAS while you're stopped), Thanksgiving, New Year and the Fourth of July. No snow or anything moving on the glass. Or pick one, or Off.
+**Holiday editions:** Auto (the default) puts on holiday colours by the date: Christmas (red, green and gold, a string of glowing Christmas lights along the top of the HUD, the shift lights as coloured bulbs, and MERRY CHRISTMAS while you're stopped), Thanksgiving, New Year and the Fourth of July, each with its own lights. The lights twinkle gently only while you're stopped; nothing moves on the glass while you drive. Or pick one, or Off.
 
 **Switching off:** the app puts nothing new on the HUD while the car is switching on or off, and takes its layers down at switch-off, so cluster-render never counts it against the HUD.
 

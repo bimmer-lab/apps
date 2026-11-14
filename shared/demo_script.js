@@ -31,6 +31,7 @@ const textRaster = require('./hud_text');
 const visible = require('./visible');
 
 const SHOW_MS = 60000;
+const START_MS = 3300;           // where Play starts in the script (the pull begins at 4 s)
 const SWITCH_MS = 30000;          // the drive-mode switch (Comfort -> Sport)
 const START_KMH = 3;              // starts only under this (the car's own speed)
 const STOP_KMH = 5;               // and stops past this
@@ -281,11 +282,12 @@ class DemoShow {
         if (!this.standing()) { this.log.info('demo show: not while the car moves'); return false; }
         this.plan = plan(this.hooks.redline(), this.hooks.shiftPoint());
         this.hooks.begin();
-        this.t0 = Date.now() - clamp(Number(at) || 0, 0, SHOW_MS - 1000); this.on = true;
+        // the script's first 4 s are idle: start 0.7 s before the first pull so something happens at once
+        this.t0 = Date.now() - clamp(Math.max(START_MS, Number(at) || 0), 0, SHOW_MS - 1000); this.on = true;
         this._reset();
         this.modes = this.hooks.modes() || [];
         this.modeAt = this.modes[0] || null;
-        this.hooks.drive(this.modeAt, true);
+        this.hooks.drive(this.modeAt, false);
         this.log.info('demo show: playing (' + SHOW_MS / 1000 + ' s' + (this.modes.length ? ', drive mode ' + this.modes.join(' > ') : '') + ')');
         this.timer = setInterval(() => { try { this._tick(); } catch (e) { this.log.warn('demo show: ' + e); this.stop('error'); } }, TICK_MS);
         return true;
@@ -298,7 +300,7 @@ class DemoShow {
         this._reset();
         this.log.info('demo show: stopped (' + (why || 'stop') + ')');
         try { this.hooks.end(); } catch (e) { this.log.warn('demo show end: ' + e); }
-        try { this.hooks.drive(null, true); } catch (e) { this.log.warn('demo show drive: ' + e); }
+        try { this.hooks.drive(null, false); } catch (e) { this.log.warn('demo show drive: ' + e); }
     }
 
     _reset() { this.listeners.forEach((l) => { try { if (l.reset) l.reset(); } catch (e) { this.log.warn('demo show reset: ' + e); } }); }

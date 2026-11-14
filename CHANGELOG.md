@@ -4,6 +4,15 @@ Newest first. Dates are when the build was pushed.
 
 ## Nov 13 2026
 
+- **Cluster Themes 0.17.0, HUD Widgets 0.14.0:**
+  - **Cleaner cluster themes:** every theme now ends just above BMW's own bottom strip, so the car's range, clock, street, drive mode and outside temperature always show and no theme repeats them. Every theme shows the drive mode next to the gear. Readouts that used to show the clock, range or outside temperature now show fuel (GT3, Roadster, Rally), torque and power (Roadster), or your shift point and last shift (Dyno). Ribbon shows your average speed in their place, Cruise shows oil, coolant and rpm, and Drag, Track and Minimal gained fuel, oil or coolant.
+  - **M:** the tyre block is gone. In its place are four readouts, boost, coolant, oil and intake air out of the box, each one changeable on the Readouts tab. The four setup rows sit together where the M8 has them, and the badge moved off the M stripes. With the Waze map on, the blades keep their shape and numbers and move out to the sides, the map fills the middle, and the gear, speed and drive mode sit in a row under it.
+  - **Sport:** a big speed in the middle with the gear and drive mode under it, over a road like BMW's own Sport view whose lane dashes run towards you at your speed. The fuel and oil bars moved up the brackets, and the boost and coolant bar sits higher, clear of BMW's strip.
+  - **M and Sport no longer leave a gap for BMW's black gear box.** It may be a leftover of a coding change; if your car still draws it, it can cover part of the right side.
+  - **Holiday lights:** a string of glowing lights along the top of every cluster theme and the HUD while a holiday edition is on (Christmas, Thanksgiving, New Year, Fourth of July). They twinkle gently only while you're stopped. The Cluster Themes setting is now called **Holiday editions** and covers every theme, not just Ribbon.
+  - **Play demo starts faster:** it no longer reloads the layout to start or stop.
+  - **Time zone names:** BMW's own settings list now shows the zone names (Not set (UTC), US Eastern, UTC+5:30 and so on) instead of number codes.
+  - Not yet tested on a car.
 - **Cluster Themes 0.16.0, HUD Widgets 0.13.0:**
   - **Directions on the HUD:** while a route runs, the next turn, its distance and the street or lanes show in a corner of every HUD layout, with "then" for a turn close behind and roundabout exits. Ported from Redline (cauliflowermossgrape/idrive7-apps, MIT). Works with CarPlay and Apple Maps; Waze over CarPlay sends the car no turns. Setting: While a route runs / Near turns / Off.
   - **Play demo:** a button on both apps' pages plays a 60-second show on the HUD or cluster while the car stands, with a DEMO tag. It stops as soon as the car moves, and nothing from it is kept. **Demo data On** now also switches back to the car's own data as soon as the car moves faster than 5 km/h.
