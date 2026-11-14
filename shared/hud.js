@@ -499,6 +499,10 @@ class HudApp {
         this.problem = null;             // why nothing shows (a bad layout), for the status line
         this.statusListeners = [];
         this.lastStatus = null;
+        this.modeDiag = {};              // issue #8 (M cars): the raw drive-mode candidates by short name, shown while byMode is on
+        this.modeDiagLogged = {};        // how many distinct values of each went to the log (20 at most)
+        this.lastDiag = '';
+        this.diagTimer = null;
 
         this.slotsFile = path.join(ctx.dataDir || '.', 'slots.json');
         this.slotPicks = {};             // { layout: { slot id: sensor id } }: the readout slots' picks (page.js Readouts)
@@ -700,6 +704,8 @@ class HudApp {
             },
             // S / M next to the gear: the gearbox status carries no programme on some cars, the M drive display does
             'de.bmw.infotainment.misc.MDrive': {
+                // issue #8: what an M car keeps here (car_vitals reads xDrive from it), for the drive mode check
+                statusMSystem: (v) => this._diag('MSystem', v),
                 dataDisplayGearbox: (v) => {
                     const raw = v && v.displayProgramGearbox;
                     this.program = PROGRAMS[raw] || null;
@@ -716,6 +722,7 @@ class HudApp {
             },
             'de.bmw.infotainment.drivingexcitement.FES': {
                 statusSwitchDriveDynamicSport2: (v) => {
+                    this._diag('Sport2', v, ['displayBoostPressure', 'displayMaximumValueBoostPressure']);
                     const raw = v && v.displayBoostPressure;
                     if (typeof raw !== 'number' || raw === BOOST_SCALE.invalid) return;
                     this.boostFes = raw * BOOST_SCALE.factor + BOOST_SCALE.offset;
@@ -723,12 +730,14 @@ class HudApp {
                 },
                 // the HMI's sport display: power and torque in % of the car's maximum (car_vitals, MIT); 255 = none
                 statusVehicleDynamicEngine: (v) => {
+                    this._diag('Engine', v, ['displaySportEnginePower', 'displaySportEngineTorque']);
                     const p = v && v.displaySportEnginePower, t = v && v.displaySportEngineTorque;
                     this.sportPower = isNum(p) && p >= 0 && p <= 150 ? p : null;
                     this.sportTorque = isNum(t) && t >= 0 && t <= 150 ? t : null;
                     this.sportAt = Date.now();
                 },
                 statusFESVehicleDynamicSwitchHMI: (v) => {
+                    this._diag('HMI', v);
                     const raw = v && v.actualValueModeDrivingExperience;
                     const m = driveModeOf(raw), variant = m ? driveVariantOf(raw) : null;
                     if (!m) {
@@ -1167,9 +1176,35 @@ class HudApp {
     _status() {
         // the Waze map's state rides along while that setting is on (and redraws the page's Map tab when it changes)
         const s = this.statusText() + (this.waze && this.setting('mapInTheme') === true ? '; Waze: ' + this.waze.info().text : '');
-        if (s === this.lastStatus) return;
-        this.lastStatus = s;
+        const d = this.modeDiagLines().join('\n');
+        if (s === this.lastStatus && d === this.lastDiag) return;
+        this.lastStatus = s; this.lastDiag = d;
         this.statusListeners.forEach((fn) => { try { fn(s); } catch (e) { this.log.warn('status listener: ' + e); } });
+    }
+
+    /**
+     * Issue #8: M cars keep FES's drive mode on Comfort whatever their M Setup says, so the real mode is somewhere
+     * else. While "Change with the drive mode" is on, the Settings tab shows the raw contents of the candidates
+     * (FES HMI switch, FES engine display, FES sport display 2, MDrive M system) for a driver to photograph in each
+     * mode. Fields that change all the time while driving (boost, power, torque) are left out. Never throws.
+     */
+    _diag(name, v, drop) {
+        try {
+            let o = v;
+            if (v && typeof v === 'object' && drop) { o = {}; Object.keys(v).forEach((k) => { if (drop.indexOf(k) < 0) o[k] = v[k]; }); }
+            const t = String(JSON.stringify(o)).replace(/"/g, '').slice(0, 84);
+            if (this.modeDiag[name] === t) return;
+            this.modeDiag[name] = t;
+            const n = this.modeDiagLogged[name] = (this.modeDiagLogged[name] || 0) + 1;
+            if (n <= 20) this.log.info('drive mode check ' + name + ': ' + t);
+            // at most two page redraws a second, however often a value changes
+            if (!this.diagTimer) this.diagTimer = setTimeout(() => { this.diagTimer = null; try { this._status(); } catch (e) { /* next status */ } }, 500);
+        } catch (e) { /* a diagnostic never stops the app */ }
+    }
+    /** The drive mode check's lines for the Settings tab (one per signal), [] while byMode is off. */
+    modeDiagLines() {
+        if (this.setting('byMode') !== true) return [];
+        return ['HMI', 'MSystem', 'Engine', 'Sport2'].map((n, i) => (i ? '' : 'Drive mode check: ') + n + '  ' + (this.modeDiag[n] || '--'));
     }
 
 /* ---------------- theme, units, values ---------------- */

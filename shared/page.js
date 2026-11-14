@@ -615,6 +615,10 @@ class Page {
         });
         // what the engine says it is doing (layers, pixel memory, why nothing shows): for checking on the car
         cv.text(this.hud.lastStatus || '', CX, bottom - 6, 15, C.label, { literal: true });
+        // issue #8: the drive mode check (raw signal values) under the right column while "Change with the drive mode" is on
+        const diag = this.hud.modeDiagLines ? this.hud.modeDiagLines() : [];
+        const dy = 84 + (keys.length - per) * 64 + 10;
+        diag.forEach((t, i) => { if (dy + 20 * i < bottom - 16) cv.text(t, CX + colW + 24, dy + 20 * i, 15, C.label, { literal: true }); });
     }
 
     /* ---------- rows ---------- */

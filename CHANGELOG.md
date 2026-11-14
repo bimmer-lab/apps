@@ -4,6 +4,7 @@ Newest first. Dates are when the build was pushed.
 
 ## Nov 13 2026
 
+- **Cluster Themes 0.17.2:** a drive mode check for M cars (issue #8). With Change with the drive mode on, the Settings tab lists what the car sends on four signals, so an M owner can photograph it in Efficient, Sport and Sport+ and the M modes can be added. Nothing else changes.
 - **Cluster Themes 0.17.1:** Badge: added the 545e (issue #10).
 - **Cluster Themes 0.17.0, HUD Widgets 0.14.0:**
   - **Cleaner cluster themes:** every theme now ends just above BMW's own bottom strip, so the car's range, clock, street, drive mode and outside temperature always show and no theme repeats them. Every theme shows the drive mode next to the gear. Readouts that used to show the clock, range or outside temperature now show fuel (GT3, Roadster, Rally), torque and power (Roadster), or your shift point and last shift (Dyno). Ribbon shows your average speed in their place, Cruise shows oil, coolant and rpm, and Drag, Track and Minimal gained fuel, oil or coolant.
