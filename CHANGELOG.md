@@ -4,6 +4,7 @@ Newest first. Dates are when the build was pushed.
 
 ## Nov 13 2026
 
+- **Cluster Themes 0.17.1:** Badge: added the 545e (issue #10).
 - **Cluster Themes 0.17.0, HUD Widgets 0.14.0:**
   - **Cleaner cluster themes:** every theme now ends just above BMW's own bottom strip, so the car's range, clock, street, drive mode and outside temperature always show and no theme repeats them. Every theme shows the drive mode next to the gear. Readouts that used to show the clock, range or outside temperature now show fuel (GT3, Roadster, Rally), torque and power (Roadster), or your shift point and last shift (Dyno). Ribbon shows your average speed in their place, Cruise shows oil, coolant and rpm, and Drag, Track and Minimal gained fuel, oil or coolant.
   - **M:** the tyre block is gone. In its place are four readouts, boost, coolant, oil and intake air out of the box, each one changeable on the Readouts tab. The four setup rows sit together where the M8 has them, and the badge moved off the M stripes. With the Waze map on, the blades keep their shape and numbers and move out to the sides, the map fills the middle, and the gear, speed and drive mode sit in a row under it.
