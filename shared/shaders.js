@@ -1739,4 +1739,306 @@ void main() {
 }
 `;
 
-module.exports = { shiftbar: SHIFTBAR, arc: ARC, revbar: REVBAR, lights: LIGHTS, fill: FILL, box: BOX, grid: GRID, segbar: SEGBAR, mdash: MDASH, mtach: MTACH, sdash: SDASH, boxes: BOXES, atext: ATEXT, meter: METER, gmeter: GMETER, revarc: REVARC, tiles: TILES, ribbon: RIBBON, deco: DECO, mview: MVIEW, vdash: VDASH };
+const E36DASH = `// The E36 theme (layouts e36.json, made by tools/gen_e36.py) in one cluster-render "effect" layer (GLSL ES 1.00): the
+// BMW E36 328i cluster of the 90s. The black bezel and the dark grey face (a rounded box under a wide arch), four black
+// dials (fuel, speed, revs, coolant) with their ticks, coloured zones (the red rev zone, the fuel and coolant blocks),
+// the LCD and lamp windows (BMW draws its own turn arrows over the cluster). The printed figures are text widgets on top; the economy gauge is
+// its own small layer (e36econ) and the needles another on top of everything (e36needles), as on the car where they
+// sweep over the print. Under the face, in BMW's bottom row, the black warning-light strips: drawn by the same shader
+// in pieces round the holes where BMW's own items show (gen_e36.py HOLES). Every position is in target px;
+// u_origin is this layer's own top-left. v_uv (0,0) is the top-left.
+// Kept light for the cluster's GPU (tools/shader_budget.js): no lookups inside loops, each loop skips what is far away.
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+varying vec2 v_uv;
+uniform vec2 u_size;
+uniform vec2 u_origin;
+uniform vec3 u_col[12];    // bezel, face, dial, mark, needle, hub, red, blue, orange, well, strip, bg
+uniform vec4 u_face;       // the face's box: x0, y0, x1, y1
+uniform vec4 u_faceB;      // its corner radius, the arch's centre x, y and radius
+uniform float u_bezel;     // the black bezel round the face, px
+uniform vec4 u_dial[4];    // fuel, speed, revs, coolant: centre x, y, radius, flat cut y below (0 = none)
+uniform vec2 u_piv[4];     // their needles' pivots (the ticks and zones turn round them)
+uniform vec4 u_tick[10];   // tick groups: first angle, last angle, count (0 = none), outer radius
+uniform vec4 u_tickB[10];  // length, width, dial index (they turn round its pivot), (unused)
+uniform vec4 u_zone[6];    // zones: from angle, to angle, inner radius, outer radius
+uniform vec2 u_zoneB[6];   // dial index (round its pivot); colour 0 red, 1 blue, 2 orange (-1 none) + 4 x stripes
+uniform vec4 u_win[3];     // windows (LCD, top lamp, ASC or the M3's /M plate): x, y, w, h (w 0 = none)
+uniform vec3 u_winR;       // their corner radii
+uniform float u_light;     // daylight: 1 by day, 0 at night (the glass's glare goes, the depth stays)
+uniform vec4 u_strip[3];   // the warning-light strips: x, y, w, h (w 0 = none)
+uniform float u_stripR;    // their corner radius
+
+float cov(float d) { return clamp(0.5 - d, 0.0, 1.0); }
+vec3 put(vec3 c, vec3 col, float a) { return mix(c, col, clamp(a, 0.0, 1.0)); }
+// a fixed noise per pixel (no sin: it loses precision at screen coordinates)
+float hash(vec2 p) { vec3 q = fract(p.xyx * 0.1031); q += dot(q, q.yzx + 33.33); return fract((q.x + q.y) * q.z); }
+float boxd(vec2 p, vec4 r, float rad) {
+    vec2 hs = r.zw * 0.5;
+    vec2 q = abs(p - (r.xy + hs)) - hs + rad;
+    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - rad;
+}
+vec2 dir(float a) { float r = radians(a); return vec2(sin(r), -cos(r)); }
+
+void main() {
+    vec2 p = v_uv * u_size + u_origin;
+    vec3 c = u_col[11];
+    vec3 BEZEL = u_col[0], FACE = u_col[1], MARK = u_col[3];
+
+    // the bezel and the face: a rounded box under a wide arch. The face is grained plastic, in the hood's shadow under
+    // the arch and a little along every edge (it sits below the bezel)
+    float ad = length(p - u_faceB.yz) - u_faceB.w;
+    float fd = max(boxd(p, vec4(u_face.xy, u_face.zw - u_face.xy), u_faceB.x), ad);
+    c = put(c, BEZEL, cov(fd - u_bezel));
+    float hood = smoothstep(-110.0, 0.0, ad);
+    float grain = hash(p) * 0.6 + hash(floor(p * 0.5)) * 0.4 - 0.5;
+    c = put(c, FACE * (1.0 + 0.14 * grain) * (1.0 - 0.5 * hood * hood) * (1.0 - 0.3 * smoothstep(-14.0, 0.0, fd)), cov(fd));
+
+    // the dials: black discs with a dark rim, cut flat at the bottom where the LCD and the economy gauge sit. They never
+    // overlap, so the one this pixel is in (if any) is found once and only its ticks and zones are drawn.
+    float K = -1.0;
+    vec2 V = vec2(0.0);
+    vec4 G = vec4(0.0);
+    for (int i = 0; i < 4; i++) {
+        vec4 g = u_dial[i];
+        if (length(p - g.xy) - g.z > 6.0) continue;
+        K = float(i); V = u_piv[i]; G = g;
+    }
+    if (K >= 0.0) {
+        float dc = length(p - G.xy) - G.z;
+        // a cut dial ends flat, its rim along the flat (the rev counter just under the economy gauge's ticks);
+        // the speedometer ends just under the LCD (u_win[0])
+        vec4 w = u_win[0];
+        bool lcd = K == 1.0 && w.z > 0.0;
+        float bot = w.y + w.w;
+        float cut = lcd ? p.y - bot - 4.0 : G.w > 0.0 ? p.y - G.w : -1.0;
+        // the dial sits in a well: its wall dark at the top (facing down), lit at the bottom (facing up); the black dial
+        // a shade lighter below its centre, where the light reaches
+        float low = clamp((p.y - G.y) / G.z * 0.7 + 0.5, 0.0, 1.0);
+        c = put(c, mix(BEZEL * 0.5, FACE * 0.9, low * low), cov(max(dc - 4.0, cut - 4.0)));
+        float inDial = cov(max(dc, cut));
+        c = put(c, u_col[2] + 0.03 * (1.0 - smoothstep(0.0, G.z, length(p - G.xy - vec2(0.0, G.z * 0.3)))), inDial);
+        if (lcd) {
+            // the LCD's window cut up into the speedometer: level over the LCD, then shoulders sloping down to the
+            // rim, grey either side of the LCD
+            float hx = max(abs(p.x - w.x - w.z * 0.5) - w.z * 0.5, 0.0);
+            c = put(c, FACE * 1.15, cov(max(max(dc + 3.0, p.y - bot), (w.y - 3.0 + hx * 0.42 - p.y) * 0.92)));
+        }
+
+        vec2 d = p - V;
+        float r = length(d), a = degrees(atan(d.x, -d.y));
+
+        // the zones (the red rev zone and its stripes, the fuel and coolant blocks)
+        for (int i = 0; i < 6; i++) {
+            vec2 b = u_zoneB[i];
+            if (b.x != K || b.y < 0.0) continue;
+            vec4 z = u_zone[i];
+            float dd = max(radians(max(z.x - a, a - z.y)) * r, max(z.z - r, r - z.w));
+            float n = floor(b.y / 4.0), k = b.y - n * 4.0;
+            if (n > 0.0) dd = max(dd, (abs(fract((a - z.x) / (z.y - z.x) * n) - 0.3) - 0.3) * radians(z.y - z.x) / n * r);
+            c = put(c, k < 0.5 ? u_col[6] : k < 1.5 ? u_col[7] : u_col[8], cov(dd));
+        }
+
+        // the ticks, evenly spaced in each group
+        for (int i = 0; i < 10; i++) {
+            vec4 g = u_tick[i], h = u_tickB[i];
+            if (h.z != K || g.z <= 0.0) continue;
+            float sp = g.z > 1.0 ? (g.y - g.x) / (g.z - 1.0) : 1.0;
+            float k = g.z > 1.0 ? clamp(floor((a - g.x) / sp + 0.5), 0.0, g.z - 1.0) : 0.0;
+            c = put(c, MARK, cov(max(abs(radians(a - (g.x + k * sp))) * r - h.y * 0.5, max(g.w - h.x - r, r - g.w))));
+        }
+
+        // the rim's shadow on the dial and its print, the light from above: where the point a little above is under the
+        // face, this one is in its shade (a crescent under the top rim)
+        c *= 1.0 - 0.55 * inDial * smoothstep(-24.0, 4.0, length(p - vec2(0.0, 16.0) - G.xy) - G.z);
+    }
+
+    // the windows (LCD, top lamp, ASC), over the dials' bevels; the LCD inside the speedometer's rim (it clips a corner)
+    float dsp = length(p - u_dial[1].xy) - u_dial[1].z + 3.0;
+    for (int i = 0; i < 3; i++) {
+        float rad = i == 0 ? u_winR.x : i == 1 ? u_winR.y : u_winR.z;
+        float d = boxd(p, u_win[i], rad);
+        if (i == 0) d = max(d, dsp);
+        float on = step(0.5, u_win[i].z);
+        // sunk like the dials: the frame dark at the top, lit at the bottom, the top edge's shade inside
+        float low = clamp((p.y - u_win[i].y) / max(u_win[i].w, 1.0), 0.0, 1.0);
+        c = put(c, mix(BEZEL * 0.6, FACE * 0.9, low), cov(d - 2.0) * on);
+        c = put(c, u_col[9] * (1.0 - 0.5 * smoothstep(-10.0, 2.0, boxd(p - vec2(0.0, 7.0), u_win[i], rad))), cov(d) * on);
+    }
+
+    // the cluster is lit from the middle: its ends fall off a little
+    c *= 1.0 - 0.18 * smoothstep(560.0, 1000.0, abs(p.x - u_faceB.y));
+    // the glass over it all, by day: a broad soft band of sky across it, a narrow one on the right, brighter under the
+    // hood's arch, a thin bright line where the glass meets the bezel's top
+    float bx = p.x + 0.55 * p.y;
+    float b1 = (bx - 560.0) / 240.0, b2 = (bx - 1560.0) / 110.0;
+    float sky = 0.055 * exp(-b1 * b1) + 0.03 * exp(-b2 * b2) + 0.045 * smoothstep(-240.0, 0.0, ad);
+    sky += 0.12 * cov(abs(fd - u_bezel + 2.0) - 0.8) * smoothstep(420.0, 80.0, p.y);
+    c = mix(c, vec3(0.86, 0.9, 0.96), sky * u_light * cov(fd - u_bezel));
+
+    // the warning-light strips, last: flat black like BMW's own row that shows through their holes (no glare, no
+    // grain, or the holes' edges would show), in a dark rim sunk into the face
+    if (p.y > u_strip[0].y - 4.0) {
+        for (int i = 0; i < 3; i++) {
+            float d = boxd(p, u_strip[i], u_stripR), on = step(0.5, u_strip[i].z);
+            c = put(c, BEZEL * 0.6, cov(d - 2.0) * on);
+            c = put(c, u_col[10], cov(d) * on);
+        }
+    }
+
+    gl_FragColor = vec4(c, 1.0);
+}
+`;
+
+const E36ECON = `// The E36 theme's economy gauge, or the M3's oil temperature gauge (widget e36econ, tools/gen_e36.py): its own small
+// layer over the rev counter's lower cut, so its tick loop runs over that window only. See-through except the window's top line (level, its two corners
+// cut off down to the dial's rim) and the ticks (as printed, end to end: the right-hand ones lean over); its needle is
+// e36needles'. Positions in target px, u_origin the layer's top-left. v_uv (0,0) is the top-left.
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+varying vec2 v_uv;
+uniform vec2 u_size;
+uniform vec2 u_origin;
+uniform vec3 u_mark;       // the ticks' colour
+uniform vec3 u_line;       // the window's top line
+uniform vec4 u_econ;       // (unused), (unused), (unused), the window's top y
+uniform vec4 u_cham;       // the window's top corners: left corner x, its slope down to the left, right corner x, its slope
+uniform vec4 u_tach;       // the rev counter's centre x, y, radius, flat cut y (the window ends at its edge and cut)
+uniform vec4 u_econT[16];  // the ticks: x0, y0, x1, y1 (width 0 = none)
+uniform vec4 u_econW[4];   // their widths, four to a vec4
+
+float cov(float d) { return clamp(0.5 - d, 0.0, 1.0); }
+
+void main() {
+    vec2 p = v_uv * u_size + u_origin;
+    float inDial = cov(length(p - u_tach.xy) - u_tach.z + 5.0) * cov(p.y - u_tach.w);
+    // the window's top edge at this x, and how far below it this pixel is (px, square to the edge)
+    float kl = u_cham.y * step(p.x, u_cham.x), kr = u_cham.w * step(u_cham.z, p.x);
+    float top = u_econ.w + (u_cham.x - p.x) * kl + (p.x - u_cham.z) * kr;
+    float below = (p.y - top) / sqrt(1.0 + kl * kl + kr * kr);
+    vec3 c = u_mark;
+    float al = 0.0;
+    float line = cov(abs(below) - 1.2);
+    c = mix(c, u_line, line); al = max(al, line);
+    for (int j = 0; j < 4; j++) {
+        vec4 W = u_econW[j];
+        for (int k = 0; k < 4; k++) {
+            vec4 t = u_econT[j * 4 + k];
+            float w = k == 0 ? W.x : k == 1 ? W.y : k == 2 ? W.z : W.w;
+            vec2 ba = t.zw - t.xy, pa = p - t.xy;
+            float len = length(ba);
+            vec2 u = ba / max(len, 0.001);
+            float along = dot(pa, u), across = abs(pa.x * u.y - pa.y * u.x);
+            float m = cov(max(across - w * 0.5, max(-along, along - len))) * step(0.01, w);
+            c = mix(c, u_mark, m); al = max(al, m);
+        }
+    }
+    gl_FragColor = vec4(c, al * inDial);
+}
+`;
+
+const E36NEEDLES = `// The E36 theme's needles (widget e36needles, tools/gen_e36.py), a see-through layer over the face (e36dash), the
+// economy gauge (e36econ) and the printed figures and icons, as on the car where the needles sweep over the print: the
+// economy (or the M3's oil) needle first, kept inside its window, then the four dials' needles with their dark
+// counterweights and hubs (the rev counter's over the economy one). The dials' needles move by the renderer's own clock
+// (u_time, layer "time" 1) along paths the app sends (shared/e36.js nextPath), so they move on every display frame.
+// Positions in target px, u_origin the layer's top-left. v_uv (0,0) is the top-left.
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+varying vec2 v_uv;
+uniform vec2 u_size;
+uniform vec2 u_origin;
+uniform vec3 u_col[3];     // needle, hub, bezel (the dark ring round the hub)
+uniform vec4 u_piv[4];     // fuel, speed, revs, coolant: pivot x, y, hub radius, counterweight length
+uniform vec2 u_ndl[4];     // needle length, width (length 0 = none)
+uniform vec4 u_path[8];    // per needle (fuel, speed, revs, coolant) a path: its keys' times (the first in u_time's
+                           // seconds, the others after it), then their angles (degrees clockwise from 12 o'clock)
+uniform float u_time;      // the renderer's clock: seconds since the layer was attached, 0 .. 3600 and again
+uniform vec4 u_econ;       // the economy needle: pivot x, y, length (0 = none), its window's top y
+uniform vec2 u_econB;      // its angle, width
+uniform vec4 u_cham;       // the window's top corners: left corner x, its slope down to the left, right corner x, its slope
+uniform vec4 u_tach;       // the rev counter's centre x, y, radius, flat cut y (the window ends at its edge and cut)
+uniform float u_light;     // daylight: 1 by day, 0 at night (softer shadows)
+
+float cov(float d) { return clamp(0.5 - d, 0.0, 1.0); }
+vec2 dir(float a) { float r = radians(a); return vec2(sin(r), -cos(r)); }
+// a path's angle now (shared/e36.js pathAt): straight between its keys, held after the last, back along the first leg
+// before the first (up to 0.25 s; further back the clocks disagree: the first key); across the clock's wrap at 3600 s
+float ang(vec4 T, vec4 A) {
+    float s = u_time - T.x;
+    s -= 3600.0 * floor((s + 1800.0) / 3600.0);
+    if (s < -0.25) return A.x;
+    if (s < T.y) return A.x + (A.y - A.x) * s / max(T.y, 0.0001);
+    if (s < T.z) return A.y + (A.z - A.y) * (s - T.y) / max(T.z - T.y, 0.0001);
+    return A.z + (A.w - A.z) * min(1.0, (s - T.z) / max(T.w - T.z, 0.0001));
+}
+// a fixed noise per pixel (no sin: it loses precision at screen coordinates)
+float hash(vec2 p) { vec3 q = fract(p.xyx * 0.1031); q += dot(q, q.yzx + 33.33); return fract((q.x + q.y) * q.z); }
+// a dial's needle at d from its pivot, pointing u: the distances to its counterweight, its bar (tapered) and its hub
+vec3 parts(vec2 d, vec2 u, vec4 V, vec2 N) {
+    float t = dot(d, u), side = abs(d.x * u.y - d.y * u.x);
+    float wt = mix(N.y, N.y * 0.55, clamp(t / N.x, 0.0, 1.0)) * 0.5;
+    return vec3(max(side - N.y * 1.1, max(t, -t - V.w)), max(side - wt, max(-t, t - N.x)), length(d) - V.z);
+}
+
+void main() {
+    vec2 p = v_uv * u_size + u_origin;
+    vec3 c = u_col[0];
+    float al = 0.0;
+
+    // the economy needle, under the window's top line only
+    if (u_econ.z > 0.0) {
+        float kl = u_cham.y * step(p.x, u_cham.x), kr = u_cham.w * step(u_cham.z, p.x);
+        float top = u_econ.w + (u_cham.x - p.x) * kl + (p.x - u_cham.z) * kr;
+        float below = (p.y - top) / sqrt(1.0 + kl * kl + kr * kr);
+        float inWin = cov(2.0 - below) * cov(length(p - u_tach.xy) - u_tach.z + 5.0) * cov(p.y - u_tach.w);
+        vec2 ed = p - u_econ.xy;
+        vec2 u = dir(u_econB.x);
+        float t = dot(ed, u), side = abs(ed.x * u.y - ed.y * u.x);
+        float n = cov(max(side - u_econB.y * 0.5, max(-t, t - u_econ.z))) * inWin;
+        c = mix(c, u_col[0], n); al = max(al, n);
+    }
+
+    // the dials' needles never reach each other: the one this pixel is near (if any) is found once, then drawn
+    float K = -1.0;
+    vec4 V = vec4(0.0), PT = vec4(0.0), PA = vec4(0.0);
+    vec2 N = vec2(0.0);
+    for (int i = 0; i < 4; i++) {
+        vec4 v = u_piv[i];
+        vec2 n = u_ndl[i];
+        if (n.x <= 0.0 || length(p - v.xy) > max(n.x, v.w) + n.y + 16.0) continue;
+        K = float(i); V = v; N = n; PT = u_path[2 * i]; PA = u_path[2 * i + 1];
+    }
+    if (K >= 0.0) {
+        vec2 d = p - V.xy, u = dir(ang(PT, PA));
+        // its shadow first (over the economy needle, which lies lower): the needle stands off the dial, the light from
+        // above and a little left. "Over" in straight alpha: what is drawn next covers what is under it
+        vec3 s = parts(d - vec2(3.0, 8.0), u, V, N);
+        float m = clamp(0.5 - min(min(s.x, s.y), s.z - 1.5) / 7.0, 0.0, 1.0) * (0.3 + 0.2 * u_light);
+        float o = m + al * (1.0 - m);
+        c = c * al * (1.0 - m) / max(o, 0.0001); al = o;
+        // a tapered bar from the pivot, a counterweight (tail) behind it, the hub over both: hub and tail one flat piece of fine-grained
+        // plastic, as on the car
+        vec3 q = parts(d, u, V, N);
+        vec3 cap = u_col[1] * (1.0 + 0.3 * (hash(p) * 0.6 + hash(floor(p * 0.5)) * 0.4 - 0.5));
+        for (int j = 0; j < 4; j++) {
+            m = cov(j == 0 ? q.x : j == 1 ? q.y : j == 2 ? q.z - 1.5 : q.z);
+            vec3 col = j == 0 ? cap : j == 1 ? u_col[0] : j == 2 ? u_col[2] : cap;
+            o = m + al * (1.0 - m);
+            c = (col * m + c * al * (1.0 - m)) / max(o, 0.0001); al = o;
+        }
+    }
+    gl_FragColor = vec4(c, al);
+}
+`;
+
+module.exports = { shiftbar: SHIFTBAR, arc: ARC, revbar: REVBAR, lights: LIGHTS, fill: FILL, box: BOX, grid: GRID, segbar: SEGBAR, mdash: MDASH, mtach: MTACH, sdash: SDASH, boxes: BOXES, atext: ATEXT, meter: METER, gmeter: GMETER, revarc: REVARC, tiles: TILES, ribbon: RIBBON, deco: DECO, mview: MVIEW, vdash: VDASH, e36dash: E36DASH, e36econ: E36ECON, e36needles: E36NEEDLES };

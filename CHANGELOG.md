@@ -2,6 +2,41 @@
 
 Newest first. Dates are when the build was pushed.
 
+## Nov 18 2026
+
+- **Cluster Themes 0.20.7:** E36:
+  - The coolant gauge holds the middle from 85 to 105 °C, as the car's own gauge does, so a warm engine reads dead centre instead of a little over it; it only moves off the middle when the engine runs cooler or hotter than that.
+  - No turn arrows on the face any more: BMW draws its own over the cluster.
+
+## Nov 17 2026
+
+- **Cluster Themes 0.20.6:** E36:
+  - The warning-light strips along the bottom are a little taller, all the way across, so a two-line drive mode (SPORT / INDIVIDUAL) fits; the fuel and coolant gauges and the small window between the dials (ASC, or the M3's /M badge) moved up with them.
+  - The speedometer's flat bottom is level with the rev counter's: the LCD sits a little lower in its dial.
+- **Cluster Themes 0.20.5:** E36:
+  - The face round the dials is darker again by day (its rim with it).
+  - The range's fuel pump icon on the LCD is smaller, 80 % of the figures' height.
+  - The hole for BMW's drive mode starts just before it, so a long street name in the middle of BMW's row stays hidden, and it is open a little above the row, so a two-line mode (SPORT / INDIVIDUAL) is no longer cut off at the top.
+- **Cluster Themes 0.20.4:** E36: the range's fuel pump icon on the LCD is as tall as the figures.
+- **Cluster Themes 0.20.3:** E36:
+  - The needles move smoothly on the car: the cluster now moves them itself on every frame of the display, along a short path the app sends. Before, the cluster took each new position only 30 times a second and out of step with the display, so the needles moved in uneven steps however often the app sent them.
+  - BMW's own range is hidden behind the strips; the LCD's range now has an arrow into the fuel pump in front of it, as on the E90.
+- **Cluster Themes 0.20.2:** E36:
+  - The warning-light strips are back along the bottom, with BMW's own range, drive mode, gear letter and electric range showing through them. The rest of BMW's bottom row (its clock, messages and outside temperature) is hidden behind the strips.
+  - The LCD has its second row again: the clock and the outside temperature.
+  - The face round the dials is darker again, by day and at night.
+  - Smoother needles, the rev counter's most of all: they move at the display's rate with a real needle's inertia, instead of in steps 20 times a second.
+  - Not yet tested on a car.
+- **Cluster Themes 0.20.1:** the E36's face round the dials is 30 % darker, by day and at night, so it reads less grey. This build also carries the install fix and the depth pass listed under 0.20.0.
+
+## Nov 16 2026
+
+- **Cluster Themes 0.20.0:**
+  - **New theme: E36,** the BMW E36 328i cluster of the 90s, traced off photos of the real one and as big as the screen allows: fuel, speed, revs and coolant dials with cream needles on top of all the print, the fuel-use gauge under the rev counter, the LCD with range and trip, and the orange-red night lighting after sunset. It has depth like the real one: the dials sunk into a grained face under the hood's shadow, flat grained hubs and tails, needles casting soft shadows, and a faint glare on the glass by day. The European face shows with km/h, the US face (MPH, MPG) with mph. With Redline at 7000 or 7500 rpm it becomes the E36 M3's cluster: red needles, the faster speedometer, the /M badge and an oil temperature gauge in place of the fuel-use gauge. BMW's own range, clock, gear letter and outside temperature show in the row under the face; the turn arrows stay dark.
+  - **Fixed:** 0.19.0 would not install on many cars ("the app manager could not install cluster_themes ... generateSomeipInterfaces", issues #17 to #20). The music panel asked for the head unit's now playing under a name those cars don't have; it now asks for the front screen's (`HMI_CID`).
+  - Not yet tested on a car.
+- **HUD Widgets 0.15.1:** installs again on the cars where 0.15.0 failed the same way (the same fix), and ships the shared file the E36 theme added to the drawing engine.
+
 ## Nov 15 2026
 
 - **Cluster Themes 0.19.0, HUD Widgets 0.15.0:**

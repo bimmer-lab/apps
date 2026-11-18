@@ -106,7 +106,7 @@ function sceneMeta() {
         key: l.key, conn: l.conn, ref: l.ref, app: l.app, kind: l.kind, target: l.target,
         class: l.class, z: l.z, x: l.x, y: l.y, w: l.w, h: l.h, visible: l.visible, opacity: l.opacity,
         sx: l.sx, sy: l.sy, px: l.px, py: l.py, rotate: l.rotate,
-        exclusive: l.exclusive, iw: l.iw, ih: l.ih, fs: l.fs, time: l.time, uniforms: l.uniforms, binds: l.binds, format: l.format,
+        exclusive: l.exclusive, iw: l.iw, ih: l.ih, fs: l.fs, time: l.time, madeAt: l.madeAt, uniforms: l.uniforms, binds: l.binds, format: l.format,
         state: l.state, reason: l.reason, warnings: l.kind === 'asset' ? [] : layerWarnings(l),
     }));
 }
@@ -249,6 +249,7 @@ const renderServer = net.createServer((sock) => {
                 } else if (m.kind === 'effect') {
                     if (!m.fs) return refuse('layer', m.ref, 'effect without fs');
                     nl.fs = m.fs; nl.time = !!m.time; nl.binds = {};
+                    nl.madeAt = Date.now();     // u_time (time 1): seconds since the layer was made, as the service's
                     try {
                         const b = shaderBudget.layer(m.fs, nl.w, nl.h, m.target);
                         if (b.level !== 'ok') log('warn', 'layer ' + m.ref + ' (effect ' + nl.w + 'x' + nl.h + ') shader budget: ' + b.text);

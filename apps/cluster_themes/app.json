@@ -1,8 +1,8 @@
 {
   "id": "cluster_themes",
   "title": "Cluster Themes",
-  "description": "Redraws the instrument cluster: GT3 race dash, M-style, M view, Vector (with a music panel), Sport, Minimal, Track, Drag, Rally, Retro 80s, Cruise, Dyno (BMW-coloured readout tiles) or Ribbon (with holiday editions), with shift lights, boost, temps, tyres, a G-meter and a 0-60 timer",
-  "version": "0.19.0",
+  "description": "Redraws the instrument cluster: GT3 race dash, M-style, M view, Vector (with a music panel), E36 (a pure 328i cluster of the 90s), Sport, Minimal, Track, Drag, Rally, Retro 80s, Cruise, Dyno (BMW-coloured readout tiles) or Ribbon (with holiday editions), with shift lights, boost, temps, tyres, a G-meter and a 0-60 timer",
+  "version": "0.20.7",
   "vendor": "custom",
   "loggingId": "OAC1",
   "iconGlyph": "CLU",
@@ -33,7 +33,8 @@
     "shift_cue.js",
     "smart_temps.js",
     "hud_holiday.js",
-    "garland.js"
+    "garland.js",
+    "e36.js"
   ],
   "signals": {
     "de.bmw.infotainment.vehicle.CDS": {
@@ -79,6 +80,7 @@
       "_optional": "S or M next to the gear; controlDisplayMSystems: an M car's drive mode (issue #8)"
     },
     "de.bmw.infotainment.hmi.hmimediastate.HmiMediaState": {
+      "_instances": "*",
       "playerMetadata": "rs",
       "trackProgress": "rs",
       "_optional": "now playing (title, artist, progress) in the Vector theme's music panel"
@@ -135,6 +137,10 @@
         [
           "vector",
           "Vector"
+        ],
+        [
+          "e36",
+          "E36"
         ],
         [
           "sport",
@@ -215,6 +221,10 @@
           "Vector"
         ],
         [
+          "e36",
+          "E36"
+        ],
+        [
           "sport",
           "Sport"
         ],
@@ -279,6 +289,10 @@
           "Vector"
         ],
         [
+          "e36",
+          "E36"
+        ],
+        [
           "sport",
           "Sport"
         ],
@@ -341,6 +355,10 @@
         [
           "vector",
           "Vector"
+        ],
+        [
+          "e36",
+          "E36"
         ],
         [
           "sport",

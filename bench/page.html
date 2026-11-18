@@ -187,7 +187,8 @@
       const u = gl.getUniformLocation(e.prog, info.name) || gl.getUniformLocation(e.prog, base);
       let entry = l.uniforms[base] || l.uniforms[info.name];
       let v = entry ? entry.v : null;
-      if (info.name === 'u_time' && l.time) v = [t / 1000];
+      // the service's u_time (layer time 1): seconds since the layer was made, 0 .. 3600 and again (PROTOCOL.md)
+      if (info.name === 'u_time' && l.time) v = [isFinite(l.madeAt) ? ((Date.now() - l.madeAt) / 1000) % 3600 : t / 1000];
       if (!v || !u) continue;
       const width = { [gl.FLOAT]: 1, [gl.FLOAT_VEC2]: 2, [gl.FLOAT_VEC3]: 3, [gl.FLOAT_VEC4]: 4, [gl.FLOAT_MAT4]: 16 }[info.type];
       if (!width) continue;

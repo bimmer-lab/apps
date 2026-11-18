@@ -17,7 +17,7 @@ character. `ox` shifts a cell from the pen position (ink overhang), `advance`
 moves the pen. Digits get one shared advance (tabular), so a changing number
 doesn't shift sideways.
 """
-import base64, json, os
+import base64, json, math, os
 from PIL import Image, ImageDraw, ImageFont
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -44,6 +44,8 @@ HUD_FONTS = [
     ('np_small', 'Barlow-Medium.ttf', 16, ''.join(chr(i) for i in range(32, 127))),
 ]
 # Cluster Themes, 1920x720 LCD. GT3: the race-dash look, Barlow Condensed.
+E36_SCALE = 1.3275     # = gen_e36.py place()'s scale / 0.9 (1.1947 / 0.9)
+E36 = lambda px: round(px * E36_SCALE)
 CLUSTER_FONTS = [
     ('gear', 'BarlowCondensed-Bold.ttf', 330, DIGITS + 'PRND-'),
     ('big', 'BarlowCondensed-Bold.ttf', 124, DIGITS + '.:-'),   # 124: "20.3 PSI" fits a 280 px box beside the hood; ':' for a clock in a readout slot
@@ -97,6 +99,18 @@ CLUSTER_FONTS = [
     ('d7_val', 'DSEG7Classic-Bold.ttf', 60, DIGITS + '-.:'),
     ('d7_sm', 'DSEG7Classic-Bold.ttf', 42, DIGITS + '-.:'),
     ('d7_gear', 'DSEG7Classic-Bold.ttf', 190, DIGITS + 'PRN-', 0, None, {'R': 'r', 'N': 'n'}),   # r and n: seven segments can't draw R or N
+    # E36: the 328i cluster's printing (sizes as at a 0.9 scale of the photo, times E36_SCALE: gen_e36.py place() draws
+    # the cluster as big as the screen allows, and refuses fonts baked for another scale). (Barlow Condensed for its DIN-like figures). The fuel gauge's "1/1" is drawn for
+    # the stand-in character '⅟' (a superior one, the fraction slash, a superior one dropped to the baseline)
+    ('e_spd', 'BarlowCondensed-SemiBold.ttf', E36(32), DIGITS),
+    ('e_rpm', 'BarlowCondensed-SemiBold.ttf', E36(38), DIGITS),
+    ('e_lab', 'BarlowCondensed-SemiBold.ttf', E36(20), UPPER + LOWER + DIGITS + '/ '),
+    ('e_frac', 'BarlowCondensed-SemiBold.ttf', E36(34), '½⅟', 0, None, {'⅟': [('1', 0.55, -0.325), ('⁄', 1.0, 0.0), ('1', 0.55, 0.0)]}),
+    ('e_us', 'BarlowCondensed-SemiBold.ttf', E36(26), DIGITS),                   # US face: the MPG figures
+    ('e_sm', 'BarlowCondensed-SemiBold.ttf', E36(15), UPPER + LOWER + DIGITS + '/° '),
+    ('e_xs', 'BarlowCondensed-SemiBold.ttf', E36(10), UPPER),
+    ('e_lcd', 'DSEG7Classic-Bold.ttf', E36(22), DIGITS + '.-: '),                # the LCD: odometer field, trip
+    ('e_lcd2', 'DSEG7Classic-Bold.ttf', E36(17), DIGITS + '.-: '),               # its second row: clock, outside temperature
     # Cruise: calm, light numbers
     ('c_speed', 'BarlowSemiCondensed-Medium.ttf', 150, DIGITS + '-'),
     ('c_val', 'BarlowSemiCondensed-Medium.ttf', 62, DIGITS + '.:-+°'),
@@ -122,9 +136,46 @@ def bake(out, name, file, size, chars, stroke=0, weight=None, subs=None, tuck=''
     font = ImageFont.truetype(os.path.join(SRC, file), size)
     if weight: font.set_variation_by_name(weight)
     subs = subs or {}
-    glyph = lambda c: subs.get(c, c)
+    glyph = lambda c: subs.get(c, c) if not isinstance(subs.get(c), list) else ''.join(p[0] for p in subs[c])
+    # a substitute may be a list of (text, scale, dy) parts drawn side by side: each in the font at size x scale, its
+    # baseline dy em lower (E36's "1/1", built like the font's own "½": a small one up, the fraction slash, a small one
+    # on the baseline, as the printed fuel gauge has it)
+    sized = {}
+    def fnt(k):
+        if k not in sized:
+            sized[k] = ImageFont.truetype(os.path.join(SRC, file), round(size * k))
+            if weight: sized[k].set_variation_by_name(weight)
+        return sized[k]
+
+    def parts(c):
+        sub = subs.get(c)
+        if not isinstance(sub, list):
+            return None
+        out, x = [], 0
+        for t, k, dy in sub:
+            f = fnt(k)
+            out.append((t, f, x, round(dy * size)))
+            x += f.getlength(t)
+        return out
+
+    def box(c):
+        ps = parts(c)
+        if ps is None:
+            return font.getbbox(glyph(c), anchor='ls', stroke_width=stroke)
+        bs = [(f.getbbox(t, anchor='ls', stroke_width=stroke), x, dy) for t, f, x, dy in ps]
+        return (math.floor(min(b[0] + x for b, x, dy in bs)), min(b[1] + dy for b, x, dy in bs),
+                math.ceil(max(b[2] + x for b, x, dy in bs)), max(b[3] + dy for b, x, dy in bs))
+
+    def draw(d, xy, c):
+        ps = parts(c)
+        if ps is None:
+            d.text(xy, glyph(c), font=font, fill=255, anchor='ls', stroke_width=stroke, stroke_fill=255)
+            return
+        for t, f, x, dy in ps:
+            d.text((xy[0] + x, xy[1] + dy), t, font=f, fill=255, anchor='ls', stroke_width=stroke, stroke_fill=255)
+
     ink = [c for c in chars if c != ' ']
-    boxes = {c: font.getbbox(glyph(c), anchor='ls', stroke_width=stroke) for c in ink}
+    boxes = {c: box(c) for c in ink}
     top = min(b[1] for c, b in boxes.items() if c not in tuck)
     bottom = max(b[3] for c, b in boxes.items() if c not in tuck)
     drop = {c: max(0, top - boxes[c][1]) for c in tuck if c in boxes}
@@ -133,14 +184,14 @@ def bake(out, name, file, size, chars, stroke=0, weight=None, subs=None, tuck=''
 
     cells = []
     for c in chars:
-        adv = font.getlength(glyph(c)) + (2 * stroke if c != ' ' else 0)
+        adv = (boxes[c][2] - boxes[c][0] + size * 0.08 if isinstance(subs.get(c), list) else font.getlength(glyph(c))) + (2 * stroke if c != ' ' else 0)
         if c == ' ':
             cells.append((c, None, 0, round(adv if adv else size * 0.25)))
             continue
         l, _, r, _ = boxes[c]
         w = r - l + 2 * PAD
         img = Image.new('L', (w, height), 0)
-        ImageDraw.Draw(img).text((PAD - l, PAD - top + drop.get(c, 0)), glyph(c), font=font, fill=255, anchor='ls', stroke_width=stroke, stroke_fill=255)
+        draw(ImageDraw.Draw(img), (PAD - l, PAD - top + drop.get(c, 0)), c)
         shift = (tab - adv) / 2 if c in DIGITS else 0
         cells.append((c, img, round(l - PAD + shift), round(tab if c in DIGITS else adv)))
 
