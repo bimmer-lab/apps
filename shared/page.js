@@ -40,6 +40,7 @@ const MODES = [['inComfort', 'Comfort'], ['inSport', 'Sport'], ['inEco', 'Eco Pr
 const PHEV_MODES = [['inHybrid', 'Hybrid'], ['inElectric', 'Electric']];
 const PHEV_KEY = { hybrid: 'inHybrid', electric: 'inElectric' };
 const MODE_KEY = { comfort: 'inComfort', sport: 'inSport', eco: 'inEco' };
+const MAP_MODE_KEY = { comfort: 'mapComfort', sport: 'mapSport', eco: 'mapEco' };
 const TAB = {
     look: { icon: 'screen' },
     readouts: { name: 'Readouts', icon: 'lines' },
@@ -109,7 +110,7 @@ class Page {
         return this.optLabel(k, v);
     }
     /** the layout showing now, else the one meant to (before cluster-render answers) */
-    shownName() { return this.hud.activeName || this.hud._layoutName() || 'off'; }
+    shownName() { return (this.hud.shownLayout ? this.hud.shownLayout() : this.hud.activeName) || this.hud._layoutName() || 'off'; }
     /** the layouts a theme card can show (not the calibration ones) */
     looks() { return ((this.item('inSport') || {}).options || []).map((o) => o[0]); }
     /**
@@ -154,7 +155,7 @@ class Page {
         const h = bottom + 8;
         cv.clear(C.bg);
         cv.gradientRect(0, 0, W, h, [[0, C.glow], [0.55, '#070a10'], [1, C.bg]]);
-        const on = this.hud.activeName && this.hud.activeName !== 'off';
+        const shown = this.hud.shownLayout ? this.hud.shownLayout() : this.hud.activeName, on = shown && shown !== 'off';
         const dd = this.hud.car && this.hud.car.data(), demo = dd && dd.demo;
         G.frame(cv, this.theme(), [], -1, [
             demo ? { text: dd.demoShow ? 'DEMO' : 'DEMO DATA', color: '#ffb020' } : null,
@@ -222,7 +223,11 @@ class Page {
             const p = this.hud.placeInfo();
             return (p.x || p.y ? 'moved' : 'centred') + ' · ' + Math.round(p.scale * 100) + ' %';
         }
-        if (id === 'map') return this.get('mapInTheme') ? 'Waze map · on' : 'Waze map · off';
+        if (id === 'map') {
+            if (!this.get('mapInTheme')) return 'Waze map · off';
+            const some = this.get('byMode') === true && this.item('mapComfort') && ['mapComfort', 'mapSport', 'mapEco'].some((k) => this.get(k) === false);
+            return some ? 'Waze map · some modes' : 'Waze map · on';
+        }
         if (id === 'badge') return badges.text(this.get('badge'), this.get('badgeBMW') === true) || 'none';
         if (id === 'alerts') { const n = WARN_KEYS.filter((k) => this.get(k) > 0).length; return n ? n + ' warning' + (n > 1 ? 's' : '') + ' on' : 'warnings off'; }
         if (id === 'gmeter') return this.optLabel('gRange', this.get('gRange')) + ' · trail ' + this.optLabel('gTrail', this.get('gTrail')).toLowerCase();
@@ -440,17 +445,26 @@ class Page {
         // live state from waze.js: the map showing, waiting, the Waze app busy, Waze on Cluster missing
         const info = this.hud.waze ? this.hud.waze.info() : { text: 'Not available in this app', up: false, ok: false };
         let text = info.text;
-        if (this.get('mapInTheme') && !this.hud.mapLayout && this.hud.activeName !== 'off') text = 'This theme has no map version (GT3, Sport, M, M view and Vector do)';
+        if (this.get('mapInTheme') && !this.hud.mapLayout && this.shownName() !== 'off') text = 'This theme has no map version (GT3, Sport, M, M view and Vector do)';
+        else if (this.get('mapInTheme') && this.hud._mapWanted && !this.hud._mapWanted()) text = 'Off in this drive mode. Waze shows the map in BMW\'s own map view';
         glass(cv, CX, y, w, 46, false);
         cv.circle(CX + 26, y + 23, 7, info.up ? C.live : info.ok ? C.dim : '#e0a340');
         cv.text(text, CX + 46, y + 30, 18, info.up ? C.live : C.text, { literal: true });
         y += 54;
+        // with the theme changing with the drive mode: which modes show the map (all on by default)
+        if (this.get('mapInTheme') === true && this.get('byMode') === true && this.item('mapComfort')) {
+            const now = MAP_MODE_KEY[this.hud.driveMode], cw = (w - 24) / 3;
+            label(cv, CX, y + 22, 'In each drive mode');
+            [['mapComfort', 'Comfort'], ['mapSport', 'Sport'], ['mapEco', 'Eco Pro']].forEach((m, i) =>
+                this.toggleRow(cv, CX + i * (cw + 12), y + 34, cw, m[1] + (m[0] === now ? '  ·  now' : ''), m[0]));
+            y += 34 + 64;
+        }
         note(cv, CX, y + 26, [
             'On: GT3, Sport, M, M view and Vector open a window in the middle and Waze\'s map shows in it,',
             'above BMW\'s own map view, so nothing shows twice. When the map goes away the theme fills back in.',
             'Needs robertnisipeanu\'s Waze on Cluster 0.14.5 or newer with cluster-render 0.8.2 or newer.',
             'Turning this off gives Waze its usual place back.',
-        ]);
+        ].concat(this.get('byMode') === true ? ['With the theme changing with the drive mode, each mode has its own switch (all on at first).'] : []));
     }
 
     /* ---------- Badge (cluster) ---------- */

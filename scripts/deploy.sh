@@ -15,7 +15,7 @@
 # cauliflowermossgrape/idrive7-apps' docs) and SSH access as root.
 set -euo pipefail
 
-APP_ID="${APP:-idrive_hud_widgets}"
+APP_ID="${APP:-cluster_themes}"
 OAP_ROOT="/var/opt/public/oap"
 
 usage() {

@@ -491,6 +491,8 @@ async function run(impl) {
 async function runInner(impl) {
     const app = new OnlineApp();
     log.info('starting ' + SPEC.id + ' ' + SPEC.version);
+    // below the car's own processes (CarPlay first): kit/runtime/priority.js, app.json config.nice / config.ioIdle
+    try { require('./priority').lower(log, SPEC.config); } catch (e) { log.warn('priority: ' + e); }
     // interfaces this unit lacks, which the installer left out (app.json "_optional")
     try {
         const missing = JSON.parse(fs.readFileSync(path.join(__dirname, 'missing-interfaces.json'), 'utf8'));

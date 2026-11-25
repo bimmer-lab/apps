@@ -1,0 +1,22 @@
+{
+  "id": "fuel_link",
+  "title": "Fuel Link",
+  "description": "Shares the fuel left (litres) and the range with your own phone over your tailnet, read-only, for the Shell diesel page. Runs in the background, with no tile in the apps menu.",
+  "version": "0.4.0",
+  "vendor": "custom",
+  "startType": "autostart",
+  "hidden": true,
+  "loggingId": "OAF1",
+  "iconGlyph": "FUL",
+  "signals": {
+    "de.bmw.infotainment.KombiIF": {
+      "statusRangeTankStatus": "rs"
+    }
+  },
+  "config": {
+    "port": 8473,
+    "allowOrigin": "https://46wen.github.io",
+    "nice": 19,
+    "_comment": "port: the read-only JSON at /fuel (and /go, a redirect back to the page with the reading), on the head unit's loopback and its tailnet address only. allowOrigin: the page allowed to read it, and the only place /go sends you back to. nice: 19, the lowest CPU priority (kit/runtime/priority.js): CarPlay and the HMI go first."
+  }
+}

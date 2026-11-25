@@ -140,6 +140,7 @@ More themes are on the way.
 - **Theme**, and one per drive mode.
 - **Readouts:** pick which car sensor each GT3, M, Track, Drag, Rally, Retro 80s or Dyno readout shows (speed, rpm, boost, temperatures, tyres, fuel, g, power and more). Plug-in hybrids can also show **Hybrid battery**, the high-voltage battery's charge in % (not yet checked on a hybrid).
 - **Show Waze map inside the theme:** GT3, Sport, M, M view and Vector open a window in the middle and Waze's map shows in it, above BMW's own map view, so nothing shows twice. When the map goes away the theme fills back in. Needs robertnisipeanu's Waze on Cluster 0.14.5 or newer with cluster-render 0.8.2 or newer; turning it off gives Waze its usual place back.
+- **Waze map in each drive mode:** with the theme changing with SPORT / COMFORT / ECO PRO, the Map tab shows a switch per mode under "Show Waze map inside the theme" (all on at first). Turn one off and that mode shows its theme without the map window, while Waze goes back to BMW's own map view; the other modes keep the map. For example GT3 with the map in Comfort and the full GT3 race dash in Sport.
 - **Badge:** the model name, like "BMW X3 M40i", as text in the theme's font (GT3 top left, Sport, M and Minimal top centre, where BMW puts its own). Off by default.
 - **Warnings:** oil, coolant and boost limits. A readout over its limit flashes red (oil 130°C and coolant 115°C by default, boost off).
 - **Test the shift lights:** runs the rpm up to the shift point for about 4 seconds while the car stands.

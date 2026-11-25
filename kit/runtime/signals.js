@@ -105,6 +105,11 @@ function set(p, field, value, timeoutMs) {
     return nativeTick(() => p.setValue(field, value, timeoutMs || 5000));
 }
 
+/** Read a field that has a getter on a proxy from proxy(), in the same one-at-a-time native ticks as call(). */
+function get(p, field, timeoutMs) {
+    return nativeTick(() => p.getValue(field, timeoutMs || 3000));
+}
+
 /** Subscribe to a broadcast/event or field on a proxy from proxy(). */
 function on(p, name, fn, log) {
     return nativeTick(() => p.subscribe({ name, onReceive: (v) => { try { fn(v); } catch (e) { if (log) log.warn(name + ': ' + e); } } }));
@@ -116,4 +121,4 @@ function onAvailable(p, fn) {
         .then(() => { if (p.isAvailable && p.isAvailable()) fn(true); });
 }
 
-module.exports = { watch, proxy, call, set, on, onAvailable, loadConfig, hasNative: () => !!someip };
+module.exports = { watch, proxy, call, get, set, on, onAvailable, loadConfig, hasNative: () => !!someip };

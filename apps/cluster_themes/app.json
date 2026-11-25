@@ -2,11 +2,12 @@
   "id": "cluster_themes",
   "title": "Cluster Themes",
   "description": "Redraws the instrument cluster: GT3 race dash, M-style, M view, Vector (with a music panel), Sport, Minimal, Track, Drag, Rally, Retro 80s, Cruise, Dyno (BMW-coloured readout tiles) or Ribbon (with holiday editions), with shift lights, boost, temps, tyres, a G-meter and a 0-60 timer",
-  "version": "0.19.10",
+  "version": "0.20.2",
   "vendor": "custom",
   "loggingId": "OAC1",
   "autostart": true,
   "iconGlyph": "CLU",
+  "requires": { "cluster-render": "0.5.1" },
   "shared": [
     "hud.js",
     "hud_text.js",
@@ -535,6 +536,24 @@
       "label": "Show Waze map inside the theme",
       "type": "bool",
       "default": false
+    },
+    {
+      "key": "mapComfort",
+      "label": "Waze map in Comfort",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "key": "mapSport",
+      "label": "Waze map in Sport",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "key": "mapEco",
+      "label": "Waze map in Eco Pro",
+      "type": "bool",
+      "default": true
     },
     {
       "key": "units",

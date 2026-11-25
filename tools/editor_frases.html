@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Editor de frases</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600;700&family=Noto+Sans+SC:wght@400;500&display=swap" rel="stylesheet">
+<style>
+/* VOICE: calm, precise, like the car's own settings menu
+   IDEA: an iDrive list page: rows of notices, each with three languages side by side
+   PICTURE: the editable table itself, with play buttons and the M stripe
+   COLOUR and TYPE: near-black iDrive ground, BMW blue #1c69d4 as action, M tricolour only in the stripe; Barlow + Noto Sans SC
+   LAYOUT: header strip, toolbar, the table (stacks to cards on phones), notes at the end */
+:root{color-scheme:light dark;--bg:light-dark(#f3f5f8,#0a0d12);--tile:light-dark(#ffffff,#141a23);--line:light-dark(#dde3ea,#232c3a);--ink:light-dark(#0e1520,#f2f5f9);--dim:light-dark(#5a6576,#8a95a6);--blue:#1c69d4;--blue2:light-dark(#1556b0,#4fa3ff);--warn:light-dark(#a35a00,#ffb000);--ok:light-dark(#127a45,#2fd27a)}
+:root[data-theme=light]{color-scheme:light}:root[data-theme=dark]{color-scheme:dark}
+*{box-sizing:border-box;min-width:0}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 Barlow,"Noto Sans SC",system-ui,sans-serif;overflow-x:clip}
+.band{padding:clamp(20px,3vw,40px) max(4vw,16px);max-width:1320px;margin:0 auto}
+header{display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+.m{display:flex;gap:3px}.m i{width:7px;height:30px;display:block}.m i:nth-child(1){background:#0066b1}.m i:nth-child(2){background:#003d78}.m i:nth-child(3){background:#e22718}
+h1{font-size:clamp(28px,4vw,40px);line-height:1.05;margin:0;font-weight:700;text-wrap:balance}
+.sub{color:var(--dim);margin:8px 0 0;max-width:70ch}
+.bar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:22px;padding:12px;background:var(--tile);border:1px solid var(--line);border-radius:14px}
+.bar label{display:flex;align-items:center;gap:8px;color:var(--dim)}
+select,button,textarea,input{font:inherit;color:inherit}
+select{min-height:44px;background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:0 10px}
+button{min-height:44px;padding:0 16px;border-radius:22px;border:1px solid var(--line);background:var(--bg);cursor:pointer;font-weight:600}
+button.pri{background:var(--blue);border-color:var(--blue);color:#fff}
+button:focus-visible,select:focus-visible,textarea:focus-visible{outline:3px solid var(--blue2);outline-offset:2px}
+.sp{flex:1}
+#msg{color:var(--ok);font-weight:600;min-height:1.5em;margin:10px 4px 0}
+#msg.bad{color:var(--warn)}
+table{width:100%;border-collapse:separate;border-spacing:0 10px;margin-top:8px}
+th{text-align:start;color:var(--dim);font-weight:600;padding:0 10px;font-size:15px}
+td{background:var(--tile);border-block:1px solid var(--line);padding:10px;vertical-align:top}
+td:first-child{border-inline-start:1px solid var(--line);border-radius:14px 0 0 14px;width:200px}
+td:last-child{border-inline-end:1px solid var(--line);border-radius:0 14px 14px 0}
+.ev{font-weight:700;font-size:17px}.key{color:var(--dim);font-size:13px;font-family:ui-monospace,monospace}
+.when{color:var(--dim);font-size:14px;margin-top:4px}
+.cell{display:flex;gap:6px;align-items:flex-start}
+textarea{width:100%;min-height:76px;resize:vertical;border:1px solid var(--line);border-radius:10px;padding:8px 10px;background:var(--bg);font-size:16px;line-height:1.4}
+textarea.changed{border-color:var(--blue2)}
+textarea.empty{border-color:var(--warn)}
+.play{width:44px;padding:0;flex:none;display:grid;place-items:center}
+.play svg{width:16px;height:16px;fill:currentColor}
+.len{font-size:13px;color:var(--dim);margin-top:2px}
+details{margin-top:26px;background:var(--tile);border:1px solid var(--line);border-radius:14px;padding:14px 18px}
+summary{cursor:pointer;font-weight:600;min-height:28px}
+#json{width:100%;min-height:220px;font:13px/1.45 ui-monospace,monospace}
+ol{padding-inline-start:22px;max-width:75ch}ol li{margin:6px 0}
+code{overflow-wrap:anywhere;background:var(--bg);padding:1px 5px;border-radius:5px;font-size:14px}
+.voices{color:var(--dim);font-size:14px}
+@media(max-width:820px){thead{display:none}table,tbody,tr,td{display:block}tr{background:var(--tile);border:1px solid var(--line);border-radius:14px;margin-bottom:12px;padding:6px}td,td:first-child,td:last-child{border:0;border-radius:0;width:auto;background:none;padding:6px}td[data-l]::before{content:attr(data-l);display:block;color:var(--dim);font-size:13px;margin-bottom:4px}}
+@media(prefers-reduced-motion:no-preference){textarea{transition:border-color .2s}}
+</style>
+</head>
+<body>
+<div class="band">
+  <header><div class="m"><i></i><i></i><i></i></div><h1>Copiloto de voz · Editor de frases</h1></header>
+  <p class="sub">Cambie lo que dice el coche y elija la voz con la que se graba. El botón ▶ lee la frase con la voz de su navegador (solo para hacerse una idea: en el coche sonará la voz natural que elija aquí). Al terminar, pulse «Copiar JSON» y péguelo en el chat con Claude.</p>
+  <div class="bar">
+    <label>Voz del coche <select id="voice"><option value="es-ES-ElviraNeural|Elvira (femenina)|F">Elvira (femenina, por defecto)</option><option value="es-ES-XimenaNeural|Ximena (femenina)|F">Ximena (femenina)</option><option value="es-ES-AlvaroNeural|Álvaro (masculina)|M">Álvaro (masculina)</option></select></label>
+    <label>Velocidad <select id="rate"><option value="-15%">Más lenta</option><option value="-10%">Algo lenta</option><option value="-5%">Normal (por defecto)</option><option value="+0%">Algo rápida</option><option value="+10%">Rápida</option></select></label>
+    <input id="gender" type="hidden" value="F">
+    <span class="sp"></span>
+    <button id="reset">Volver a las originales</button>
+    <button id="load">Cargar frases.json</button>
+    <button id="copy">Copiar JSON</button>
+    <button id="save" class="pri" hidden>Descargar frases.json</button>
+    <input id="file" type="file" accept=".json,application/json" hidden>
+  </div>
+  <p id="msg" role="status"></p>
+  <table>
+    <thead><tr><th>Aviso</th><th>Frase (español)</th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <details>
+    <summary>Después de editar: cómo llegan las frases al coche</summary>
+    <ol>
+      <li>Pulse <strong>Copiar JSON</strong> y péguelo en el chat con Claude (o descargue <code>frases.json</code> y mándelo).</li>
+      <li>Claude deja el generador preparado en el PC (<code>D:\MGU_Store\copiloto_voces</code>); haga doble clic en <code>GENERAR_VOCES.bat</code> y espere a «Terminado».</li>
+      <li>Claude recoge las voces, las pasa al formato del coche y las sube; usted actualiza Copiloto de voz en el Store.</li>
+      <li>En el coche: «Probar la siguiente frase» o la Demo, para escucharlas.</li>
+    </ol>
+    <p class="voices" id="voices"></p>
+  </details>
+  <details>
+    <summary>Ver o pegar el JSON</summary>
+    <textarea id="json" spellcheck="false"></textarea>
+    <p><button id="apply">Usar el JSON pegado</button></p>
+  </details>
+</div>
+<script id="data" type="application/json">{"_comment": "Copiloto de voz: el texto de cada aviso y la voz con la que se graba (scripts/generar_voces.py). Las claves de 'frases' son los nombres de archivo: no cambiarlas.", "idiomas": {"es": {"nombre": "Español", "voces": [{"id": "es-ES-ElviraNeural", "nombre": "Elvira (femenina)", "genero": "F"}]}}, "velocidad": "-5%", "frases": {"combustible": {"es": "Nivel de combustible bajo."}, "neumaticos": {"es": "Atención: el sistema indica presión baja en un neumático. Revíselo en cuanto pueda."}, "hielo": {"es": "Atención: la temperatura exterior es baja. Puede haber hielo en la carretera."}, "motor_frio": {"es": "El motor aún está frío. Le recomiendo no superar las dos mil quinientas revoluciones."}, "bienvenida_manana": {"es": "Buenos días. Bienvenido a bordo. Su BMW está listo para el viaje."}, "bienvenida_tarde": {"es": "Buenas tardes. Bienvenido a bordo. Su BMW está listo para el viaje."}, "bienvenida_noche": {"es": "Buenas noches. Bienvenido a bordo. Su BMW está listo para el viaje."}, "bienvenida": {"es": "Bienvenido a bordo. BMW listo para el viaje."}, "mantenimiento": {"es": "Se acerca un mantenimiento. Puede consultarlo en el estado del vehículo."}, "ventanillas": {"es": "Atención: ha quedado una ventanilla o el techo abierto."}, "fin_viaje": {"es": "Fin del viaje. Hasta la próxima."}, "descanso": {"es": "Lleva dos horas conduciendo. Le recomiendo hacer una pausa."}, "motor_caliente": {"es": "Motor a temperatura. Ya puede exigirle."}}}</script>
+<script>
+{
+const ORIG = JSON.parse(document.getElementById('data').textContent);
+const LANGS = [['es', 'es-ES', 'Español']];
+const INFO = {
+  combustible: ['Combustible bajo', 'Autonomía de 50 km o menos'], neumaticos: ['Neumáticos', 'Aviso de presión de BMW'],
+  hielo: ['Posible hielo', '3 °C o menos fuera'], motor_frio: ['Motor frío', 'Aceite < 80 °C y > 2.500 rpm'],
+  bienvenida_manana: ['Bienvenida · mañana', 'Al arrancar, de 6 a 13 h'],
+  bienvenida_tarde: ['Bienvenida · tarde', 'Al arrancar, de 13 a 21 h'], bienvenida_noche: ['Bienvenida · noche', 'Al arrancar, de 21 a 6 h'],
+  bienvenida: ['Bienvenida (sin hora)', 'Si no hay las de mañana/tarde/noche'], mantenimiento: ['Mantenimiento', 'Faltan 2.000 km o 60 días'],
+  ventanillas: ['Ventanillas', 'Abiertas al apagar'], fin_viaje: ['Fin del viaje', 'Al apagar'], descanso: ['Pausa', 'Cada 2 horas'],
+  motor_caliente: ['Motor caliente', 'El aceite llega a 80 °C'] };
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const clone = (o) => JSON.parse(JSON.stringify(o));
+let doc = clone(ORIG);
+try { const d = JSON.parse(localStorage.getItem('copiloto_frases_es1') || 'null'); if (d && d.frases) doc = d; } catch (e) {}
+const $ = (id) => document.getElementById(id);
+const msg = (t, bad) => { $('msg').textContent = t; $('msg').className = bad ? 'bad' : ''; };
+const PLAY = '<svg viewBox="0 0 16 16"><path d="M3 1.5v13l11-6.5z"/></svg>';
+
+const render = () => {
+  $('rows').innerHTML = Object.keys(doc.frases).map((k) => {
+    const i = INFO[k] || [k, ''];
+    return '<tr><td data-l="Aviso"><div class="ev">' + esc(i[0]) + '</div><div class="when">' + esc(i[1]) + '</div><div class="key">' + esc(k) + '</div></td>' +
+      LANGS.map((l) => '<td data-l="' + l[2] + '"><div class="cell"><textarea data-k="' + esc(k) + '" data-lang="' + l[0] + '" lang="' + l[1] + '" aria-label="' + esc(i[0]) + ', ' + l[2] + '"></textarea>' +
+        '<button class="play" data-k="' + esc(k) + '" data-lang="' + l[0] + '" aria-label="Escuchar">' + PLAY + '</button></div><div class="len"></div></td>').join('') + '</tr>';
+  }).join('');
+  document.querySelectorAll('#rows textarea').forEach((t) => { t.value = doc.frases[t.dataset.k][t.dataset.lang] || ''; mark(t); });
+  $('voices').textContent = 'Voces que se generan: ' + LANGS.map((l) => l[2] + ': ' + ((doc.idiomas[l[0]] || {}).voces || []).map((v) => v.nombre).join(', ')).join(' · ') + '.';
+  $('json').value = text();
+};
+const mark = (t) => {
+  const v = t.value.trim(), o = ((ORIG.frases[t.dataset.k] || {})[t.dataset.lang] || '').trim();
+  t.classList.toggle('changed', v !== o && !!v);
+  t.classList.toggle('empty', !v);
+  t.parentNode.nextElementSibling.textContent = !v ? 'Vacía: no se grabará' : v !== o ? 'Cambiada · ' + v.length + ' caracteres' : v.length + ' caracteres';
+};
+const text = () => JSON.stringify(doc, null, 2) + '\n';
+const store = () => { try { localStorage.setItem('copiloto_frases_es1', JSON.stringify(doc)); } catch (e) {} };
+
+$('rows').addEventListener('input', (e) => {
+  const t = e.target; if (t.tagName !== 'TEXTAREA') return;
+  doc.frases[t.dataset.k][t.dataset.lang] = t.value; mark(t); store(); $('json').value = text(); msg('');
+});
+
+// listen with the browser's voice in that language, female or male where the browser has both
+const pick = (code, g) => {
+  const vs = speechSynthesis.getVoices().filter((v) => v.lang.replace('_', '-').toLowerCase().indexOf(code.slice(0, 2)) === 0);
+  const exact = vs.filter((v) => v.lang.replace('_', '-').toLowerCase() === code.toLowerCase());
+  const pool = exact.length ? exact : vs;
+  const male = /male|hombre|álvaro|alvaro|jorge|pablo|ryan|thomas|daniel|george|yunxi|yunjian|kangkang|arthur|oliver/i;
+  const female = /female|mujer|elvira|monica|mónica|paulina|helena|laura|sonia|libby|serena|kate|xiaoxiao|xiaoyi|huihui|tingting|martha/i;
+  return pool.find((v) => (g === 'M' ? male : female).test(v.name) && !(g === 'M' ? /female/i : /\bmale\b/i).test(v.name)) || pool[0] || null;
+};
+$('rows').addEventListener('click', (e) => {
+  const b = e.target.closest('.play'); if (!b) return;
+  if (!('speechSynthesis' in window)) { msg('Este navegador no puede leer en voz alta.', true); return; }
+  const l = LANGS.find((x) => x[0] === b.dataset.lang), t = doc.frases[b.dataset.k][l[0]];
+  if (!t) { msg('La frase está vacía.', true); return; }
+  try {
+    speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(t), v = pick(l[1], $('gender').value);
+    u.lang = l[1]; if (v) u.voice = v; u.rate = 0.95;
+    speechSynthesis.speak(u);
+    msg(v ? 'Escuchando con «' + v.name + '» (voz del navegador)' : 'Su navegador no tiene voz en ' + l[2].toLowerCase() + ': pruebe en otro navegador o en el móvil.', !v);
+  } catch (err) { msg('No se pudo leer: ' + err.message, true); }
+});
+
+const use = (d, how) => {
+  if (!d || typeof d !== 'object' || !d.frases || !d.idiomas) throw new Error('no parece un frases.json del Copiloto');
+  Object.keys(ORIG.frases).forEach((k) => { d.frases[k] = Object.assign({ es: '' }, d.frases[k] || {}); });
+  doc = d; store(); render(); msg(how);
+};
+$('reset').addEventListener('click', () => { use(clone(ORIG), 'Frases originales restauradas.'); });
+$('load').addEventListener('click', () => $('file').click());
+$('file').addEventListener('change', () => {
+  const f = $('file').files[0]; if (!f) return;
+  f.text().then((t) => use(JSON.parse(t), 'Cargado ' + f.name + '.')).catch((e) => msg('No se pudo cargar: ' + e.message, true));
+  $('file').value = '';
+});
+$('apply').addEventListener('click', () => { try { use(JSON.parse($('json').value), 'JSON pegado aplicado.'); } catch (e) { msg('El JSON no es válido: ' + e.message, true); } });
+$('copy').addEventListener('click', () => {
+  navigator.clipboard.writeText(text()).then(() => msg('Copiado. Péguelo en el chat con Claude, o en tools-prebuilt/copiloto-voz-voces/frases.json.'))
+    .catch(() => { document.querySelector('details:last-of-type').open = true; $('json').select(); msg('No se pudo copiar: seleccione el texto de abajo y cópielo.', true); });
+});
+let downloads = null;
+if (window.claude && window.claude.use) {
+  window.claude.use('downloads').then((d) => { downloads = d; if (d) $('save').hidden = false; }).catch(() => {});
+}
+$('save').addEventListener('click', () => {
+  if (!downloads) return;
+  downloads.save({ filename: 'frases.json', data: new Blob([text()], { type: 'application/json' }) })
+    .then(() => msg('frases.json guardado. Mándeselo a Claude o póngalo en tools-prebuilt/copiloto-voz-voces/.')).catch(() => msg('No se guardó. Use «Copiar JSON».', true));
+});
+const syncVoice = () => {
+  const v = (doc.idiomas.es.voces || [])[0] || { id: 'es-ES-ElviraNeural' };
+  const opt = Array.from($('voice').options).find((o) => o.value.split('|')[0] === v.id);
+  if (opt) $('voice').value = opt.value;
+  $('rate').value = doc.velocidad || '-5%';
+  $('gender').value = (opt ? opt.value.split('|')[2] : 'F');
+};
+$('voice').addEventListener('change', () => {
+  const p = $('voice').value.split('|');
+  doc.idiomas.es.voces = [{ id: p[0], nombre: p[1], genero: p[2] }];
+  $('gender').value = p[2]; store(); $('json').value = text();
+  msg('Voz del coche: ' + p[1] + '. El ▶ usa la voz del navegador más parecida (hombre o mujer).');
+});
+$('rate').addEventListener('change', () => { doc.velocidad = $('rate').value; store(); $('json').value = text(); });
+if ('speechSynthesis' in window) { speechSynthesis.getVoices(); speechSynthesis.onvoiceschanged = () => {}; }
+render(); syncVoice();
+}
+</script>
+</body>
+</html>

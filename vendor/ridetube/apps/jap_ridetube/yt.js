@@ -1,0 +1,627 @@
+'use strict';
+/**
+ * yt.js - RideTube's link to the car daemon jap-ridetube-d (ytd.js) and its playback state.
+ *
+ *   Ctl    the control socket /run/jap-ridetube-d/ctl.sock: JSON lines, reconnects every 2 s.
+ *          App -> daemon: search{q} thumb{id} play{id,rect:"WxH",fill} pause resume seek{ms} stop quality{quality} fill{on} video{on} status
+ *                         auth_status auth sign_out feed{which:home|subs|wl|hist} channels channel{id} playlists playlist{id}
+ *                         send_logs{app}: the service's recent log, redacted, to the developer
+ *                         hello{app,lang,region?}: on connect, after the rest; the service's caps come back
+ *                         health (cap health), related{id} (cap related)
+ *                         library, download{id,meta,quality}, remove{id}, auto_download{max} (cap download)
+ *          Daemon -> app: (a played video is deleted from the car once stopped; a download stays until removed and
+ *                         plays with no network)
+ *                         results{q,items:[{id,title,channel,duration_s,meta?}]} thumb{id,w,h,rgba(base64)}: 160x90 or 320x180
+ *                         state{state:idle|preparing|playing|paused|ended|error,pct,id,title} time{elapsed,total} error{msg}
+ *                         auth{state:signed_out|code|signed_in|error,code,url,expires,msg}
+ *                         feed{which,items,shelves?|error}: shelves [{title,items}] in the service's page order (0.1.6 on;
+ *                         absent or [] = none); meta: ["125K views","1 day ago"] as the service words them
+ *                         channels{items:[{id,title,handle}]|error}: every subscription, A-Z
+ *                         channel{id,items,shelves|error}: a channel's page
+ *                         playlists{items:[{id,title,count,meta,thumb}]|error}: the account's playlists (thumb: a video id)
+ *                         playlist{id,title?,items|error}: a playlist's videos
+ *                         logs_sent{id}: the code to quote in a GitHub issue; logs_error{msg:closed|busy|offline|failed}
+ *                         hello{service,caps}: what the service really answers (0.4.0 on); an older one answers
+ *                         error "unknown cmd hello": no caps. Entries for a feature hide unless can(<its cap>)
+ *                         hello's clock "2026-10-13", then clock{clock|null}: the head unit's clock is wrong and the
+ *                         service skips the certificate dates (main.js warns the driver); an older service: never
+ *                         health{key,ok,text} per check, then health{done:true}; related{id,items|error}
+ *                         library{items:[{id,title,channel,duration_s,ready,pct?,error?,auto?}]}: the downloads, newest
+ *                         first, on every change; auto_download{max}; error{msg,offline:true}: a play failed with no network
+ *                         a tile may carry short:true (a Short: shown only with the Show Shorts setting)
+ *          Thumbs are asked lazily (Model.wantThumb, from the screens' draw path): only for the tiles drawn.
+ *          The daemon signs in itself (TV device sign-in) and keeps the tokens; none come here.
+ *          The daemon stops playback within 1 s of this socket closing, so the app keeps it open hidden too.
+ *   Model  what the screens show, from the daemon's events; the commands the buttons send. Pure: no HMI, no timers.
+ */
+const net = require('net');
+
+const SOCKET = '/run/jap-ridetube-d/ctl.sock';
+const MAX_LINE = 1 << 20;            // a 320x180 thumb is 307 kB of base64; anything far past that is not ours
+const FEEDS = ['home', 'subs', 'wl', 'hist'];          // hist: History (cap hist)
+const FEED_MAX = 100;                // a feed's flat list (its pictures: as many as drawn, main.js's pool)
+const SHELVES = 8, SHELF_MAX = 12;   // a feed's shelves, the videos in each
+const SIZES = ['160x90', '320x180']; // the thumb sizes the daemon sends
+const PL_RE = /^[\w-]{2,64}$/, VID_RE = /^[\w-]{11}$/;   // a playlist id (PL..., LL, OLAK5uy_...), a video id
+const isPl = (x) => typeof x === 'string' && PL_RE.test(x), isVid = (x) => typeof x === 'string' && VID_RE.test(x);
+const PL_MAX = 60, PL_ITEMS = 1000;   // the playlists shown, the videos of one (and of Watch later)
+const HEALTH_MS = 60000;             // a health check row may take this long (the service tries a real extract)
+const LOG_ERRORS = ['closed', 'busy', 'offline', 'failed'];   // logs_error's msg; 'old': a service without send_logs
+
+class Ctl {
+    constructor(path, log) {
+        this.path = path || SOCKET;
+        this.log = log;
+        this.sock = null;
+        this.up = false;
+        this.buf = '';
+        this.closed = false;
+        this.handlers = { msg: [], up: [], down: [] };
+    }
+    on(ev, fn) { this.handlers[ev].push(fn); return this; }
+    _emit(ev, a) { this.handlers[ev].forEach((fn) => { try { fn(a); } catch (e) { this.log.error('yt ' + ev, e); } }); }
+    connect() {
+        if (this.closed) return this;
+        const s = this.sock = net.createConnection(this.path);
+        s.setEncoding('utf8');
+        s.on('connect', () => { this.up = true; this.buf = ''; this.log.info('jap-ridetube-d: connected'); this._emit('up'); });
+        s.on('data', (d) => this._data(d));
+        s.on('error', (e) => { if (!this.errLogged) { this.errLogged = true; this.log.warn('jap-ridetube-d: ' + e.message); } });
+        s.on('close', () => {
+            const was = this.up;
+            this.up = false; this.sock = null;
+            if (was) { this.errLogged = false; this.log.warn('jap-ridetube-d: connection closed'); this._emit('down'); }
+            if (!this.closed) this.retry = setTimeout(() => this.connect(), 2000);
+        });
+        return this;
+    }
+    _data(d) {
+        this.buf += d;
+        if (this.buf.length > MAX_LINE && this.buf.indexOf('\n') < 0) { this.log.warn('jap-ridetube-d: line too long, dropped'); this.buf = ''; return; }
+        let i;
+        while ((i = this.buf.indexOf('\n')) >= 0) {
+            const line = this.buf.slice(0, i);
+            this.buf = this.buf.slice(i + 1);
+            if (!line.trim()) continue;
+            let m;
+            try { m = JSON.parse(line); } catch (e) { this.log.warn('jap-ridetube-d: bad line ' + line.slice(0, 80)); continue; }
+            if (m && typeof m.ev === 'string') this._emit('msg', m);
+        }
+    }
+    /** false when not connected (the command is dropped: the screen shows the daemon is missing) */
+    send(obj) {
+        if (!this.up || !this.sock) return false;
+        this.sock.write(JSON.stringify(obj) + '\n');
+        return true;
+    }
+    close() {
+        this.closed = true;
+        clearTimeout(this.retry);
+        if (this.sock) this.sock.destroy();
+    }
+}
+
+const ACTIVE = ['preparing', 'playing', 'paused'];
+
+class Model {
+    /** send(obj): Ctl.send; hi: {app, lang, region} for hello */
+    constructor(send, hi) {
+        this.send = send;
+        this.hi = hi || {};
+        this.caps = [];              // hello's: what the service answers beyond 0.3 (none from an older one)
+        this.clock = null;           // hello's clock: the head unit's wrong date while the service skips the certificate dates
+        this.connected = false;
+        this.q = null; this.searching = false;
+        this.results = [];           // [{id,title,channel,duration_s}]
+        this.thumbs = {};            // id -> { w, h, buf } (RGBA, 160x90 or 320x180), for ids some list shows
+        this.pending = new Set();    // ids whose thumb was asked and has not come yet
+        this.searchError = null;     // what the last search got instead of results (proxy offline, no answer)
+        this.searchT = 0;
+        this.state = 'idle'; this.pct = 0; this.id = null; this.title = ''; this.channel = '';
+        this.elapsed = 0; this.total = 0;
+        this.error = null;
+        this.videoOn = true;         // what the daemon was last told
+        this.wantVideo = false;      // player shown and parked
+        // the account: unknown (not asked yet) | asking | signed_out | code | signed_in | error | unsupported (older daemon)
+        this.auth = { state: 'unknown', code: null, url: null, msg: null };
+        this.feeds = {};             // home|subs|wl -> {items, loading, error, t}
+        this.pos = {};               // id -> {ms, total, done, title, channel, duration_s}: where each video was left
+        this.resume = [];            // Continue watching: started, not finished, newest first
+        this.extras = null;          // the playing video's {id, chapters: [[ms, title]], segments: [[ms, ms, category]]}
+        this.toast = null;           // {text, until}: a skipped sponsor
+        this.chans = null;           // the subscribed channels: {items:[{id,title,handle}], loading, error, t}
+        this.chan = null;            // the channel page shown: {id, title, items, shelves, loading, error, t}
+        this.pls = null;             // the account's playlists: {items:[{id,title,count,meta,thumb}], loading, error, t}
+        this.plist = null;           // the playlist shown: {id, title, items, loading, error, t}
+        this.logs = null;            // a log report: {state: confirm|sending|sent|error, code (sent), msg (error), t}
+        this.related = null;         // watch-next (cap related): {id, items, loading, error, t}
+        this.health = null;          // the health check (cap health): {items:[{key, ok, text}], loading, error, t}
+        this.resumeWait = false;     // a fresh play: its first tick says whether the service resumed it
+        this.resumed = null;         // {id, ms, until}: "Resumed at 12:34 · Start over" shows until then
+        this.ytdlpAuto = true;       // the yt-dlp updates setting, told to the daemon on every connect
+        this.storeProxy = true;      // "Use the MGU Store's proxy", told the same way (cap proxy)
+        this.ytdlp = null;           // the daemon's {auto, version, bundled, checking}; {unsupported: true} from an older one
+        this.library = [];           // the downloads (cap download): [{id, title, channel, duration_s, ready, pct?, error?, auto?}]
+        this.autoDl = 0;             // the auto-download setting (0: off), told to the daemon on every connect
+        this.errorOffline = false;   // the last play error came with no network
+        this.rev = 0;                // bumped on every change the screens show
+    }
+    active() { return ACTIVE.indexOf(this.state) >= 0; }
+    /** the service answers this (hello's caps: health, related, hist, ytdlp, remote, proxy, stream) */
+    can(cap) { return this.caps.indexOf(cap) >= 0; }
+    _changed() { this.rev++; }
+
+    /** a new display language (the Language setting): hello again with it (the service keeps a connection's last
+     *  hello), so the feeds, search and related come in it; watch-next is asked again, the page shown reloads (main.js) */
+    relang(hi) {
+        this.hi = hi;
+        this.related = null;
+        // a feed on its way was asked in the old language (the service answers it once): asked again when it comes
+        Object.keys(this.feeds).forEach((w) => { if (this.feeds[w].loading) this.feeds[w].again = true; });
+        this._changed();
+        return this.connected ? this.send(Object.assign({ cmd: 'hello' }, this.hi)) : false;
+    }
+    setConnected(on) {
+        this.connected = on;
+        if (on) { this.send(Object.assign({ cmd: 'hello' }, this.hi)); this.send({ cmd: 'status' }); this.send({ cmd: 'auth_status' }); this.send({ cmd: 'positions' }); this.videoOn = null; this._video(); } else {
+            this.caps = []; this.clock = null; this.library = [];
+            this.searching = false; this.state = 'idle'; this.pending.clear();
+            this.auth = { state: 'unknown', code: null, url: null, msg: null };
+            Object.keys(this.feeds).forEach((w) => { this.feeds[w].loading = false; });
+            if (this.logs && this.logs.state === 'sending') this.logs = { state: 'error', msg: 'failed' };
+        }
+        this._changed();
+    }
+    /** a daemon event */
+    onMsg(m) {
+        if (m.ev === 'results') {
+            if (this.q !== null && m.q !== undefined && m.q !== this.q) return;     // an older search's answer
+            this.searching = false; this.searchError = null;
+            this.results = valid(m.items);
+            this._prune();
+        } else if (m.ev === 'thumb') {
+            if (typeof m.rgba !== 'string' || !this._known(m.id)) return;
+            const w = m.w === undefined ? 160 : m.w, h = m.h === undefined ? 90 : m.h, buf = Buffer.from(m.rgba, 'base64');
+            if (SIZES.indexOf(w + 'x' + h) < 0 || buf.length !== w * h * 4) return;     // (stays asked: not asked again)
+            this.pending.delete(m.id);
+            this.thumbs[m.id] = { w, h, buf };
+        } else if (m.ev === 'state') {
+            const was = this.state;
+            this.state = String(m.state || 'idle');
+            if (typeof m.pct === 'number') this.pct = m.pct;
+            // another video than the one asked (the daemon's own, after an app restart): title and channel from a list;
+            // either way the daemon's title wins unless it is only the id (said while preparing)
+            if (m.id !== undefined && m.id !== this.id) { const r = this.item(m.id); this.id = m.id; this.title = r ? String(r.title || '') : ''; this.channel = r ? String(r.channel || '') : ''; }
+            const t = m.title === undefined ? '' : String(m.title || '');
+            if (t && (t !== this.id || !this.title)) this.title = t;
+            if (this.state !== 'error') this.error = null;
+            if (this.state !== 'preparing') this.retry = 0;
+            if (this.state === 'idle' || (was !== 'preparing' && this.state === 'preparing')) { this.elapsed = 0; this.total = 0; }
+            // a fresh ytdec starts with video on: tell it again where we are
+            if (this.state === 'playing' && was !== 'playing' && was !== 'paused') { this.videoOn = null; this._video(); }
+        } else if (m.ev === 'auth') {
+            this.auth = { state: String(m.state || 'signed_out'), code: m.code ? String(m.code) : null, url: typeof m.url === 'string' ? m.url : null, msg: m.msg ? String(m.msg) : null };
+            if (this.auth.state !== 'signed_in') { this.feeds = {}; this.chans = null; this.chan = null; this.pls = null; this.plist = null; this._prune(); }   // signed out: nobody's feed left on screen
+        } else if (m.ev === 'channels') {
+            if (!this.chans) return;
+            this.chans.loading = false;
+            if (m.error) this.chans.error = String(m.error); else {
+                this.chans.error = null;
+                this.chans.items = (Array.isArray(m.items) ? m.items : []).filter((c) => c && /^UC[\w-]{22}$/.test(c.id))
+                    .map((c) => ({ id: c.id, title: String(c.title || c.id), handle: String(c.handle || ''), key: fold(c.title) }));
+            }
+        } else if (m.ev === 'channel') {
+            const c = this.chan;
+            if (!c || m.id !== c.id) return;                                          // another channel's late answer
+            c.loading = false;
+            if (m.error) c.error = String(m.error); else {
+                c.error = null; c.items = valid(m.items, FEED_MAX);
+                c.shelves = (Array.isArray(m.shelves) ? m.shelves : []).filter((x) => x && typeof x === 'object')
+                    .map((x) => ({ title: String(x.title || ''), items: valid(x.items, SHELF_MAX) })).filter((x) => x.items.length).slice(0, SHELVES);
+                this._prune();
+            }
+        } else if (m.ev === 'playlists') {
+            if (!this.pls) return;
+            this.pls.loading = false;
+            if (m.error) this.pls.error = String(m.error); else {
+                this.pls.error = null;
+                this.pls.items = (Array.isArray(m.items) ? m.items : []).filter((p) => p && isPl(p.id)).slice(0, PL_MAX)
+                    .map((p) => ({ id: p.id, title: String(p.title || p.id), count: typeof p.count === 'number' && p.count >= 0 ? p.count : null,
+                        meta: (Array.isArray(p.meta) ? p.meta : []).filter((x) => typeof x === 'string' && x), thumb: isVid(p.thumb) ? p.thumb : null }));
+                this._prune();
+            }
+        } else if (m.ev === 'playlist') {
+            const p = this.plist;
+            if (!p || m.id !== p.id) return;                                          // another playlist's late answer
+            p.loading = m.partial === true;                                           // its first page: the rest follows
+            p.rest = p.loading; if (p.loading) p.t = Date.now();                      // the rest's clock starts now
+            if (m.error) p.error = String(m.error); else {
+                p.error = null; p.items = valid(m.items, PL_ITEMS);
+                if (m.title) p.title = String(m.title);
+                this._prune();
+            }
+        } else if (m.ev === 'feed') {
+            if (FEEDS.indexOf(m.which) < 0) return;
+            const f = this.feeds[m.which] = this.feeds[m.which] || { items: [] };
+            f.loading = m.partial === true;                                           // a playlist feed's first page
+            f.rest = f.loading; if (f.loading) f.t = Date.now();
+            if (m.error) f.error = String(m.error); else {
+                f.error = null; f.items = valid(m.items, m.which === 'wl' ? PL_ITEMS : FEED_MAX);
+                // shelves: none (an older daemon, or a playlist) = the flat list as a grid
+                f.shelves = (Array.isArray(m.shelves) ? m.shelves : []).filter((s) => s && typeof s === 'object')
+                    .map((s) => ({ title: String(s.title || ''), items: valid(s.items, SHELF_MAX) })).filter((s) => s.items.length).slice(0, SHELVES);
+                if (!f.shelves.length) f.shelves = null;
+                this._prune();
+            }
+            if (f.again && !f.loading) { f.again = false; this.feed(m.which); }
+        } else if (m.ev === 'positions') {
+            this.pos = {};
+            valid(m.items, 300).forEach((r) => { if (r.total > 0) this.pos[r.id] = r; });
+            this.resume = valid(m.items, 300).filter((r) => r.total > 0 && !r.done && r.ms > 10000).slice(0, SHELF_MAX);
+            this._prune();
+        } else if (m.ev === 'extras') {
+            this.extras = { id: String(m.id), chapters: (Array.isArray(m.chapters) ? m.chapters : []).filter((c) => Array.isArray(c) && c[0] >= 0),
+                segments: (Array.isArray(m.segments) ? m.segments : []).filter((c) => Array.isArray(c) && c[1] > c[0]) };
+        } else if (m.ev === 'logs_sent' || m.ev === 'logs_error') {
+            if (!this.logs || this.logs.state !== 'sending') return;
+            this.logs = m.ev === 'logs_sent' && /^[A-Za-z0-9]{4,16}$/.test(String(m.id)) ? { state: 'sent', code: String(m.id) }
+                : { state: 'error', msg: LOG_ERRORS.indexOf(m.msg) >= 0 ? m.msg : 'failed' };
+        } else if (m.ev === 'retry') {
+            if (m.id === this.id) this.retry = Number(m.n) || 1;   // the fetch failed (the network): the daemon tries again
+        } else if (m.ev === 'skipped') {
+            const names = { sponsor: 'sponsor', selfpromo: 'self-promotion', interaction: 'like & subscribe reminder', intro: 'intro' };
+            this.toast = { text: 'Skipped ' + (names[m.category] || 'segment') + ' · ' + clock(m.ms), until: Date.now() + 4000 };
+        } else if (m.ev === 'hello') {
+            this.caps = Array.isArray(m.caps) ? m.caps.filter((x) => typeof x === 'string') : [];
+            this.ev_clock(m);
+            if (this.can('ytdlp')) this.send({ cmd: 'ytdlp', auto: this.ytdlpAuto });   // the setting, once the service says it has it
+            if (this.can('proxy')) this.send({ cmd: 'proxy', mode: this.storeProxy ? 'store' : 'off' });
+            if (this.can('download')) { this.send({ cmd: 'library' }); this.send({ cmd: 'auto_download', max: this.autoDl }); }
+        } else if (m.ev === 'time') {
+            if (typeof m.elapsed === 'number') this.elapsed = m.elapsed;
+            if (typeof m.total === 'number') this.total = m.total;
+            this._resumeTick(Date.now());
+        } else if (m.ev === 'proxy') {
+            if (this.onStoreProxy) this.onStoreProxy(m.store === true);   // whether the Store has a proxy (the switch follows it)
+        } else if (m.ev === 'ytdlp') {
+            this.ytdlp = { auto: m.auto !== false, version: m.version || null, bundled: m.bundled || null, checking: !!m.checking };
+        } else if (m.ev === 'error') {
+            // a service older than 0.4.0: no caps, nothing wrong; a frozen command it has not built: nothing to show
+            if (m.msg === 'unknown cmd hello') { this.caps = []; this._changed(); return; }
+            if (m.cmd && /^not implemented /.test(m.msg)) return;
+            // a daemon older than yt-dlp updates: its own yt-dlp, nothing wrong
+            if (m.msg === 'unknown cmd ytdlp') { this.ytdlp = { unsupported: true }; this._changed(); return; }
+            // a daemon older than the account commands: no sign-in, nothing wrong with playback
+            if (/^unknown cmd (auth|auth_status|sign_out|feed)$/.test(m.msg)) { this.auth = { state: 'unsupported', code: null, url: null, msg: null }; this._changed(); return; }
+            // a daemon older than playlists: the Playlists page says so, nothing wrong with playback
+            if (/^unknown cmd playlists?$/.test(m.msg)) {
+                [this.pls, this.plist].forEach((p) => { if (p && p.loading) { p.loading = false; p.error = 'unknown cmd playlists'; } });
+                this._changed(); return;
+            }
+            // a service older than send_logs: the logs page says so, nothing wrong with playback
+            if (m.msg === 'unknown cmd send_logs') {
+                if (this.logs && this.logs.state === 'sending') this.logs = { state: 'error', msg: 'old' };
+                this._changed(); return;
+            }
+            this.error = String(m.msg || 'error').replace(/^fetch: /, '');   // the service's stage name means nothing to a driver
+            this.errorOffline = m.offline === true;
+            if (this.searching) { this.searching = false; this.searchError = this.error; }
+        } else if (typeof this['ev_' + m.ev] === 'function') this['ev_' + m.ev](m);   // events of later packages: an ev_<name> method
+        else return;
+        this._changed();
+    }
+
+    _items() {
+        const f = FEEDS.map((w) => this.feeds[w]).filter(Boolean);
+        if (this.chan) f.push(this.chan);
+        if (this.plist) f.push(this.plist);
+        if (this.related) f.push(this.related);
+        return this.results.concat(this.resume, this.library, ...f.map((x) => x.items || []), ...f.map((x) => [].concat(...(x.shelves || []).map((s) => s.items))));
+    }
+    /** the videos whose pictures the playlist tiles show */
+    _plThumbs() { return ((this.pls && this.pls.items) || []).map((p) => p.thumb).filter(Boolean); }
+    _known(id) { return this._items().some((r) => r.id === id) || this._plThumbs().indexOf(id) >= 0; }
+    /** an item by its id (the first list that has it), or null */
+    item(id) { return this._items().find((r) => r.id === id) || null; }
+    /** drop the thumbs (and the requests) of ids no list shows any more */
+    _prune() {
+        const ids = new Set(this._items().map((r) => r.id).concat(this._plThumbs()));
+        Object.keys(this.thumbs).forEach((id) => { if (!ids.has(id)) delete this.thumbs[id]; });
+        this.pending.forEach((id) => { if (!ids.has(id)) this.pending.delete(id); });
+    }
+    /** the chapter playing (its title), or null */
+    chapter() {
+        const x = this.extras;
+        if (!x || x.id !== this.id || !x.chapters.length) return null;
+        let c = null;
+        x.chapters.forEach((k) => { if (k[0] <= this.elapsed) c = k; });
+        return c ? String(c[1]) : null;
+    }
+    /** a stream lookup ahead of a likely play (the daemon skips cached and fresh ones) */
+    prefetch(id) { return this.connected && this._known(id) ? this.send({ cmd: 'prefetch', id }) : false; }
+    /** the screens draw item id: its thumb asked once (until it comes, or the item goes), if not held; true when asked now */
+    wantThumb(id) {
+        if (this.thumbs[id] || this.pending.has(id) || !this.connected || !this._known(id)) return false;
+        if (!this.send({ cmd: 'thumb', id })) return false;
+        this.pending.add(id);
+        return true;
+    }
+    /** a search with no answer after ms: an error, never a screen waiting for ever */
+    checkSearch(now, ms) {
+        if (!this.searching || now - this.searchT < ms) return false;
+        this.searching = false; this.searchError = 'No answer from the RideTube service';
+        this._changed();
+        return true;
+    }
+    search(q) {
+        q = String(q || '').trim();
+        if (!q) return false;
+        this.q = q; this.searching = true; this.searchError = null; this.searchT = Date.now();
+        this._changed();
+        if (this.send({ cmd: 'search', q })) return true;
+        this.searching = false; this.searchError = 'The RideTube service (jap-ridetube-d) is not running';
+        return false;
+    }
+    /** it: the tile tapped ({title, channel}), else the lists' item: shown until the daemon says its own title */
+    /** o: { quality, skip } (the settings), sent as they are */
+    play(id, rect, fill, it, o) {
+        const r = it || this.item(id);
+        this.id = id; this.title = r ? String(r.title || '') : ''; this.channel = r ? String(r.channel || '') : ''; this.state = 'preparing'; this.pct = 0; this.elapsed = 0; this.total = 0; this.error = null; this.retry = 0;
+        this.resumeWait = true; this.resumed = null;
+        this._changed();
+        // the account's own resume point (the tile's), used by the daemon when this car never played it
+        return this.send(Object.assign({ cmd: 'play', id, rect, fill: !!fill }, r && r.start_s > 0 ? { at: r.start_s * 1000 } : {}, o || {}));
+    }
+    toggle() {
+        if (this.state === 'playing') return this.send({ cmd: 'pause' });
+        if (this.state === 'paused') return this.send({ cmd: 'resume' });
+        return false;
+    }
+    /** seek by delta ms, clamped into the video */
+    skip(delta) {
+        if (this.state !== 'playing' && this.state !== 'paused') return false;
+        let ms = this.elapsed + delta;
+        if (this.total > 0) ms = Math.min(ms, Math.max(0, this.total - 1000));
+        ms = Math.max(0, Math.round(ms));
+        this.elapsed = ms;
+        this._changed();
+        return this.send({ cmd: 'seek', ms });
+    }
+    /** ask the daemon for a sign-in code (it says the one shown again, or signed in); retry: after an error too */
+    authStart(retry) {
+        const st = this.auth.state;
+        if (!this.connected || !(st === 'signed_out' || (retry && st === 'error'))) return false;
+        this.auth = { state: 'asking', code: null, url: null, msg: null };
+        this._changed();
+        return this.send({ cmd: 'auth' });
+    }
+    signOut() { return this.auth.state === 'signed_in' ? this.send({ cmd: 'sign_out' }) : false; }
+    /** (re)load feed which (home|subs|wl); its items stay shown meanwhile */
+    feed(which) {
+        if (FEEDS.indexOf(which) < 0) return false;
+        const f = this.feeds[which] = this.feeds[which] || { items: [] };
+        if (f.loading || this.auth.state !== 'signed_in') return false;
+        f.loading = true; f.error = null; f.t = Date.now(); f.rest = false;
+        this._changed();
+        if (this.send({ cmd: 'feed', which })) return true;
+        f.loading = false; f.error = 'The RideTube service (jap-ridetube-d) is not running';
+        return false;
+    }
+    /** a feed with no answer after ms: an error, as for searches */
+    checkFeeds(now, ms) {
+        let any = false;
+        FEEDS.map((w) => this.feeds[w]).concat([this.chans, this.chan, this.pls, this.plist, this.related, this.health])
+            .forEach((f) => { if (f && f.loading && now - f.t >= (f === this.health ? HEALTH_MS : f.rest ? ms * 6 : ms)) { f.loading = false; f.error = 'No answer from the RideTube service'; any = true; } });
+        if (any) this._changed();
+        return any;
+    }
+    stop() { return this.active() ? this.send({ cmd: 'stop' }) : false; }
+    /** while playing: the same video again at this quality, from where it is */
+    quality(q) { return this.active() ? this.send({ cmd: 'quality', quality: q }) : false; }
+    /** fill (crop to the screen) or fit (the whole picture) for the playing video */
+    fill(on) { return this.active() ? this.send({ cmd: 'fill', on: !!on }) : false; }
+    /** the "Use the MGU Store's proxy" switch: kept for the next connect, told now when connected */
+    setStoreProxy(on) { this.storeProxy = !!on; return this.connected && this.can('proxy') ? this.send({ cmd: 'proxy', mode: this.storeProxy ? 'store' : 'off' }) : false; }
+    /** the yt-dlp updates setting: kept for the next connect, told now when connected */
+    setYtdlpAuto(on) { this.ytdlpAuto = !!on; return this.connected && this.can('ytdlp') ? this.send({ cmd: 'ytdlp', auto: this.ytdlpAuto }) : false; }
+    /** (re)load the subscribed channels (the daemon keeps them 10 min); shown meanwhile */
+    loadChannels() {
+        const c = this.chans = this.chans || { items: [] };
+        if (c.loading || this.auth.state !== 'signed_in') return false;
+        c.loading = true; c.error = null; c.t = Date.now();
+        this._changed();
+        if (this.send({ cmd: 'channels' })) return true;
+        c.loading = false; c.error = 'The RideTube service (jap-ridetube-d) is not running';
+        return false;
+    }
+    /** the channels whose name starts with q (one letter or digit), else holds q (also the @handle); case and accents aside */
+    findChannels(q) {
+        const all = (this.chans && this.chans.items) || [], k = fold(q);
+        if (!k) return all;
+        if (k.length === 1) return all.filter((c) => c.key.charAt(0) === k);
+        return all.filter((c) => c.key.indexOf(k) >= 0 || fold(c.handle).indexOf(k) >= 0);
+    }
+    /** show channel id's page (title: its name, until it loads) */
+    openChannel(id, title) {
+        const same = this.chan && this.chan.id === id;
+        if (!same) { this.chan = { id, title: String(title || ''), items: [], shelves: null }; this._prune(); }
+        const c = this.chan;
+        if (c.loading) return false;
+        c.loading = true; c.error = null; c.t = Date.now();
+        this._changed();
+        if (this.send({ cmd: 'channel', id })) return true;
+        c.loading = false; c.error = 'The RideTube service (jap-ridetube-d) is not running';
+        return false;
+    }
+    /** (re)load the account's playlists; the ones held stay shown meanwhile */
+    loadPlaylists() {
+        const p = this.pls = this.pls || { items: [] };
+        if (p.loading || this.auth.state !== 'signed_in') return false;
+        p.loading = true; p.error = null; p.t = Date.now();
+        this._changed();
+        if (this.send({ cmd: 'playlists' })) return true;
+        p.loading = false; p.error = 'The RideTube service (jap-ridetube-d) is not running';
+        return false;
+    }
+    /** show playlist id's videos (title: its name, until it loads) */
+    openPlaylist(id, title) {
+        if (!isPl(id)) return false;
+        if (!this.plist || this.plist.id !== id) { this.plist = { id, title: String(title || ''), items: [] }; this._prune(); }
+        const p = this.plist;
+        if (p.loading) return false;
+        p.loading = true; p.error = null; p.t = Date.now(); p.rest = false;
+        this._changed();
+        if (this.send({ cmd: 'playlist', id })) return true;
+        p.loading = false; p.error = 'The RideTube service (jap-ridetube-d) is not running';
+        return false;
+    }
+    /** the log report: the confirm step (askLogs), sent with this app's version, dropped; never two at once */
+    askLogs() { if (this.logs && this.logs.state === 'sending') return; this.logs = { state: 'confirm' }; this._changed(); }
+    dropLogs() { if (this.logs && this.logs.state === 'sending') return; this.logs = null; this._changed(); }
+    sendLogs(app) {
+        if (this.logs && this.logs.state === 'sending') return false;
+        const sent = this.send({ cmd: 'send_logs', app });
+        this.logs = sent ? { state: 'sending', t: Date.now() } : { state: 'error', msg: 'failed' };
+        this._changed();
+        return sent;
+    }
+    /** a report with no answer after ms (the service times out at 30 s): failed, never "Sending..." for ever */
+    checkLogs(now, ms) {
+        if (!this.logs || this.logs.state !== 'sending' || now - this.logs.t < ms) return false;
+        this.logs = { state: 'error', msg: 'failed' };
+        this._changed();
+        return true;
+    }
+    /** video wanted (player on screen and the car parked): tells the daemon when that changes */
+    setWantVideo(on) { this.wantVideo = !!on; this._video(); }
+    _video() {
+        if (!this.connected || this.videoOn === this.wantVideo) return;
+        if (this.send({ cmd: 'video', on: this.wantVideo })) this.videoOn = this.wantVideo;
+    }
+
+    /* ---------- 0.4.0 (caps): watch-next, the health check, the resume notice ---------- */
+    /** the videos YouTube lists after id (watch-next); asked once per id (the service caches them 10 min) */
+    loadRelated(id) {
+        if (!this.can('related') || !isVid(id) || (this.related && this.related.id === id)) return false;
+        this.related = { id, items: [], loading: true, error: null, t: Date.now() };
+        this._prune();
+        this._changed();
+        if (this.send({ cmd: 'related', id })) return true;
+        this.related.loading = false; this.related.error = 'The RideTube service (jap-ridetube-d) is not running';
+        return false;
+    }
+    ev_related(m) {
+        const r = this.related;
+        if (!r || m.id !== r.id) return;                                         // another video's late answer
+        r.loading = false;
+        if (m.error) r.error = String(m.error); else { r.error = null; r.items = valid(m.items, FEED_MAX); this._prune(); }
+        if (this.onRelated) this.onRelated(r);                                    // (main.js: a wheel tap waiting for it)
+    }
+    /** run the service's health check (rows replace the last run's as they come); never two at once */
+    runHealth() {
+        if (!this.can('health') || (this.health && this.health.loading)) return false;
+        this.health = { items: [], loading: true, error: null, t: Date.now() };
+        this._changed();
+        if (this.send({ cmd: 'health' })) return true;
+        this.health.loading = false; this.health.error = 'The RideTube service (jap-ridetube-d) is not running';
+        return false;
+    }
+    ev_health(m) {
+        const h = this.health;
+        if (!h || !h.loading) return;                                            // a run nobody waits for
+        h.t = Date.now();                                                        // (the timeout counts from the last row)
+        if (m.done) { h.loading = false; return; }
+        if (typeof m.key !== 'string' || !m.key) return;
+        const row = { key: m.key, ok: m.ok === true, text: typeof m.text === 'string' ? m.text : '' };
+        const i = h.items.findIndex((x) => x.key === row.key);
+        if (i >= 0) h.items[i] = row; else h.items.push(row);
+    }
+    /** the clock went wrong or right again (hello's clock, then clock events): a date as YYYY-MM-DD, else none */
+    ev_clock(m) { this.clock = typeof m.clock === 'string' && /^\d{4}-\d\d-\d\d$/.test(m.clock) ? m.clock : null; }
+    /** a fresh play's first tick past 10 s while playing: the service resumed it there (10 s notice: Resumed at, Start over) */
+    _resumeTick(now) {
+        if (!this.resumeWait || this.state !== 'playing') return;
+        this.resumeWait = false;
+        if (this.elapsed > 10000) this.resumed = { id: this.id, ms: this.elapsed, until: now + 10000 };
+    }
+    /** the resume notice to show now, or null */
+    resumedNow(now) {
+        const r = this.resumed;
+        return r && r.id === this.id && now < r.until && (this.state === 'playing' || this.state === 'paused') ? r : null;
+    }
+    /** Start over: from the very start (the service seeks to 1 ms for 0) */
+    startOver() { this.resumed = null; return this.skip(-this.elapsed); }
+
+    /* ---------- 0.6.0 (cap download): downloads, kept on the car and played with no network ---------- */
+    ev_library(m) { this.library = valid(m.items, 300); this._prune(); }
+    ev_auto_download(m) { if (m.max >= 0) this.autoDl = m.max; }
+    /** id's download: its library item, or null */
+    saved(id) { return this.library.find((r) => r.id === id) || null; }
+    /** the downloads on the car, ready to play */
+    downloaded() { return this.library.filter((r) => r.ready); }
+    /** download id (its title and channel from the lists) at the quality setting */
+    download(id, quality) {
+        if (!this.can('download') || !isVid(id)) return false;
+        const r = this.item(id) || (id === this.id ? { title: this.title, channel: this.channel } : {});
+        const total = id === this.id && this.total > 0 ? Math.round(this.total / 1000) : null;
+        return this.send(Object.assign({ cmd: 'download', id, meta: { title: r.title || '', channel: r.channel || '', duration_s: r.duration_s || total } }, quality ? { quality } : {}));
+    }
+    remove(id) { return this.can('download') && isVid(id) ? this.send({ cmd: 'remove', id }) : false; }
+    /** the auto-download setting (0, 3, 5, 10): kept for the next connect, told now when connected */
+    setAutoDl(n) { this.autoDl = Number(n) || 0; return this.connected && this.can('download') ? this.send({ cmd: 'auto_download', max: this.autoDl }) : false; }
+}
+
+/** "Élise Atelier" -> "elise atelier": what a channel search compares */
+function fold(t) {
+    let s = String(t || '');
+    try { s = s.normalize('NFD').replace(/[\u0300-\u036f]/g, ''); } catch (e) { /* a Node without ICU: accents kept */ }
+    return s.toLowerCase().trim();
+}
+// at most n videos and n Shorts (short:true): Shorts never push videos out, so with Show Shorts off (main.js) a
+// Shorts-heavy list still shows its n videos
+function valid(items, n) {
+    let v = 0, s = 0;
+    n = n || 100;
+    return (Array.isArray(items) ? items : []).filter((r) => r && typeof r.id === 'string' && (r.short ? s++ < n : v++ < n));
+}
+
+/** 83000 -> "1:23", 3723000 -> "1:02:03" */
+function clock(ms) {
+    const s = Math.max(0, Math.floor((ms || 0) / 1000)), h = Math.floor(s / 3600), m = Math.floor(s / 60) % 60, ss = s % 60;
+    const p = (n) => (n < 10 ? '0' : '') + n;
+    return h ? h + ':' + p(m) + ':' + p(ss) : m + ':' + p(ss);
+}
+
+// "Use the MGU Store's proxy": until the user flips it the switch shows whether the Store has a proxy, and RideTube
+// uses it when there is one (mode store); once flipped, the choice holds (store_proxy_chosen). Returns the onChange part.
+function followStoreProxy(settings, model) {
+    let sync = false;
+    const chosen = () => settings.get('store_proxy_chosen') === true;
+    model.storeProxy = !chosen() || settings.get('store_proxy') === true;
+    model.onStoreProxy = (has) => {
+        if (chosen() || settings.get('store_proxy') === has) return;
+        sync = true;
+        try { settings.set('store_proxy', has); } finally { sync = false; }
+    };
+    return (key, value) => {
+        if (key !== 'store_proxy' || sync) return;
+        settings.set('store_proxy_chosen', true);
+        model.setStoreProxy(value === true);
+    };
+}
+
+// The drive lock of "Video while driving": the setting counts only once it is on while parked, so a press while moving
+// cannot bring the picture up; off works at once. That parked yes is kept with the settings (video_driving_ok), so a
+// restart while driving (an update, the head unit) keeps the passenger's picture. Settings from before 0.6.3 have no
+// video_driving_ok: on there counts as said yes (as riskAgreed does), and every check saves the answer, false too.
+// Returns (on, moving) => no video.
+function driveLock(settings) {
+    let ok = settings.get('video_driving') === true && settings.get('video_driving_ok') !== false;
+    return (on, moving) => {
+        ok = moving ? ok && on : on;
+        if (settings.get('video_driving_ok') !== ok) settings.set('video_driving_ok', ok);
+        return moving && !ok;
+    };
+}
+
+module.exports = { Ctl, Model, clock, SOCKET, FEEDS, FEED_MAX, SHELF_MAX, followStoreProxy, driveLock };

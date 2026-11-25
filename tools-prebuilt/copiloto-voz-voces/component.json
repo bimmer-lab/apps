@@ -1,0 +1,70 @@
+{
+ "id": "copiloto-voz-voces",
+ "kind": "tool",
+ "version": "1.0.1",
+ "title": "Copiloto de voz: voces",
+ "description": "La voz de Copiloto de voz (español, Elvira) en /var/opt, donde el reproductor de BMW puede abrirla",
+ "mguHmi": [
+  "ID7",
+  "ID8"
+ ],
+ "requires": {
+  "mgu-deploy": "0.4.0"
+ },
+ "voicesHash": "adb209e1c250e279",
+ "files": [
+  {
+   "path": "es/es-ES-ElviraNeural/bienvenida.m4a",
+   "mode": "0644"
+  },
+  {
+   "path": "es/es-ES-ElviraNeural/bienvenida_manana.m4a",
+   "mode": "0644"
+  },
+  {
+   "path": "es/es-ES-ElviraNeural/bienvenida_noche.m4a",
+   "mode": "0644"
+  },
+  {
+   "path": "es/es-ES-ElviraNeural/bienvenida_tarde.m4a",
+   "mode": "0644"
+  },
+  {
+   "path": "es/es-ES-ElviraNeural/combustible.m4a",
+   "mode": "0644"
+  },
+  {
+   "path": "es/es-ES-ElviraNeural/descanso.m4a",
+   "mode": "0644"
+  },
+  {
+   "path": "es/es-ES-ElviraNeural/fin_viaje.m4a",
+   "mode": "0644"
+  },
+  {
+   "path": "es/es-ES-ElviraNeural/hielo.m4a",
+   "mode": "0644"
+  },
+  {
+   "path": "es/es-ES-ElviraNeural/mantenimiento.m4a",
+   "mode": "0644"
+  },
+  {
+   "path": "es/es-ES-ElviraNeural/motor_caliente.m4a",
+   "mode": "0644"
+  },
+  {
+   "path": "es/es-ES-ElviraNeural/motor_frio.m4a",
+   "mode": "0644"
+  },
+  {
+   "path": "es/es-ES-ElviraNeural/neumaticos.m4a",
+   "mode": "0644"
+  },
+  {
+   "path": "es/es-ES-ElviraNeural/ventanillas.m4a",
+   "mode": "0644"
+  }
+ ],
+ "units": []
+}

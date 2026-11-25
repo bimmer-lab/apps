@@ -1,14 +1,385 @@
 {
   "schema": 1,
-  "apps": {
-    "path": "apps/*",
-    "manifest": "app.json",
-    "mguHmi": ["ID7"],
-    "build": {
-      "python": "kit/tools/build.py",
-      "args": ["{id}"],
-      "sdk": "oap-sdk",
-      "output": "dist/{id}@{version}.tgz"
+  "components": [
+    {
+      "id": "cluster_themes",
+      "kind": "app",
+      "path": "apps/cluster_themes",
+      "mguHmi": [
+        "ID7"
+      ],
+      "build": {
+        "python": "kit/tools/build.py",
+        "args": [
+          "{id}"
+        ],
+        "sdk": "oap-sdk",
+        "output": "dist/{id}@{version}.tgz",
+        "shared": [
+          "kit/tools",
+          "kit/runtime",
+          "kit/platform",
+          "kit/localization",
+          "kit/LICENSE",
+          "oap-sdk",
+          "shared/hud.js",
+          "shared/hud_text.js",
+          "shared/hud_data.js",
+          "shared/hud_themes.js",
+          "shared/layouts.js",
+          "shared/shaders.js",
+          "shared/icons.js",
+          "shared/shift_score.js",
+          "shared/demo_script.js",
+          "shared/sun.js",
+          "shared/cluster_render_client.js",
+          "shared/calibration.js",
+          "shared/visible.js",
+          "shared/page.js",
+          "shared/waze.js",
+          "shared/previews.js",
+          "shared/sensors.js",
+          "shared/badges.js",
+          "shared/screen.js",
+          "shared/runs.js",
+          "shared/tz.js",
+          "shared/holidays.js",
+          "shared/vehicle_state.js",
+          "shared/shift_cue.js",
+          "shared/smart_temps.js",
+          "shared/hud_holiday.js",
+          "shared/garland.js"
+        ]
+      }
+    },
+    {
+      "id": "fuel_link",
+      "kind": "app",
+      "path": "apps/fuel_link",
+      "mguHmi": [
+        "ID7"
+      ],
+      "build": {
+        "python": "kit/tools/build.py",
+        "args": [
+          "{id}"
+        ],
+        "sdk": "oap-sdk",
+        "output": "dist/{id}@{version}.tgz",
+        "shared": [
+          "kit/tools",
+          "kit/runtime",
+          "kit/platform",
+          "kit/localization",
+          "kit/LICENSE",
+          "oap-sdk"
+        ]
+      }
+    },
+    {
+      "id": "copiloto_voz",
+      "kind": "app",
+      "path": "apps/copiloto_voz",
+      "mguHmi": [
+        "ID7"
+      ],
+      "build": {
+        "python": "kit/tools/build.py",
+        "args": [
+          "{id}"
+        ],
+        "sdk": "oap-sdk",
+        "output": "dist/{id}@{version}.tgz",
+        "shared": [
+          "kit/tools",
+          "kit/runtime",
+          "kit/platform",
+          "kit/localization",
+          "kit/LICENSE",
+          "oap-sdk",
+          "shared/tz.js"
+        ]
+      }
+    },
+    {
+      "id": "redline",
+      "kind": "app",
+      "path": "vendor/idrive7-apps/apps/redline",
+      "mguHmi": [
+        "ID7"
+      ],
+      "build": {
+        "python": "vendor/idrive7-apps/kit/tools/build.py",
+        "args": [
+          "{id}"
+        ],
+        "sdk": "vendor/idrive7-apps/oap-sdk",
+        "output": "vendor/idrive7-apps/dist/{id}@{version}.tgz",
+        "shared": [
+          "vendor/idrive7-apps/kit",
+          "vendor/idrive7-apps/oap-sdk",
+          "vendor/idrive7-apps/LICENSE"
+        ]
+      }
+    },
+    {
+      "id": "draggy",
+      "kind": "app",
+      "path": "vendor/idrive7-apps/apps/draggy",
+      "mguHmi": [
+        "ID7"
+      ],
+      "build": {
+        "python": "vendor/idrive7-apps/kit/tools/build.py",
+        "args": [
+          "{id}"
+        ],
+        "sdk": "vendor/idrive7-apps/oap-sdk",
+        "output": "vendor/idrive7-apps/dist/{id}@{version}.tgz",
+        "shared": [
+          "vendor/idrive7-apps/kit",
+          "vendor/idrive7-apps/oap-sdk",
+          "vendor/idrive7-apps/LICENSE"
+        ]
+      }
+    },
+    {
+      "id": "dyno",
+      "kind": "app",
+      "path": "vendor/idrive7-apps/apps/dyno",
+      "mguHmi": [
+        "ID7"
+      ],
+      "build": {
+        "python": "vendor/idrive7-apps/kit/tools/build.py",
+        "args": [
+          "{id}"
+        ],
+        "sdk": "vendor/idrive7-apps/oap-sdk",
+        "output": "vendor/idrive7-apps/dist/{id}@{version}.tgz",
+        "shared": [
+          "vendor/idrive7-apps/kit",
+          "vendor/idrive7-apps/oap-sdk",
+          "vendor/idrive7-apps/LICENSE"
+        ]
+      }
+    },
+    {
+      "id": "ambient_config",
+      "kind": "app",
+      "path": "vendor/idrive7-apps/apps/ambient_config",
+      "mguHmi": [
+        "ID7"
+      ],
+      "build": {
+        "python": "vendor/idrive7-apps/kit/tools/build.py",
+        "args": [
+          "{id}"
+        ],
+        "sdk": "vendor/idrive7-apps/oap-sdk",
+        "output": "vendor/idrive7-apps/dist/{id}@{version}.tgz",
+        "shared": [
+          "vendor/idrive7-apps/kit",
+          "vendor/idrive7-apps/oap-sdk",
+          "vendor/idrive7-apps/LICENSE"
+        ]
+      }
+    },
+    {
+      "id": "dpf_monitor",
+      "kind": "app",
+      "path": "vendor/namelsmissing/apps/dpf_monitor",
+      "mguHmi": [
+        "ID7"
+      ],
+      "build": {
+        "python": "vendor/namelsmissing/kit/tools/build.py",
+        "args": [
+          "{id}"
+        ],
+        "sdk": "vendor/namelsmissing/oap-sdk",
+        "output": "vendor/namelsmissing/dist/{id}@{version}.tgz",
+        "shared": [
+          "vendor/namelsmissing/kit",
+          "vendor/namelsmissing/oap-sdk",
+          "vendor/namelsmissing/LICENSE",
+          "vendor/namelsmissing/THIRD_PARTY_NOTICES.md"
+        ]
+      },
+      "requires": {
+        "idrive7-renderd": "2.1.6",
+        "mgu-inputgate": "1.0.0"
+      }
+    },
+    {
+      "id": "jap_sysmon",
+      "kind": "app",
+      "path": "vendor/justanotherpu/apps/jap_sysmon",
+      "mguHmi": [
+        "ID7"
+      ],
+      "build": {
+        "python": "vendor/justanotherpu/kit/tools/build.py",
+        "args": [
+          "{id}"
+        ],
+        "sdk": "vendor/justanotherpu/oap-sdk",
+        "output": "vendor/justanotherpu/dist/{id}@{version}.tgz",
+        "shared": [
+          "vendor/justanotherpu/kit",
+          "vendor/justanotherpu/oap-sdk",
+          "vendor/justanotherpu/LICENSE",
+          "vendor/justanotherpu/THIRD_PARTY_LICENSES"
+        ]
+      },
+      "requires": {
+        "mgu-render": "0.6.11",
+        "mgu-inputgate": "1.0.0"
+      }
+    },
+    {
+      "id": "jap_ridetube",
+      "kind": "app",
+      "path": "vendor/ridetube/apps/jap_ridetube",
+      "mguHmi": [
+        "ID7"
+      ],
+      "build": {
+        "python": "vendor/ridetube/kit/tools/build.py",
+        "args": [
+          "{id}"
+        ],
+        "sdk": "vendor/ridetube/oap-sdk",
+        "output": "vendor/ridetube/dist/{id}@{version}.tgz",
+        "shared": [
+          "vendor/ridetube/kit",
+          "vendor/ridetube/oap-sdk",
+          "vendor/ridetube/LICENSE",
+          "vendor/ridetube/THIRD_PARTY_LICENSES"
+        ]
+      },
+      "requires": {
+        "jap-ridetube-d": "0.5.4",
+        "mgu-render": "0.6.11",
+        "mgu-inputgate": "1.0.0"
+      }
+    },
+    {
+      "id": "robertn_waze_cluster",
+      "kind": "app",
+      "path": "vendor/robertnisipeanu/apps/robertn_waze_cluster",
+      "build": "unit",
+      "requires": {
+        "waze-on-cluster": "0.14.2"
+      },
+      "uninstallable": true,
+      "mguHmi": [
+        "ID7"
+      ]
+    },
+    {
+      "id": "idrive7-renderd",
+      "kind": "tool",
+      "path": "tools-prebuilt/idrive7-renderd",
+      "title": "GPU renderer",
+      "description": "The apps' own GPU renderer (mgu-render): draws them at 60 fps, beside the MGU Store's Renderer; installed with the apps (iDrive 7 and iDrive 8)",
+      "mguHmi": [
+        "ID7",
+        "ID8"
+      ]
+    },
+    {
+      "id": "mgu-inputgate",
+      "kind": "tool",
+      "path": "tools-prebuilt/mgu-inputgate",
+      "title": "Controller gate",
+      "description": "Lets the apps have the iDrive controller (tabs, page buttons, settings, Doom); loads into the HMI at the next start (iDrive 7 and iDrive 8)",
+      "optional": false,
+      "uninstallable": true,
+      "mguHmi": [
+        "ID7",
+        "ID8"
+      ],
+      "needs": [
+        "renderer"
+      ]
+    },
+    {
+      "id": "cluster-render",
+      "kind": "tool",
+      "path": "tools-prebuilt/cluster-render",
+      "title": "Cluster renderer",
+      "description": "Draws every app's layers on the instrument cluster and the HUD, sharing the display slots and one upload budget",
+      "requires": {
+        "mgu-deploy": "0.4.0"
+      },
+      "uninstallable": true,
+      "mguHmi": [
+        "ID7",
+        "ID8"
+      ]
+    },
+    {
+      "id": "waze-on-cluster",
+      "kind": "tool",
+      "path": "tools-prebuilt/waze-on-cluster",
+      "title": "Maps on cluster",
+      "description": "Runs the cluster map in the background. It is installed with the Maps on cluster app, which you use to control it.",
+      "requires": {
+        "mgu-deploy": "0.7.17",
+        "cluster-render": "0.5.3"
+      },
+      "uninstallable": true,
+      "mguHmi": [
+        "ID7"
+      ]
+    },
+    {
+      "id": "jap-ridetube-d",
+      "kind": "tool",
+      "path": "tools-prebuilt/jap-ridetube-d",
+      "title": "RideTube service",
+      "description": "The car side of RideTube, an unofficial client for YouTube: yt-dlp (from its official release, run in mgu-python) fetches as the daemon's own internet uid; search, feeds and thumbnails on the car (jap-node22); audio through the BMW MediaPlayer, video decoded by ytdec into the mgu-render video layer; TV device sign-in; controlled by the RideTube app over /run/jap-ridetube-d/ctl.sock",
+      "requires": {
+        "mgu-deploy": "0.7.0",
+        "mgu-python": "1.0.2",
+        "jap-node22": "22.23.4",
+        "mgu-render": "0.6.11"
+      },
+      "uninstallable": true,
+      "mguHmi": [
+        "ID7"
+      ]
+    },
+    {
+      "id": "mgu-render-id7-touch",
+      "kind": "tool",
+      "path": "tools-prebuilt/mgu-render-id7-touch",
+      "title": "Full-width touch",
+      "description": "Lets full-screen apps (RideTube, Moonride) use the screen's left edge: both renderers get the whole screen as their touch area, so a tap on the strip where the back arrow usually is reaches the app instead of closing it. Leave such an app with the BACK or MENU button. Other apps keep the back arrow. Removing it takes effect at the next start of the head unit.",
+      "requires": {
+        "mgu-deploy": "0.7.0"
+      },
+      "optional": true,
+      "uninstallable": true,
+      "mguHmi": [
+        "ID7"
+      ]
+    },
+    {
+      "id": "copiloto-voz-voces",
+      "kind": "tool",
+      "path": "tools-prebuilt/copiloto-voz-voces",
+      "title": "Copiloto de voz: voces",
+      "description": "La voz de Copiloto de voz (español, Elvira) en /var/opt, donde el reproductor de BMW puede abrirla",
+      "requires": {
+        "mgu-deploy": "0.4.0"
+      },
+      "uninstallable": true,
+      "mguHmi": [
+        "ID7",
+        "ID8"
+      ]
     }
-  }
+  ]
 }

@@ -300,6 +300,20 @@ const STATUS_ASK_MS = 2000;      // after a rebuild: ask cluster-render for its 
 // an image layer is "stalled" until its first pixels reach cluster-render, which after a rebuild takes a second or two
 // through the upload budget: normal. Only one still stalled this long is logged as a problem (and its recovery)
 const STALL_WARN_MS = 5000;
+// Ready in the background (cluster only): while the theme changes with the drive mode, the mode now shows BMW's own
+// cluster and the other modes all show one theme, that theme is built now with its layers hidden (shaders compiled,
+// pixels sent), so a switch to it only makes them visible: as quick as going back to BMW's own, with no BMW cluster
+// of the new mode showing while the theme would be built. A hidden layer doesn't hold the cluster's screen, so a
+// see-through hold layer does (its own connection, <app id>_cover; an effect layer costs no pixel memory); with the
+// screen let go, BMW would show again only once the theme has asked for it back.
+// At start, with the theme changing with the drive mode, BMW's own cluster stays until the car says which mode it is
+// in (a theme for the wrong mode would flash up first); without a mode by then, the usual rules ("hudLayout").
+const MODE_WAIT_MS = 60000;
+// A layout kept ready is not hidden but parked: every layer drawn 1 x 1 px at the top-left corner, under the hood line
+// where the driver sees nothing (shared/visible.js), so its shaders are compiled and its pictures sent before the
+// first switch to it, which then only moves the layers back.
+const PARK = { x: 0, y: 0, w: 1, h: 1 };
+const HOLD_FS = 'precision mediump float;\nvoid main() { gl_FragColor = vec4(0.0); }\n';
 const LAYER_BUDGET = 8;          // cluster-render's limit per client connection (CompositorLimits.per_client; confirmed on the car Nov 5 2026)
 const MAX_CONN = 4;              // connections a layout may ask for ("conn"): 32 layers service-wide / 8 per connection
 // The map (Waze on Cluster, 1088x480) where "start panel" put it on the panel, BMW's own map view (the calibration
@@ -308,9 +322,16 @@ const MAP_SLOT = [416, 120, 1088, 480];
 const PIXEL_BYTES = 16 * 1024 * 1024;   // cluster-render's pixel memory for every app's images together (CompositorLimits.pixel_bytes)
 const SHEET_AREA_FRAC = 4;       // the first sheet size limit: 1/4 of the target area (see the header)
 const TICK_MS = 50;              // 20 Hz: shift bar and gauges
+// The tick slows down when fast frames show nothing, so CarPlay and the HMI get the CPU (_tickMs):
+const PARKED_TICK_MS = 100;      // 10 Hz: standing, engine not running, no shift light (needles still; text, garland)
+const IDLE_TICK_MS = 250;        // 4 Hz: nothing of ours on the cluster (Off, BMW's own, renderer not up): data only
 const TEXT_MS = 200;             // text re-draws at most 5 times a second (what BMW's own readouts do)
 const TARGET_SIZES = { hud: [800, 480], panel: [1920, 720] };
 const MODE_KEY = { comfort: 'inComfort', sport: 'inSport', eco: 'inEco' };
+// "Show Waze map inside the theme" per drive mode (Cluster Themes): while byMode is on and the mode is known, the
+// mode's own switch also has to be on. All on by default, so the map shows in every mode as before.
+const MAP_MODE_KEY = { comfort: 'mapComfort', sport: 'mapSport', eco: 'mapEco' };
+const MAP_MODE_KEYS = ['mapComfort', 'mapSport', 'mapEco'];
 // a plug-in hybrid's eDrive mode (issue #31; the idea from FDX100's KurdBimmer Themes): its own theme when the driver
 // picked one ("In Hybrid" / "In Electric", Cluster Themes), else the drive mode's
 const PHEV_KEY = { hybrid: 'inHybrid', electric: 'inElectric' };
@@ -348,6 +369,9 @@ const MVIEW_RPM = 8000;            // the M view theme's rev scale: 0..8
 const MVIEW_SPEED = { us: 200, metric: 330 };
 const VDASH_RPM = 8000;            // the Vector theme's rev counter: 0..8
 const MEDIA_IF = 'de.bmw.infotainment.hmi.hmimediastate.HmiMediaState';   // the head unit's now playing (front)
+// Its instances have names, and none is '1': the units' catalogs list HMI_CID (the centre display), HMI_FoMo_Left and
+// HMI_FoMo_Right. Asked for as '1' (0.19.0 / 0.15.0), BMW's app manager refused the whole app (issue #26).
+const MEDIA_INSTANCE = 'HMI_CID';
 const MEDIA_TYPES = { 1: 'ARTIST', 2: 'ALBUM', 3: 'TITLE' };
 /** A song's text for the baked fonts: accents dropped, curly quotes and dashes made plain, the rest left out. */
 function mediaText(v) {
@@ -587,11 +611,14 @@ class HudApp {
         this.hostCi = null;              // the connection it went on
         // the screen shared with the other app (screen.js): stepping aside while the driver gave it to the other one
         this.screen = new Screen(this.target === 'panel' ? 'cluster' : 'hud', ctx.dataDir, this.log,
-            () => !!(this.started && this.activeName && this.activeName !== 'off'), () => this._guard('screen', () => this._rebuild()),
+            () => !!(this.started && this.activeName && this.activeName !== 'off' && !this.hidden), () => this._guard('screen', () => this._rebuild()),
             () => this.scenesApart === true);
         // cluster-render 0.5.1+ gives the panel its own scene id, so the cluster and the HUD can show at once; null until
         // its status says (sceneIdsOf), false while they share one (older versions, or a panel fallen back after the guard)
         this.scenesApart = null;
+        this.hidden = false;             // the layout is built but hidden: ready for the next drive mode (_prebuildName)
+        this.coverClient = null;         // the hold layer's own connection to cluster-render (cluster only), from start()
+        this.standbyRef = null;          // the see-through hold layer, while up (_standby)
         this.claimBy = null;             // the id of another kit app holding the HUD now (hud_claim), we step aside
         this.testAt = null;              // the shift-light test's start (Date.now()), while it runs
         this.nightOn = false;            // the layout was built with the night colours (nightDim)
@@ -605,6 +632,7 @@ class HudApp {
             // a theme or layout picked anywhere (the page asks first, the kit's All settings list doesn't): no longer stepping aside
             if (['hudLayout', 'inComfort', 'inSport', 'inEco', 'inHybrid', 'inElectric', 'byMode'].indexOf(key) >= 0 && this.screen.yielded) this.screen.release();
             if (PLACE_KEYS.indexOf(key) >= 0) this._guard('place', () => this._place());
+            else if (MAP_MODE_KEYS.indexOf(key) >= 0) this._guard('map mode', () => this._mapCheck());
             else if (LIVE_KEYS.indexOf(key) >= 0) this.widgets.forEach((x) => { x.last = null; });
             else if (key === 'autoStart') { /* read by main.js at the next start only */ }
             else if (key !== 'demo') this._rebuild(); else this._status();
@@ -728,7 +756,7 @@ class HudApp {
     /** A setting's value, or its default when the saved value isn't one the schema allows. */
     setting(key) {
         // "mapUp": not saved, the Waze map is showing inside the theme now (the setting on, waze.js says so)
-        if (key === 'mapUp') return !!(this.waze && this.waze.up && this.ctx.settings.get('mapInTheme') === true);
+        if (key === 'mapUp') return !!(this.waze && this.waze.up && this._mapWanted());
         // "ribScale": not saved, the Ribbon's scale numbers to show: thousands on the bar, "c" while the camera dip is on
         if (key === 'ribScale') return String(this._barMax() / 1000) + (this._cameraOn() ? 'c' : '');
         const s = this.ctx.settings.item(key);
@@ -834,7 +862,7 @@ class HudApp {
         // (app.json): not every unit may have it, and whether CarPlay fills it is not known yet. Added last, so the
         // one-at-a-time SOME/IP setup (signals.js) reaches every vehicle signal before it, whatever this one does
         extra[MEDIA_IF] = {
-            $instance: 'HMI_CID',        // the front screen (the unit names its instances; there is no "1")
+            $instance: MEDIA_INSTANCE,
             playerMetadata: (v) => this._mediaFeed('meta', v),
             trackProgress: (v) => this._mediaFeed('progress', v),
         };
@@ -966,7 +994,16 @@ class HudApp {
         this.log.info('connecting to cluster-render at ' + this.socketPath);
         this.started = true;
         this.clients.forEach((c) => c.connect());
-        this.tickTimer = setInterval(() => this._guard('tick', () => this._tick()), TICK_MS);
+        // a self-timed tick (_tickMs): 20 Hz while the cluster moves, slower while nothing on it would change
+        const tick = () => {
+            this.tickTimer = setTimeout(() => {
+                if (!this.tickTimer) return;
+                this._guard('tick', () => this._tick());
+                if (this.tickTimer) tick();
+            }, this._tickMs());
+        };
+        this.tickTimer = true;
+        tick();
         // Auto theme: check for sunrise / sunset once a minute; the status line too
         this.themeTimer = setInterval(() => this._guard('theme check', () => {
             if (this._themeName() !== this.themeName || this._nightDim() !== this.nightOn || this._hudHoliday() !== (this.hudHoliday || null) ||
@@ -979,15 +1016,49 @@ class HudApp {
         this._status();
         this._startDme();
         if (this.waze) { this.waze.start(); this._wazeWant(); }
+        this.modeWaitUntil = Date.now() + MODE_WAIT_MS;
+        this.modeWaitTimer = setTimeout(() => this._guard('drive mode wait', () => {
+            if (this.driveMode || this.setting('byMode') !== true) return;
+            this.log.info('no drive mode from the car after ' + MODE_WAIT_MS / 1000 + ' s: the "otherwise" layout');
+            if (this._buildName() !== this.activeName) this._rebuild(); else { this._applyHidden(); this._mapCheck(); }
+        }), MODE_WAIT_MS + 100);
+        if (this.target === 'panel') {
+            this.coverClient = new ClusterRender(this.ctx.spec.id + '_cover', this.socketPath);
+            this.coverClient.on('refused', (op, ref, reason) => {
+                this.log.warn('hold layer: ' + op + ' refused: ' + reason);
+                if (ref && ref === this.standbyRef) this.standbyRef = null;
+            });
+            // the client makes its layers again after a reconnect; the first time, the standby goes up now
+            this.coverClient.on('ready', () => this._guard('standby', () => this._standby()));
+            this.coverClient.connect();
+        }
         this.screen.start();
     }
 
-    /** Waze's map on the panel only while the setting is on and the theme shown has a map window. */
+    /** Waze's map on the panel only while the setting is on (for this drive mode) and the theme shown has a map window. */
     _wazeWant() {
         if (!this.waze) return;
-        const on = !!(this.started && this.setting('mapInTheme') === true && this.mapLayout);
+        const on = !!(this.started && !this.hidden && this._mapWanted() && this.mapLayout);
         this.waze.want(on);
         this._mapHost(on ? this.mapRect : null);
+    }
+
+    /**
+     * "Show Waze map inside the theme" for now: the setting on and, while the theme changes with the drive mode and the
+     * car has said which mode it is in, that mode's own switch on (mapComfort / mapSport / mapEco). With the mode not
+     * known yet, or byMode off, the setting alone decides.
+     */
+    _mapWanted() {
+        if (this.ctx.settings.get('mapInTheme') !== true) return false;
+        if (this.setting('byMode') !== true || !this.driveMode || !MAP_MODE_KEY[this.driveMode]) return true;
+        const k = MAP_MODE_KEY[this.driveMode];
+        return !this.ctx.settings.item(k) || this.setting(k) !== false;
+    }
+
+    /** The map wanted or not after a drive mode or a per-mode switch changed: tell Waze, open or close the window. */
+    _mapCheck() {
+        this._wazeWant();
+        if (this.mapLayout && this.setting('mapUp') !== this.mapShown) { if (this.mapLive) this._mapLive(); else this._rebuild(); } else this._status();
     }
 
     /**
@@ -1092,13 +1163,15 @@ class HudApp {
     }
 
     stop() {
-        clearInterval(this.tickTimer);
+        clearTimeout(this.tickTimer); this.tickTimer = null;
         clearInterval(this.themeTimer);
         clearInterval(this.statusTimer);
         clearInterval(this.dmeTimer);
         clearInterval(this.claimTimer);
         clearTimeout(this.statusAskT);
         clearTimeout(this.diagTimer); this.diagTimer = null;
+        clearTimeout(this.modeWaitTimer);
+        if (this.coverClient) this._guard('hold layer stop', () => this.coverClient.close());
         this.vstate.stop();
         this.stallTimers.forEach((t) => clearTimeout(t)); this.stallTimers.clear();
         if (this.waze) this._guard('waze stop', () => this.waze.stop());
@@ -1195,6 +1268,8 @@ class HudApp {
     }
     /** The layout the driver picked for now, before anything that makes us step aside. */
     _chosenName() {
+        // just started, the drive mode not known yet: BMW's own for now (MODE_WAIT_MS), not the "otherwise" layout
+        if (this.setting('byMode') === true && !this.driveMode && this.modeWaitUntil && Date.now() < this.modeWaitUntil) return 'off';
         if (this.setting('byMode') === true && this.drivePhev) {
             const v = this.setting(PHEV_KEY[this.drivePhev]);
             if (v && v !== 'same') return v;
@@ -1329,6 +1404,7 @@ class HudApp {
         if (this.activeName === 'off' && this.claimBy) return this.label + ' off: ' + this.claimBy.charAt(0).toUpperCase() + this.claimBy.slice(1) + ' has the HUD; it comes back when that app lets go';
         if (this.activeName === 'off' && this.screen.yielded) return this.label + ' off: ' + this.screen.otherName + ' has the screen, pick one here to take it back';
         if (this.activeName === 'off') return this.label + ' off' + mode + ": BMW's own " + what + ' shows';
+        if (this.hidden) return this.label + ' off' + mode + ": BMW's own " + what + ' shows; ' + this._layoutLabel(this.activeName) + ' ready in the background';
         const name = this._layoutLabel(this.activeName);
         const d = this.car.data();
         const demo = d.demoShow ? ', playing the demo' : d.demo ? ', demo data' : '';
@@ -1343,8 +1419,9 @@ class HudApp {
     }
 
     _status() {
+        this._guard('standby', () => this._standby());
         // the Waze map's state rides along while that setting is on (and redraws the page's Map tab when it changes)
-        const s = this.statusText() + (this.waze && this.setting('mapInTheme') === true ? '; Waze: ' + this.waze.info().text : '');
+        const s = this.statusText() + (this.waze && this._mapWanted() ? '; Waze: ' + this.waze.info().text : '');
         const d = this.modeDiagLines().join('\n');
         if (s === this.lastStatus && d === this.lastDiag) return;
         this.lastStatus = s; this.lastDiag = d;
@@ -1364,7 +1441,7 @@ class HudApp {
         if (m === this.driveMode && variant === this.driveVariant && phev === this.drivePhev) return;
         this.log.info('drive mode ' + MODE_NAME[m] + (variant ? ' ' + variant : '') + (phev ? ' (' + phev + ')' : '') + ' (' + raw + ')');
         this.driveMode = m; this.driveVariant = variant; this.drivePhev = phev;
-        if (this._layoutName() !== this.activeName) this._rebuild(); else this._status();
+        if (this._buildName() !== this.activeName) this._rebuild(); else { this._applyHidden(); this._mapCheck(); }
     }
 
     _diag(name, v, drop) {
@@ -1510,7 +1587,7 @@ class HudApp {
                 if (m) { this.driveMode = m; this.driveVariant = null; this.drivePhev = null; }
                 else if (this.demoKeep) { this.driveMode = this.demoKeep.mode; this.driveVariant = this.demoKeep.variant; this.drivePhev = this.demoKeep.phev || null; this.demoKeep = null; }
                 // a calibration layout carries the DEMO tag only while the show plays (CAL_LAYOUTS): Play and Stop rebuild it
-                if (force || this._layoutName() !== this.activeName || CAL_LAYOUTS[this.activeName]) this._rebuild(); else this._status();
+                if (force || this._buildName() !== this.activeName || CAL_LAYOUTS[this.activeName]) this._rebuild(); else { this._applyHidden(); this._mapCheck(); }
             },
         };
     }
@@ -1566,7 +1643,7 @@ class HudApp {
         const sp = this.score.shiftPoint(d.oil).rpm, lead = this.cue.lead(share && share.leadMs);
         // learned only on the car's own data, not in the test, and only from flashes the driver could see
         const learn = d.demo || testing || !this._countIn() ? null : { mode: this.gradeMode };
-        const seen = () => this.activeName !== 'off' && !!this.client.ready && Array.from(this.widgets.values()).some((x) => CUE_TYPES[x.w.type]);
+        const seen = () => this.activeName !== 'off' && !this.hidden && !!this.client.ready && Array.from(this.widgets.values()).some((x) => CUE_TYPES[x.w.type]);
         this.cue.tick(testing ? test : d.rpm, now, sp, this.setting('redline'), lead, testing ? undefined : d.gear, this.rpmF, seen, learn);
     }
 
@@ -1946,13 +2023,73 @@ class HudApp {
 
     _rebuild() {
         this._guard('rebuild', () => this._rebuildInner());
+        this._guard('ready in the background', () => this._applyHidden());
         this._status();
+    }
+
+    /**
+     * The layout to build now and keep hidden, ready for a drive mode switch: while the theme changes with the drive
+     * mode, this mode shows BMW's own and the modes with a theme all show the same one. null otherwise (several
+     * themes, nothing holding us back but the driver's pick).
+     */
+    _prebuildName() {
+        if (this.target !== 'panel' || this.setting('byMode') !== true) return null;
+        if (this.screen.yielded || this.claimBy || this.vstate.hold()) return null;
+        if (this._chosenName() !== 'off') return null;
+        const themes = [];
+        ['inComfort', 'inSport', 'inEco'].forEach((k) => { const v = this.setting(k); if (v && v !== 'off' && themes.indexOf(v) < 0) themes.push(v); });
+        return themes.length === 1 && !CAL_LAYOUTS[themes[0]] ? themes[0] : null;
+    }
+    /** The layout to build: the one to show, or the one kept ready while BMW's own shows. */
+    _buildName() { return this._prebuildName() || this._layoutName(); }
+    /** The layout on the cluster now ('off' while BMW's own shows, also with a theme ready in the background). */
+    shownLayout() { return this.hidden ? 'off' : this.activeName; }
+
+    /** Park or show the layout built as wanted (a drive mode switch between BMW's own and the theme ready). */
+    _applyHidden() {
+        const want = this.activeName !== 'off' && !!this._prebuildName();
+        if (want === this.hidden) return;
+        this.hidden = want;
+        this.placed.forEach((l) => l.c.set(l.ref, want ? PARK : { x: l.x, y: l.y, w: l.w, h: l.h }));
+        this._wazeWant();
+        if (want) { this.log.info('"' + this.activeName + '" ready in the background, BMW\'s own cluster shows'); return; }
+        this.log.info('"' + this.activeName + '" shown from the background');
+        // the readouts kept still while hidden: up to date now
+        this.widgets.forEach((x) => { x.last = null; });
+        this._guard('tick', () => this._tick());
+    }
+
+    /** The hold layer wanted: the cluster, the theme changing with the drive mode, some mode with a theme, nothing holding us back. */
+    _standbyWanted() {
+        if (this.target !== 'panel' || !this.started || this.setting('byMode') !== true) return false;
+        if (this.scenesApart === false || this.claimBy || this.screen.yielded) return false;   // the HUD needs the shared scene
+        if (this.vstate.hold() || this.vstate.drop()) return false;                            // switching off: let go of everything
+        return ['inComfort', 'inSport', 'inEco'].some((k) => { const v = this.setting(k); return v && v !== 'off'; });
+    }
+
+    /** The see-through hold layer up or down as wanted (cheap; from every status update). */
+    _standby() {
+        const want = this._standbyWanted();
+        if (want && !this.standbyRef) {
+            const c = this.coverClient;
+            if (!c || !c.ready) return;
+            const [w, h] = TARGET_SIZES.panel;
+            const ref = c.effect({ target: 'panel', klass: 'overlay', z: 1000, x: 0, y: 0, w, h, fs: HOLD_FS });
+            if (!ref) return;
+            this.standbyRef = ref;
+            this.log.info('hold layer: keeping the cluster\'s screen (see-through) for quick theme switches');
+        } else if (!want && this.standbyRef) {
+            try { this.coverClient.drop(this.standbyRef); } catch (e) { /* the connection went */ }
+            this.standbyRef = null;
+            this.log.info('hold layer: off, the cluster\'s screen goes back to BMW when no theme shows');
+        }
     }
 
     _rebuildInner() {
         if (!this.client.ready) return; // the 'ready' handler calls us again
         if (this._vehKeep()) return;
         this._layerRefs().forEach((r) => r.c.drop(r.ref));
+        this.hidden = false;             // new layers come visible; _rebuild hides them again when kept ready
         this.placed = [];
         this.widgets.clear();
         this.navShown = false;           // the nav widget shows a turn ("navHide" texts are empty then)
@@ -1963,8 +2100,10 @@ class HudApp {
         this.refused = null;
         clearTimeout(this.statusAskT); this.statusAskT = null;
         this.car.setRedline(this.setting('redline'));
-        const name = this._layoutName();
+        const name = this._buildName();
         this.activeName = name;
+        // kept ready in the background (_prebuildName): every layer made hidden from the start, none ever drawn
+        this.hidden = name !== 'off' && !!this._prebuildName();
         this.holidayAt = this._holidayNow();     // the light string's holiday (garland.js); the minute timer rebuilds when it changes
         this.mapLayout = false;
         this.mapRect = null;
@@ -2134,7 +2273,7 @@ class HudApp {
     /** One image layer for a sheet: every member painted into a local buffer, then sent whole once. */
     _createSheet(s) {
         const c = this._clientAt(s.conn);
-        const ref = c.image({ target: this.target, klass: s.klass, z: s.z, x: s.x, y: s.y, w: s.w, h: s.h, iw: s.w, ih: s.h });
+        const ref = c.image(Object.assign({ target: this.target, klass: s.klass, z: s.z, x: s.x, y: s.y, w: s.w, h: s.h, iw: s.w, ih: s.h }, this.hidden ? PARK : null));
         if (!ref) { this.log.warn('sheet ' + s.klass + '/' + s.z + ' at ' + s.x + ',' + s.y + ' ' + s.w + 'x' + s.h + ': layer refused'); return; }
         s.ref = ref; s.c = c; s.ci = s.conn;
         this.placed.push({ c, ref, x: s.x, y: s.y, w: s.w, h: s.h });
@@ -2193,7 +2332,7 @@ class HudApp {
         if (sheet) { ref = sheet.ref; c = sheet.c; }
         else {
             c = this._clientAt(this._connOf(w));
-            const base = { target: this.target, klass: w.class || 'content', z: w.z || 0, x: w.x, y: w.y, w: w.w, h: w.h };
+            const base = Object.assign({ target: this.target, klass: w.class || 'content', z: w.z || 0, x: w.x, y: w.y, w: w.w, h: w.h }, this.hidden ? PARK : null);
             if (IMAGE_TYPES[w.type]) ref = c.image(Object.assign({ iw: w.w, ih: w.h }, w.type === 'nav' ? this._navImage(w) : null, base));
             else ref = c.effect(Object.assign({ fs: w.type === 'swatch' ? calibration.SWATCH : shaders[w.type] }, base));
             if (!ref) { this.log.warn('widget "' + w.id + '": layer refused'); return; }
@@ -2624,6 +2763,21 @@ class HudApp {
         this._status();
     }
 
+    /**
+     * ms to the next tick. 20 Hz while our cluster is shown and the engine runs, the car moves or the shift light
+     * flashes; 10 Hz standing with the engine off (the 0-60 timer, armed whenever the car stands, then starts within
+     * 0.1 s: only an electric launch can start that way); 4 Hz while nothing of ours is drawn (the data still follows:
+     * trip, peaks, 0-60 best times, to within a quarter second).
+     */
+    _tickMs() {
+        if (!this.client.ready || this.hidden || this.activeName === 'off') return IDLE_TICK_MS;
+        const d = this.car.data();
+        if (d.demo || this.flash || (this.demo && this.demo.playing && this.demo.playing())) return TICK_MS;
+        const rpm = this._raw('rpm');
+        const still = !isNum(d.speed) || d.speed < 1;
+        return still && (!isNum(rpm) || rpm < 100) ? PARKED_TICK_MS : TICK_MS;
+    }
+
     _tick() {
         const now = Date.now();
         this._smoothRpm(now);
@@ -2635,7 +2789,7 @@ class HudApp {
         this._gTick(now);
         const b = this._boost();
         if (isNum(b) && (!isNum(this.boostPeak) || b > this.boostPeak)) this.boostPeak = b;
-        if (!this.client.ready) return;
+        if (!this.client.ready || this.hidden) return;   // hidden: nothing to draw until shown (_applyHidden repaints)
         // shift light: blink the whole bar at 8 Hz once the rpm reaches the redline
         const rpm = this._raw('rpm');
         const flashing = isNum(rpm) && rpm >= this.setting('redline') - 150;

@@ -1,0 +1,129 @@
+{
+  "comment": "What scripts/vendor_sync.py brings in from each origin, and the commit / version it is at now. The script updates the commit and version fields.",
+  "vendor": [
+    {
+      "dir": "idrive7-apps",
+      "repo": "cauliflowermossgrape/idrive7-apps",
+      "commit": "874f7b8e1e1ef3c0d2e6a6228b4bb91d5b27b4e2",
+      "apps": [
+        "redline",
+        "draggy",
+        "dyno",
+        "ambient_config"
+      ],
+      "copy": {
+        "kit/runtime": "kit/runtime",
+        "kit/platform": "kit/platform",
+        "kit/localization": "kit/localization",
+        "kit/tools": "kit/tools",
+        "LICENSE": "LICENSE",
+        "kit/renderd": "native/renderd"
+      },
+      "drop": [
+        "kit/localization/diagnostic-full.ru.json",
+        "kit/localization/diagnostic-full.zh-CN.json",
+        "native/renderd/prebuilt"
+      ],
+      "patch": {
+        "redline": "redline_no_hud"
+      }
+    },
+    {
+      "dir": "namelsmissing",
+      "repo": "NamelsMissing/mgu-apps",
+      "commit": "d552013915e92f2462fee79ca43e9bf5fd406b61",
+      "apps": [
+        "dpf_monitor"
+      ],
+      "copy": {
+        "kit": "kit",
+        "LICENSE": "LICENSE",
+        "THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md"
+      }
+    },
+    {
+      "dir": "justanotherpu",
+      "repo": "JustAnotherPU/mgu-apps",
+      "commit": "42cd2242d9e75c48aace6ee40274451a88c920a7",
+      "apps": [
+        "jap_sysmon"
+      ],
+      "copy": {
+        "kit": "kit",
+        "LICENSE": "LICENSE",
+        "THIRD_PARTY_LICENSES": "THIRD_PARTY_LICENSES",
+        "tools/jap-node22": "tools/jap-node22"
+      }
+    },
+    {
+      "dir": "ridetube",
+      "repo": "JustAnotherPU/ridetube",
+      "commit": "eb0973bd8f6a3b90b52af4710b093e6afb1ca384",
+      "apps": [
+        "jap_ridetube"
+      ],
+      "copy": {
+        "kit": "kit",
+        "native": "native",
+        "LICENSE": "LICENSE",
+        "THIRD_PARTY_LICENSES": "THIRD_PARTY_LICENSES",
+        "CHANGELOG.md": "CHANGELOG.md"
+      },
+      "drop": [
+        "kit/tools/.font-cache"
+      ]
+    },
+    {
+      "dir": "robertnisipeanu",
+      "repo": "robertnisipeanu/idrive-apps",
+      "commit": "9da968c8644ef4f6bcce174b0836f9f24d8db7fb",
+      "apps": [
+        "robertn_waze_cluster"
+      ],
+      "copy": {
+        "native": "native",
+        "LICENSE": "LICENSE",
+        "LICENSES": "LICENSES"
+      }
+    }
+  ],
+  "tools": [
+    {
+      "id": "cluster-render",
+      "catalog": "robertnisipeanu/idrive-apps",
+      "version": "0.8.13"
+    },
+    {
+      "id": "waze-on-cluster",
+      "catalog": "robertnisipeanu/idrive-apps",
+      "version": "0.14.15"
+    },
+    {
+      "id": "jap-ridetube-d",
+      "catalog": "JustAnotherPU/ridetube",
+      "version": "0.5.4"
+    },
+    {
+      "id": "mgu-render-id7-touch",
+      "catalog": "JustAnotherPU/ridetube",
+      "version": "1.4.0"
+    },
+    {
+      "id": "idrive7-renderd",
+      "folder": "idrive7-apps:kit/renderd/prebuilt",
+      "version": "2.1.19"
+    },
+    {
+      "id": "mgu-inputgate",
+      "folder": "idrive7-apps:kit/renderd/inputgate/tool",
+      "version": "1.2.1"
+    }
+  ],
+  "upstream": {
+    "repo": "bimmer-lab/apps",
+    "branch": "main",
+    "apps": [
+      "cluster_themes"
+    ]
+  }
+}

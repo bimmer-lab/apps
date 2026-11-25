@@ -1,0 +1,57 @@
+{
+  "_comment": "Copiloto de voz: el texto de cada aviso y la voz con la que se graba (scripts/generar_voces.py). Las claves de 'frases' son los nombres de archivo: no cambiarlas.",
+  "idiomas": {
+    "es": {
+      "nombre": "Español",
+      "voces": [
+        {
+          "id": "es-ES-ElviraNeural",
+          "nombre": "Elvira (femenina)",
+          "genero": "F"
+        }
+      ]
+    }
+  },
+  "velocidad": "-5%",
+  "frases": {
+    "combustible": {
+      "es": "Nivel de combustible bajo."
+    },
+    "neumaticos": {
+      "es": "Atención: el sistema indica presión baja en un neumático. Revíselo en cuanto pueda."
+    },
+    "hielo": {
+      "es": "Atención: la temperatura exterior es baja. Puede haber hielo en la carretera."
+    },
+    "motor_frio": {
+      "es": "El motor aún está frío. Le recomiendo no superar las dos mil quinientas revoluciones."
+    },
+    "bienvenida_manana": {
+      "es": "Buenos días. Bienvenido a bordo. Su BMW está listo para el viaje."
+    },
+    "bienvenida_tarde": {
+      "es": "Buenas tardes. Bienvenido a bordo. Su BMW está listo para el viaje."
+    },
+    "bienvenida_noche": {
+      "es": "Buenas noches. Bienvenido a bordo. Su BMW está listo para el viaje."
+    },
+    "bienvenida": {
+      "es": "Bienvenido a bordo. BMW listo para el viaje."
+    },
+    "mantenimiento": {
+      "es": "Se acerca un mantenimiento. Puede consultarlo en el estado del vehículo."
+    },
+    "ventanillas": {
+      "es": "Atención: ha quedado una ventanilla o el techo abierto."
+    },
+    "fin_viaje": {
+      "es": "Fin del viaje. Hasta la próxima."
+    },
+    "descanso": {
+      "es": "Lleva dos horas conduciendo. Le recomiendo hacer una pausa."
+    },
+    "motor_caliente": {
+      "es": "Motor a temperatura. Ya puede exigirle."
+    }
+  }
+}

@@ -1,0 +1,463 @@
+{
+  "id": "jap_ridetube",
+  "title": "RideTube",
+  "description": "Video in the car: an unofficial client for YouTube. Your Home, Subscriptions, Watch later, History and playlists (signed in on the car), search, channels and chapters; the sound through the car's media player, the picture only while parked (a podcast view while driving). Needs the jap-ridetube-d tool.",
+  "version": "0.6.4",
+  "license": "GPL-3.0-or-later",
+  "vendor": "custom",
+  "loggingId": "OAA6",
+  "iconGlyph": "RT",
+  "signals": {
+    "de.bmw.infotainment.vehicle.Vehicle2": {
+      "statusCarSpeed2": "rs"
+    },
+    "de.bmw.infotainment.vehicle.CDS": {
+      "statusBattery2": "rs"
+    },
+    "de.bmw.infotainment.controlelements.SteeringWheelPushButton": {
+      "statusSearchSwitch1": "rs",
+      "_optional": "the steering wheel's next / previous"
+    },
+    "de.bmw.infotainment.controlelements.FrontCCU": {
+      "ccsControlTouchCCU": "w",
+      "_optional": "touch mode on the controller's touchpad while RideTube shows (two fingers scroll)"
+    },
+    "de.bmw.infotainment.ControllerElements": {
+      "ZBETouchFrontSide": "rs"
+    },
+    "org.genivi.am.commandinterface.CommandControl": {
+      "_instances": "1",
+      "_methods": ["getListMainSinks"],
+      "_broadcasts": ["volumeChanged", "sinkMuteStateChanged"]
+    }
+  },
+  "screens": [
+    {
+      "name": "VIEW",
+      "kind": "canvas",
+      "title": "RideTube",
+      "hmi": false,
+      "fill": true,
+      "bg": "#0f0f0f",
+      "buttons": [
+        [
+          "BTN_PLAY",
+          "Play"
+        ],
+        [
+          "BTN_RW",
+          "-10 s"
+        ],
+        [
+          "BTN_FF",
+          "+10 s"
+        ],
+        [
+          "BTN_LIST",
+          "Player"
+        ],
+        [
+          "BTN_FIND",
+          "Search"
+        ]
+      ]
+    },
+    {
+      "name": "MAIN",
+      "kind": "menu",
+      "title": "RideTube search",
+      "settings": true,
+      "items": [
+        [
+          "button",
+          "BTN_SEARCH",
+          "Search"
+        ],
+        [
+          "text",
+          "MAIN_INFO",
+          ""
+        ],
+        [
+          "button",
+          "BTN_NOW",
+          "Now playing"
+        ],
+        [
+          "button",
+          "BTN_CLOSE",
+          "Close video"
+        ],
+        [
+          "button",
+          "BTN_RESULTS",
+          "Results"
+        ],
+        [
+          "button",
+          "BTN_HOME",
+          "Home"
+        ],
+        [
+          "button",
+          "BTN_SUBS",
+          "Subscriptions"
+        ],
+        [
+          "button",
+          "BTN_WL",
+          "Watch later"
+        ],
+        [
+          "button",
+          "BTN_PL",
+          "Playlists"
+        ],
+        [
+          "button",
+          "BTN_HIST",
+          "History"
+        ],
+        [
+          "button",
+          "BTN_LIB",
+          "Library"
+        ],
+        [
+          "button",
+          "BTN_S1",
+          ""
+        ],
+        [
+          "button",
+          "BTN_S2",
+          ""
+        ],
+        [
+          "button",
+          "BTN_S3",
+          ""
+        ],
+        [
+          "button",
+          "BTN_S4",
+          ""
+        ],
+        [
+          "button",
+          "BTN_S5",
+          ""
+        ],
+        [
+          "button",
+          "BTN_S6",
+          ""
+        ],
+        [
+          "button",
+          "BTN_ACCOUNT",
+          "Sign in"
+        ],
+        [
+          "button",
+          "BTN_HEALTH",
+          "Health check"
+        ],
+        [
+          "button",
+          "BTN_REMOTE",
+          "Phone remote"
+        ],
+        [
+          "button",
+          "BTN_LOGS",
+          "Send logs to the developer"
+        ],
+        [
+          "text",
+          "MAIN_SB",
+          "Skip data: SponsorBlock (sponsor.ajay.app), CC BY-NC-SA 4.0"
+        ]
+      ]
+    }
+  ],
+  "settings": [
+    {
+      "key": "language",
+      "label": "Language",
+      "type": "choice",
+      "default": "auto",
+      "options": [
+        [
+          "auto",
+          "Auto"
+        ],
+        [
+          "en",
+          "English"
+        ],
+        [
+          "fr",
+          "Français"
+        ],
+        [
+          "nl",
+          "Nederlands"
+        ],
+        [
+          "de",
+          "Deutsch"
+        ],
+        [
+          "es",
+          "Español"
+        ],
+        [
+          "it",
+          "Italiano"
+        ],
+        [
+          "pt",
+          "Português"
+        ],
+        [
+          "ru",
+          "Русский"
+        ],
+        [
+          "zh-CN",
+          "中文"
+        ]
+      ]
+    },
+    {
+      "key": "fill",
+      "label": "Fill the screen (crops the video; off: black side bars)",
+      "type": "bool",
+      "default": false,
+      "reset": 2
+    },
+    {
+      "key": "quality",
+      "label": "Video quality",
+      "type": "choice",
+      "default": "auto",
+      "options": [
+        [
+          "auto",
+          "Auto (720p on Wi-Fi, 480p on phone data)"
+        ],
+        [
+          "720",
+          "720p"
+        ],
+        [
+          "480",
+          "480p (less data)"
+        ],
+        [
+          "360",
+          "360p (least data)"
+        ]
+      ]
+    },
+    {
+      "key": "video_driving",
+      "label": "Video while driving - at your own risk, only for a car coded for video in motion (passengers); takes effect once parked",
+      "type": "bool",
+      "default": false
+    },
+    {
+      "key": "members",
+      "label": "Show members-only videos",
+      "type": "bool",
+      "default": false
+    },
+    {
+      "key": "shorts",
+      "label": "Show Shorts",
+      "type": "bool",
+      "default": false
+    },
+    {
+      "key": "sb_sponsor",
+      "label": "SponsorBlock: Sponsors",
+      "type": "choice",
+      "default": "skip",
+      "options": [
+        [
+          "skip",
+          "Skip"
+        ],
+        [
+          "ask",
+          "Show a Skip button"
+        ],
+        [
+          "off",
+          "Off"
+        ]
+      ]
+    },
+    {
+      "key": "sb_selfpromo",
+      "label": "SponsorBlock: Self-promotion",
+      "type": "choice",
+      "default": "skip",
+      "options": [
+        [
+          "skip",
+          "Skip"
+        ],
+        [
+          "ask",
+          "Show a Skip button"
+        ],
+        [
+          "off",
+          "Off"
+        ]
+      ]
+    },
+    {
+      "key": "sb_interaction",
+      "label": "SponsorBlock: Like & subscribe reminders",
+      "type": "choice",
+      "default": "skip",
+      "options": [
+        [
+          "skip",
+          "Skip"
+        ],
+        [
+          "ask",
+          "Show a Skip button"
+        ],
+        [
+          "off",
+          "Off"
+        ]
+      ]
+    },
+    {
+      "key": "sb_intro",
+      "label": "SponsorBlock: Intros",
+      "type": "choice",
+      "default": "skip",
+      "options": [
+        [
+          "skip",
+          "Skip"
+        ],
+        [
+          "ask",
+          "Show a Skip button"
+        ],
+        [
+          "off",
+          "Off"
+        ]
+      ]
+    },
+    {
+      "key": "sb_outro",
+      "label": "SponsorBlock: End cards and credits",
+      "type": "choice",
+      "default": "ask",
+      "options": [
+        [
+          "skip",
+          "Skip"
+        ],
+        [
+          "ask",
+          "Show a Skip button"
+        ],
+        [
+          "off",
+          "Off"
+        ]
+      ]
+    },
+    {
+      "key": "sb_music_offtopic",
+      "label": "SponsorBlock: Non-music parts of music videos",
+      "type": "choice",
+      "default": "off",
+      "options": [
+        [
+          "skip",
+          "Skip"
+        ],
+        [
+          "ask",
+          "Show a Skip button"
+        ],
+        [
+          "off",
+          "Off"
+        ]
+      ]
+    },
+    {
+      "key": "auto_download",
+      "label": "Download new Subscriptions videos on Wi-Fi (deleted once watched)",
+      "type": "choice",
+      "default": "0",
+      "options": [
+        [
+          "0",
+          "Off"
+        ],
+        [
+          "3",
+          "3 newest"
+        ],
+        [
+          "5",
+          "5 newest"
+        ],
+        [
+          "10",
+          "10 newest"
+        ]
+      ]
+    },
+    {
+      "key": "ytdlp_auto",
+      "label": "Update yt-dlp by itself: the newest release, looked for daily (off: the one in this RideTube service)",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "key": "store_proxy",
+      "label": "Use the MGU Store's proxy when one is set there (Settings → Proxy in the Store; off: direct)",
+      "type": "bool",
+      "default": false
+    },
+    {
+      "key": "battery",
+      "label": "Parked: pause when the 12 V battery is under",
+      "type": "choice",
+      "default": "65",
+      "options": [
+        [
+          "60",
+          "60 %"
+        ],
+        [
+          "65",
+          "65 %"
+        ],
+        [
+          "70",
+          "70 %"
+        ],
+        [
+          "0",
+          "Never"
+        ]
+      ]
+    }
+  ]
+}

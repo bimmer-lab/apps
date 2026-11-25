@@ -1,0 +1,4598 @@
+'use strict';
+// Host test for ytd.js: fake someip, fake ytdec, fake fetcher and thumb helper, real unix socket.  node test/test_ytd.js
+const assert = require('assert');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const net = require('net');
+const ytdjs = require('../ytd.js');
+const { Audio, pruneCache, listCache, feedItems, feedShelves, pickFetchUid, pickUid, fetchRequest, isPlayable, VERSION, CAPS, REPORT_URL, BUILT, clockBehind } = ytdjs;
+// WP8: every daemon here keeps its videos in the cache folder (as before the RAM folder), unless the test says ramDir
+// (a host's /dev/shm would otherwise be taken as the car's tmpfs)
+function Daemon(o) { return new ytdjs.Daemon(Object.assign({ ramDir: null }, o)); }
+
+// (Node 8, as on the car: no mkdirSync {recursive}, no rmSync)
+const mkdirp = (d) => { if (!fs.existsSync(d)) { mkdirp(path.dirname(d)); fs.mkdirSync(d); } };
+const rmrf = (p) => {
+    let st;
+    try { st = fs.lstatSync(p); } catch (e) { return; }
+    if (st.isDirectory()) { fs.readdirSync(p).forEach((n) => rmrf(path.join(p, n))); fs.rmdirSync(p); } else fs.unlinkSync(p);
+};
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ytd-'));
+const cache = path.join(tmp, 'cache');
+const srcGen = path.join(tmp, 'src-gen');
+const ytlog = path.join(tmp, 'ytdec.calls');
+fs.mkdirSync(cache); fs.mkdirSync(srcGen);
+['org_genivi_am_commandinterface_CommandControl.json', 'de_bmw_infotainment_entertainment_mediaplayer_MediaPlayer.json']
+    .forEach((f) => fs.writeFileSync(path.join(srcGen, f), JSON.stringify({ name: f })));
+const fakeYtdec = path.join(__dirname, 'fake_ytdec.js');
+fs.chmodSync(fakeYtdec, 0o755);
+process.env.FAKE_YTDEC_LOG = ytlog;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const setMode = (m) => fs.writeFileSync(ytlog + '.mode', m);
+// VP9 back on for the next test: the flag and its state/codec.json (a later daemon on that state dir would read it)
+const noAvc1 = (x) => { x.avc1Only = false; try { fs.unlinkSync(path.join(x.opts.stateDir, 'codec.json')); } catch (e) { /* none */ } };
+
+// ---- fake someip
+const calls = [];
+let conns = [{ mainConnectionID: 7, sourceID: 1046, sinkID: 1024 }, { mainConnectionID: 15, sourceID: 129, sinkID: 387 }];
+let nextConn = 20;
+let slowPlayFile = 0;
+const subs = {};
+const someip = {
+    buildProxy: async (cfg, inst) => ({
+        init: async () => {},
+        isAvailable: async () => true,
+        subscribe: (s) => { subs[s.name] = s.onReceive; },
+        getValue: async (n) => { assert.strictEqual(n, 'listOfMainConnections'); return conns.slice(); },
+        callMethod: async (m, a) => {
+            calls.push({ inst: inst, m: m, a: a });
+            if (m === 'connect') { const id = nextConn++; conns.push({ mainConnectionID: id, sourceID: a.sourceID }); return { mainConnectionID: id, amError: 'E_OK' }; }
+            if (m === 'disconnect') { conns = conns.filter((c) => c.mainConnectionID !== a.mainConnectionID); return { amError: 'E_OK' }; }
+            if (m === 'playFile' && slowPlayFile) await sleep(slowPlayFile);
+            return { EntError: 'OK' };
+        }
+    })
+};
+const called = (m) => calls.filter((c) => c.m === m);
+const ours = () => conns.filter((c) => c.sourceID === 1046);
+
+// ---- cache fixtures
+function mkVideo(id, opts) {
+    opts = opts || {};
+    const d = path.join(cache, id);
+    fs.mkdirSync(d);
+    fs.writeFileSync(path.join(d, 'meta.json'), JSON.stringify({ id: id, title: 'T ' + id, channel: 'C', duration_s: 60 }));
+    fs.writeFileSync(path.join(d, 'thumb.rgba'), Buffer.alloc(57600, 7));
+    (opts.files || ['audio.m4a', 'index.bin', 'video.h264']).forEach((f) => fs.writeFileSync(path.join(d, f), 'x'));
+    const t = new Date(opts.mtime || Date.now());
+    fs.utimesSync(d, t, t);
+    return d;
+}
+
+// ---- fake www.youtube.com (ytRequest): the TV page, its base script, device code, token, browse
+const yt = { calls: [], inline: false, expiresIn: 1800, token: () => ({ error: 'authorization_pending' }), browse: null };
+const SECRETS = ['SeCrEt-1', 'DEV-CODE-XYZ', 'ACCESS-1', 'ACCESS-2', 'ACCESS-3', 'REFRESH-1'];
+const CRED = 'clientId:"123-abc.apps.googleusercontent.com",\nqz:"SeCrEt-1"';
+const fakeYt = async (method, url, headers, body) => {
+    yt.calls.push({ method: method, url: url, headers: headers, body: body });
+    const slow = Object.keys(yt.slow || {}).find((k) => url.endsWith(k));
+    if (slow) await sleep(yt.slow[slow]);
+    const json = (o, st) => ({ status: st || 200, body: JSON.stringify(o) });
+    if (url === 'https://www.youtube.com/tv') return { status: 200, body: yt.creds === false ? '<html></html>' : yt.inline ? 'a ' + CRED + ' b' : '<script src="/s/tv/x1/base.js"></script>' };
+    if (url === 'https://www.youtube.com/s/tv/x1/base.js') return { status: 200, body: 'var q={' + CRED + '};' };
+    if (url === 'https://www.youtube.com/o/oauth2/device/code' && yt.refuse > 0) { yt.refuse--; return json({ error: 'invalid_client' }, 401); }
+    if (url === 'https://www.youtube.com/o/oauth2/device/code') return json({ device_code: 'DEV-CODE-XYZ', user_code: 'ABC-DEF-GHI', verification_url: 'https://www.google.com/device', interval: 0.03, expires_in: yt.expiresIn });
+    if (url === 'https://www.youtube.com/o/oauth2/token') { const r = yt.token(body); return json(r, r.error ? 400 : 200); }
+    if (url === 'https://www.youtube.com/youtubei/v1/browse') return yt.browse(headers, body);
+    if (url === 'https://www.youtube.com/youtubei/v1/search') return yt.search(headers, body);
+    if (url === 'https://www.youtube.com/youtubei/v1/next' && yt.next) return yt.next(headers, body);
+    if (url.indexOf('https://sponsor.ajay.app/api/skipSegments/') === 0 && yt.sb) return yt.sb(url);
+    if (url === 'https://www.youtube.com/youtubei/v1/player') return json({ playbackTracking: { videostatsPlaybackUrl: { baseUrl: 'https://s.youtube.com/api/stats/playback?docid=x&ei=E' }, videostatsWatchtimeUrl: { baseUrl: 'https://s.youtube.com/api/stats/watchtime?docid=x&ei=E' } } });
+    if (url.indexOf('https://s.youtube.com/api/stats/') === 0) return { status: 204, body: '' };
+    return { status: 404, body: '' };
+};
+// an anonymous TVHTML5 search answer for "big buck bunny" (2026-11-03), trimmed to three lockups
+const SEARCH = JSON.parse(fs.readFileSync(path.join(__dirname, 'search_tvhtml5.json'), 'utf8'));
+yt.search = () => ({ status: 200, body: JSON.stringify(SEARCH) });
+const ytCalls = (end) => yt.calls.filter((x) => x.url.endsWith(end));
+// a browse answer shaped like TVHTML5's: shelves of tiles (a video, a short, a channel, the video again)
+const tile = (id, type, title, channel, len, line2) => ({ tileRenderer: {
+    contentId: id, contentType: type,
+    header: { tileHeaderRenderer: { thumbnailOverlays: len ? [{ thumbnailOverlayTimeStatusRenderer: { text: { simpleText: len } } }] : [] } },
+    metadata: { tileMetadataRenderer: { title: { runs: [{ text: title }] }, lines: [
+        { lineRenderer: { items: [{ lineItemRenderer: { text: { runs: [{ text: channel }] } } }] } },
+        { lineRenderer: { items: line2 || [{ lineItemRenderer: { text: { simpleText: '1K views' } } }, { lineItemRenderer: { text: { simpleText: '•' } } }] } }] } },
+    onSelectCommand: type === 'TILE_CONTENT_TYPE_SHORTS' ? { reelWatchEndpoint: { videoId: id } } : { watchEndpoint: { videoId: id } } } });
+const BROWSE = { contents: { tvBrowseRenderer: { content: { tvSurfaceContentRenderer: { content: { sectionListRenderer: { contents: [
+    { shelfRenderer: { content: { horizontalListRenderer: { items: [
+        tile('VVVVVVVVVV1', 'TILE_CONTENT_TYPE_VIDEO', 'First', 'Chan A', '39:50'),
+        tile('SSSSSSSSSS1', 'TILE_CONTENT_TYPE_SHORTS', 'A short', 'Chan B', null),
+        tile('UCxxxxxxxxx', 'TILE_CONTENT_TYPE_CHANNEL', 'A channel', '', null)] } } } },
+    { shelfRenderer: { content: { horizontalListRenderer: { items: [
+        tile('VVVVVVVVVV2', 'TILE_CONTENT_TYPE_VIDEO', 'Second', 'Chan C', '1:02:03'),
+        tile('VVVVVVVVVV1', 'TILE_CONTENT_TYPE_VIDEO', 'First', 'Chan A', '39:50'),
+        tile('VVVVVVVVVV3', 'TILE_CONTENT_TYPE_VIDEO', 'Live', 'Chan D', 'LIVE')] } } } }] } } } } } } };
+
+// ---- app side
+function client(sock) {
+    return new Promise((resolve) => {
+        const c = net.connect(sock, () => resolve(c));
+        c.evs = [];
+        let buf = '';
+        c.on('data', (d) => { buf += d; let i; while ((i = buf.indexOf('\n')) >= 0) { c.evs.push(JSON.parse(buf.slice(0, i))); buf = buf.slice(i + 1); } });
+        c.send = (o) => c.write(JSON.stringify(o) + '\n');
+        c.waitFor = async (pred, ms) => {
+            const end = Date.now() + (ms || 3000);
+            for (;;) {
+                const e = c.evs.find(pred);
+                if (e) return e;
+                if (Date.now() > end) throw new Error('timeout waiting; got ' + JSON.stringify(c.evs.slice(-5)));
+                await sleep(20);
+            }
+        };
+        c.clear = () => { c.evs.length = 0; };
+    });
+}
+const ytdecLines = () => (fs.existsSync(ytlog) ? fs.readFileSync(ytlog, 'utf8').split('\n').filter(Boolean) : []);
+const waitUntil = async (f, ms) => { const end = Date.now() + (ms || 3000); while (!f()) { if (Date.now() > end) throw new Error('timeout'); await sleep(20); } };
+const tick = (ms) => subs.currentItemTime({ elapsed: ms, total: 60000 });
+
+const results = [];
+async function t(name, fn) {
+    try { await fn(); results.push('ok   ' + name); } catch (e) { results.push('FAIL ' + name + '\n' + (e.stack || e)); }
+}
+
+async function main() {
+    const logs = [];
+    const stateDir = path.join(tmp, 'state');
+    const acct = path.join(stateDir, 'account.json');
+    const ctl = path.join(tmp, 'fetch.ctl');
+    const d = new Daemon({
+        someip: someip, srcGen: srcGen, ytdec: fakeYtdec, cacheDir: cache, logDir: tmp, sock: path.join(tmp, 'ctl.sock'),
+        watchdogMs: 800, tickMs: 200, keep: 40, stateDir: stateDir, noSetuid: true, spare: false, resume: false, fetchRetryMs: [],
+        fetcher: [process.execPath, path.join(__dirname, 'fake_ytfetch.js'), ctl],
+        accountFile: acct, ytRequest: fakeYt, log: (m) => logs.push(m)
+    });
+    mkVideo('DemoVideo01', { mtime: Date.now() - 1000 });
+    mkVideo('PPPPPPPPPPP', { mtime: Date.now() - 1500 });
+    mkVideo('DemoVideo02', { files: ['audio.m4a', 'index.bin', 'video.h264.part'], mtime: Date.now() - 2000 });
+    await d.start();
+    let c = await client(d.opts.sock);
+
+    await t('leftover 1046 connection removed at start, others kept', async () => {
+        assert.deepStrictEqual(called('disconnect').map((x) => x.a.mainConnectionID), [7]);
+        assert.ok(conns.some((x) => x.mainConnectionID === 15));
+    });
+
+    await t('library: nothing downloaded yet; thumb read from the cache', async () => {
+        c.clear();
+        c.send({ cmd: 'library' });
+        assert.deepStrictEqual(await c.waitFor((x) => x.ev === 'library'), { ev: 'library', items: [] });
+        c.send({ cmd: 'thumb', id: 'DemoVideo01' });
+        const th = await c.waitFor((x) => x.ev === 'thumb');
+        assert.strictEqual(Buffer.from(th.rgba, 'base64').length, 57600);
+        c.clear();
+        fs.renameSync(path.join(cache, 'DemoVideo02', 'video.h264.part'), path.join(cache, 'DemoVideo02', 'video.h264'));
+    });
+
+    await t('search: TVHTML5 InnerTube, anonymous when signed out; lockups parsed; offline -> "search offline"', async () => {
+        c.clear(); yt.calls.length = 0;
+        c.send({ cmd: 'search', q: ' bunny ' });
+        const e = await c.waitFor((x) => x.ev === 'results');
+        assert.deepStrictEqual(e, { ev: 'results', q: 'bunny', items: [
+            { id: 'f7NwyBnIRTE', title: 'Animated Short Film "Big Buck Bunny", 4K, Full Length', channel: 'AnimalsReview', duration_s: 635, meta: ['37M views', '11 years ago'] },
+            { id: 'PJx173L9jWw', title: 'Big Buck Bunny creative common Blender Foundation Short Film', channel: 'Miniaiza', duration_s: 10205, meta: ['36 views', 'Streamed 15 hours ago'] },
+            { id: 'OR6rRQ1fAzM', title: 'LES ANIMOJIS - LA CHANSON DU GROS LAPIN (CLIP)', channel: 'Monsieur Seby', duration_s: 213, meta: ['1.7M views', '8 years ago'] }] });
+        const r = ytCalls('/youtubei/v1/search')[0];
+        assert.strictEqual(r.method, 'POST');
+        assert.strictEqual(r.headers, null, 'anonymous');
+        assert.deepStrictEqual(r.body, { context: { client: { clientName: 'TVHTML5', clientVersion: '7.20251101.10.00', hl: 'en' } }, query: 'bunny' });
+        yt.search = () => Promise.reject(new Error('ENETUNREACH'));
+        c.send({ cmd: 'search', q: 'x' });
+        await c.waitFor((x) => x.ev === 'error' && x.msg === 'search offline');
+        yt.search = () => ({ status: 200, body: JSON.stringify(SEARCH) });
+    });
+
+    await t('play cached: connect + playFile + ytdec args, no fetcher', async () => {
+        c.clear(); calls.length = 0; fs.writeFileSync(ytlog, ''); setMode('ok');
+        fs.chmodSync(path.join(cache, 'DemoVideo01'), 0o700);       // cached by 0.3.8 or older
+        c.send({ cmd: 'play', id: 'DemoVideo01', rect: '1836x504', fill: true });
+        const pl = await c.waitFor((x) => x.ev === 'state' && x.state === 'playing');
+        assert.strictEqual(pl.buffering, false);
+        assert.ok(!fs.existsSync(ctl + '.log'), 'no fetcher');
+        assert.deepStrictEqual(called('connect')[0].a, { sourceID: 1046, sinkID: 1024 });
+        assert.deepStrictEqual(called('playFile')[0].a, { path: path.join(cache, 'DemoVideo01', 'audio.m4a'), languageCode: 7695972 });
+        assert.strictEqual(called('playFile')[0].inst, 'OapGenericMedia');
+        // BMW's media engine (its own uid) opens audio.m4a by name: it must pass through the folder, not list it
+        assert.strictEqual(fs.statSync(path.join(cache, 'DemoVideo01')).mode & 0o777, 0o711, 'an old 0700 folder opened up');
+        await waitUntil(() => ytdecLines().length > 0);
+        assert.ok(ytdecLines()[0].endsWith('argv --dir ' + path.join(cache, 'DemoVideo01') + ' --rect 1836x504 --fill --log ' + path.join(tmp, 'ytdec.log')), ytdecLines()[0]);
+    });
+
+    await t('the player\'s own metadata (newer firmware): logged, keys as names or numbers; none of them said so', async () => {
+        assert.strictEqual(typeof subs.currentItemMetadata, 'function', 'subscribed');
+        const n = logs.length;
+        subs.currentItemMetadata([{ key: 3, value: { stringValue: 'Поправка a B58' } }, { key: 'ARTIST', value: { stringValue: 'Night Garage' } },
+            { key: 17, value: { stringValue: '/var/cache/cover/1.jpg' } }, { key: 44, value: { numeric: 60000 } }, { key: 0, value: { id: Buffer.from('x') } }]);
+        subs.currentItemMetadata([{ key: 16, value: { stringValue: 'audio.m4a' } }]);
+        assert.deepStrictEqual(logs.slice(n), ['player metadata: TITLE(14 chars) ARTIST(12 chars) COVER_FILE(22 chars) LENGTH=60000',
+            'player metadata: no title, artist, album or cover']);
+    });
+
+    await t('clock ticks forwarded to ytdec (mono ms) and as time events', async () => {
+        subs.currentItemTime({ elapsed: 0, total: 1 }); // ignored
+        subs.playerState('PLAYER_STATE_PLAY');
+        tick(1226);
+        const e = await c.waitFor((x) => x.ev === 'time');
+        assert.deepStrictEqual(e, { ev: 'time', elapsed: 1226, total: 60000 });
+        await sleep(100);
+        const cl = ytdecLines().filter((l) => / in clock /.test(l));
+        assert.strictEqual(cl.length, 1);
+        const parts = cl[0].split(' ');
+        assert.strictEqual(parts[3], '1226');
+        assert.ok(Math.abs(Number(parts[4]) - (process.hrtime()[0] * 1000)) < 5000);
+    });
+
+    await t('pause/resume/seek/video map to SOME/IP and ytdec stdin', async () => {
+        calls.length = 0;
+        c.send({ cmd: 'pause' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'paused');
+        c.send({ cmd: 'resume' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'playing');
+        c.send({ cmd: 'seek', ms: 30000 });
+        c.send({ cmd: 'video', on: false });
+        c.send({ cmd: 'video', on: true });
+        await sleep(200);
+        assert.strictEqual(called('setTime').length, 0, 'no setTime before the restarted file ticks (the player drops it)');
+        tick(0);
+        await waitUntil(() => called('setTime').length > 0);
+        // pause = STOP where it is (the car's player answers OK to PAUSE and plays on); resume = the file again, set there
+        assert.deepStrictEqual(called('sendButtonEvent').map((x) => x.a.button), ['STOP', 'STOP'], 'pause; resume releases (STOP, disconnect) and connects again');
+        assert.strictEqual(called('connect').length, 1);
+        assert.deepStrictEqual(called('playFile').map((x) => x.a.path), [path.join(cache, 'DemoVideo01', 'audio.m4a')]);
+        // the seek sent while the file restarts wins: one setTime, there
+        assert.deepStrictEqual(called('setTime').map((x) => x.a.newTimeElapsed), [30000]);
+        const ins = ytdecLines().map((l) => l.split(' ').slice(1).join(' ')).filter((l) => /^in (pause|resume|seek|video)/.test(l));
+        assert.strictEqual(ins[0], 'in pause');
+        assert.ok(/^in seek \d+$/.test(ins[1]) && Number(ins[1].split(' ')[2]) < 60000, 'where it stopped: ' + ins[1]);
+        assert.deepStrictEqual(ins.slice(2), ['in resume', 'in seek 30000', 'in video 0', 'in video 1']);
+    });
+
+    await t('stop disconnects audio and quits ytdec', async () => {
+        calls.length = 0;
+        c.send({ cmd: 'stop' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'idle');
+        assert.deepStrictEqual(called('sendButtonEvent').map((x) => x.a.button), ['STOP']);
+        assert.strictEqual(called('disconnect').length, 1);
+        assert.strictEqual(ours().length, 0);
+        await sleep(200);
+        assert.ok(ytdecLines().some((l) => / in quit$/.test(l)));
+        assert.strictEqual(d.child, null);
+    });
+
+    const playing = async (id) => {
+        c.clear();
+        c.send({ cmd: 'play', id: id || 'DemoVideo01', rect: '1280x720' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'playing');
+        subs.playerState('PLAYER_STATE_PLAY');
+    };
+
+    // what a pause then a resume does: SOME/IP calls, ytdec's stdin, the app's state events
+    const pauseResume = async (pause, resume) => {
+        await playing();
+        tick(10000);
+        calls.length = 0; fs.writeFileSync(ytlog, ''); c.clear();
+        pause();
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'paused');
+        resume();
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'playing');
+        await waitUntil(() => called('playFile').length > 0);
+        tick(0);
+        await waitUntil(() => called('setTime').length > 0);
+        return { buttons: called('sendButtonEvent').map((x) => x.a.button), connects: called('connect').length, playFile: called('playFile').map((x) => x.a.path),
+            setTime: called('setTime').map((x) => x.a.newTimeElapsed), states: c.evs.filter((x) => x.ev === 'state').map((x) => x.state),
+            ytdec: ytdecLines().map((l) => l.split(' ').slice(1).join(' ')).filter((l) => /^in (pause|resume|seek)/.test(l)) };
+    };
+    const stopped = async () => { c.send({ cmd: 'stop' }); await c.waitFor((x) => x.ev === 'state' && x.state === 'idle'); };
+    await t('Majordome\'s mic hold (SIGWINCH) and release (SIGUSR2) do exactly what the app\'s pause and resume do', async () => {
+        const app = await pauseResume(() => c.send({ cmd: 'pause' }), () => c.send({ cmd: 'resume' }));
+        await stopped();
+        const mic = await pauseResume(() => d.micHold(), () => d.micRelease('test'));
+        await stopped();
+        assert.deepStrictEqual(app.buttons, ['STOP', 'STOP'], JSON.stringify(app));   // pause = STOP; resume releases (STOP, disconnect), connects again
+        assert.deepStrictEqual(app.setTime, [10000]);
+        assert.deepStrictEqual(mic, app);
+    });
+    await t('mic hold: kept by a second hold (a follow-up listen); never resumes over the user\'s own pause, stop or play', async () => {
+        await playing();
+        tick(10000);
+        d.micHold();
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'paused');
+        calls.length = 0;
+        d.micHold();   // the follow-up's hold: still paused, nothing sent
+        assert.strictEqual(d.state, 'paused');
+        assert.deepStrictEqual(called('sendButtonEvent'), []);
+        // the user resumes, then pauses, while held: the release leaves his pause
+        c.clear();
+        c.send({ cmd: 'resume' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'playing');
+        await waitUntil(() => called('playFile').length > 0);
+        tick(0); await waitUntil(() => called('setTime').length > 0);
+        c.send({ cmd: 'pause' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'paused');
+        d.micRelease('test');
+        await sleep(200);
+        assert.strictEqual(d.state, 'paused', 'his pause kept');
+        // paused by the user: a hold takes nothing, its release resumes nothing
+        d.micHold(); d.micRelease('test');
+        await sleep(200);
+        assert.strictEqual(d.state, 'paused');
+        // a stop, a new play while held: dropped
+        d.micRelease('none'); c.clear();
+        const n = called('playFile').length;
+        c.send({ cmd: 'resume' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'playing');
+        await waitUntil(() => called('playFile').length > n);
+        tick(0); await waitUntil(() => called('setTime').length > 1);
+        d.micHold();
+        assert.strictEqual(d.state, 'paused');
+        await stopped();
+        assert.strictEqual(d.micHeld, null);
+        await playing();
+        d.micRelease('test');
+        await sleep(200);
+        assert.strictEqual(d.state, 'playing');
+        // not playing: nothing
+        await stopped();
+        d.micHold();
+        assert.strictEqual(d.micHeld, null);
+        assert.strictEqual(d.state, 'idle');
+    });
+    await t('mic hold: not released within micHoldMs (Majordome gone) -> resumed by itself', async () => {
+        d.opts.micHoldMs = 300;
+        try {
+            await playing();
+            tick(10000);
+            c.clear();
+            d.micHold();
+            await c.waitFor((x) => x.ev === 'state' && x.state === 'paused');
+            await c.waitFor((x) => x.ev === 'state' && x.state === 'playing', 2000);
+            assert.ok(logs.some((l) => /mic hold: released \(none in 300 ms\)/.test(l)));
+            tick(0); await sleep(100);
+            await stopped();
+        } finally { d.opts.micHoldMs = 150000; }
+    });
+
+    await t('app disconnect stops within 1 s', async () => {
+        await playing();
+        const child = d.child;
+        const t0 = Date.now();
+        c.destroy();
+        while (ours().length && Date.now() - t0 < 1000) await sleep(10);
+        assert.strictEqual(ours().length, 0);
+        assert.ok(child.killed || child.exitCode !== null || d.child === null);
+        assert.strictEqual(d.state, 'idle');
+        c = await client(d.opts.sock);
+    });
+
+    await t('fault (uncaught error path) disconnects and goes idle', async () => {
+        await playing();
+        d.fault(new Error('boom'));
+        await c.waitFor((x) => x.ev === 'error' && /boom/.test(x.msg));
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'idle');
+        assert.strictEqual(ours().length, 0);
+        assert.strictEqual(d.child, null);
+    });
+
+    await t('ytdec dies -> one restart with seek to the clock; second death -> error, audio keeps playing', async () => {
+        await sleep(500); fs.writeFileSync(ytlog, ''); setMode('crash'); // let earlier children finish logging
+        await playing();
+        tick(4000);
+        const err = await c.waitFor((x) => x.ev === 'error' && /audio only/.test(x.msg), 3000);
+        assert.ok(err);
+        const argv = ytdecLines().filter((l) => / argv /.test(l));
+        assert.strictEqual(argv.length, 2, ytdecLines().filter((l) => !/ in clock/.test(l)).join('\n'));
+        assert.ok(ytdecLines().some((l) => / in seek 4000$/.test(l)));
+        assert.strictEqual(ours().length, 1);
+        assert.strictEqual(d.state, 'playing');
+        c.send({ cmd: 'stop' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'idle');
+    });
+
+    await t('the audio clock holds (a slow player, an announcement): ytdec waits with it, no watchdog kill', async () => {
+        fs.writeFileSync(ytlog, ''); setMode('stall');
+        await playing();
+        const wd = logs.filter((l) => /watchdog/.test(l)).length;
+        for (let i = 0; i < 11; i++) { tick(5000 + (i % 2) * 100); await sleep(200); }   // 2.2 s of wall time, 0.1 s of audio
+        assert.strictEqual(logs.filter((l) => /watchdog/.test(l)).length, wd, 'no kill while the audio holds');
+        assert.strictEqual(ytdecLines().filter((l) => / argv /.test(l)).length, 1);
+        setMode('ok');
+        c.send({ cmd: 'stop' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'idle');
+    });
+
+    await t('no decoded frames for the watchdog period of audio played -> child restarted', async () => {
+        fs.writeFileSync(ytlog, ''); setMode('stall');
+        await playing();
+        for (let i = 0; i < 11; i++) { tick(1000 + i * 200); await sleep(200); }          // audio plays in step with the clock
+        const argv = ytdecLines().filter((l) => / argv /.test(l));
+        assert.ok(argv.length >= 2, 'restarted: ' + argv.length);
+        assert.ok(logs.some((l) => /watchdog/.test(l)));
+        setMode('ok');
+        c.send({ cmd: 'stop' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'idle');
+    });
+
+    await t('STOP mid-file -> held as paused; resume plays the file again at that point', async () => {
+        await playing();
+        tick(20000);
+        calls.length = 0;
+        subs.playerState('PLAYER_STATE_STOP');
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'paused');
+        assert.strictEqual(ours().length, 1, 'audio kept connected');
+        c.send({ cmd: 'resume' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'playing');
+        await waitUntil(() => called('playFile').length > 0);
+        tick(0);   // the restarted file's first tick: then setTime
+        await waitUntil(() => called('setTime').length > 0);
+        assert.strictEqual(called('playFile').length, 1);
+        assert.deepStrictEqual(called('setTime')[0].a, { newTimeElapsed: 20000 });
+        assert.deepStrictEqual(called('sendButtonEvent').map((x) => x.a.button), ['STOP'], 'no PLAY after a stop (ignored): released, connected again');
+        assert.strictEqual(called('disconnect').length, 1);
+        assert.strictEqual(called('connect').length, 1);
+        assert.strictEqual(ours().length, 1, 'one connection');
+        c.send({ cmd: 'stop' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'idle');
+    });
+
+    await t('resume after STOP: the new file\'s ticks before its waiter are not the place (QJZ9TX, 0.4.7)', async () => {
+        await playing();
+        tick(20000);
+        subs.playerState('PLAYER_STATE_STOP');
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'paused');
+        calls.length = 0; c.clear();
+        slowPlayFile = 300;
+        try {
+            c.send({ cmd: 'resume' });
+            await waitUntil(() => called('playFile').length > 0);
+            tick(150); await sleep(20); tick(400);   // the restarted file plays while playFile still answers
+            assert.ok(Math.abs(d.elapsed - 20000) < 100, 'place kept: ' + d.elapsed);
+            await waitUntil(() => d.tickWaiter);
+            tick(600);   // first tick once waiting: then setTime
+            await waitUntil(() => called('setTime').length > 0);
+            assert.deepStrictEqual(called('setTime')[0].a, { newTimeElapsed: 20000 });
+            assert.ok(!c.evs.some((x) => x.ev === 'time' && x.elapsed < 1000), 'no time at 0 sent');
+        } finally { slowPlayFile = 0; }
+        c.send({ cmd: 'stop' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'idle');
+    });
+
+    await t('resume, then pause + resume while the file restarts: the newer replay takes over, never back to the start', async () => {
+        await playing();
+        tick(20000);
+        subs.playerState('PLAYER_STATE_STOP');
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'paused');
+        calls.length = 0; c.clear();
+        slowPlayFile = 300;
+        try {
+            c.send({ cmd: 'resume' });
+            await waitUntil(() => called('playFile').length === 1);
+            c.send({ cmd: 'pause' }); c.send({ cmd: 'resume' }); // a double tap while the first playFile answers
+            await waitUntil(() => called('playFile').length === 2);
+            tick(150);
+            await waitUntil(() => d.tickWaiter);
+            tick(300);
+            await waitUntil(() => called('setTime').length > 0);
+            await sleep(3300); // the older replay's waiter times out: it must stop quietly
+            assert.deepStrictEqual(called('setTime').map((x) => x.a.newTimeElapsed), [20000], 'one setTime, at the place');
+            assert.ok(!c.evs.some((x) => x.ev === 'time' && x.elapsed < 1000), 'no time at 0 sent');
+            assert.ok(!c.evs.some((x) => x.ev === 'state' && x.state === 'error'), 'no error');
+            assert.strictEqual(d.replaying, null);
+        } finally { slowPlayFile = 0; }
+        c.send({ cmd: 'stop' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'idle');
+    });
+
+    await t('end of file (STOP after PLAY, near the end) -> ended, audio released', async () => {
+        await playing();
+        tick(58000);
+        subs.playerState('PLAYER_STATE_STOP');
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'ended');
+        assert.strictEqual(ours().length, 0);
+    });
+
+    const fetchLog = () => JSON.parse(fs.readFileSync(ctl + '.log', 'utf8'));
+    const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return false; } };
+    const fetchPlay = async (id) => {
+        c.clear();
+        c.send({ cmd: 'play', id: id, rect: '1280x720' });
+        return c.waitFor((x) => x.ev === 'state' && x.state === 'playing', 4000);
+    };
+
+    await t('play uncached: the fetcher (env {}, cwd /) into a fresh dir, streaming (no RAM: the window on flash); preparing pct; playing after audio_ready + 10 s of video', async () => {
+        fs.writeFileSync(ctl, ''); fs.writeFileSync(ytlog, ''); setMode('ok');
+        const id = 'FFFFFFFFFF1', dir = path.join(cache, id);
+        fs.mkdirSync(dir); // a killed fetch's leftover: fetched again
+        ['audio.m4a', 'index.bin', 'video.h264.part'].forEach((f) => fs.writeFileSync(path.join(dir, f), 'old'));
+        assert.strictEqual(isPlayable(dir), false);
+        const pl = await fetchPlay(id);
+        assert.deepStrictEqual(c.evs.filter((x) => x.ev === 'state' && x.state === 'preparing').map((x) => x.pct), [0, 35, 70, 94, 99]);
+        assert.strictEqual(pl.title, 'Fetched ' + id);
+        assert.strictEqual(pl.buffering, false);
+        const l = fetchLog();
+        assert.deepStrictEqual(l.argv.slice(1), ['fetch', '--cache-dir', path.join(cache, 'ytdlp'), '--height', '720', '--stream', '120000,45000', '--', id, dir]);
+        assert.strictEqual(l.cwd, '/');
+        assert.ok(l.env.length < 5, 'an empty env: ' + l.env);
+        assert.ok(alive(l.pid), 'still fetching');
+        assert.ok(fs.statSync(path.join(cache, 'ytdlp')).isDirectory());
+        assert.strictEqual(d.fetchedMs, 12000);
+        assert.strictEqual(d.preparing, id);
+        assert.strictEqual(called('playFile').slice(-1)[0].a.path, path.join(dir, 'audio.m4a'));
+        assert.strictEqual(fs.statSync(dir).mode & 0o777, 0o711, 'the media engine passes through, nobody lists it');
+        assert.strictEqual(d.cur.vdir, path.join(dir, 'win'));
+        assert.strictEqual(d.cur.stored, 'flash');
+        await waitUntil(() => ytdecLines().some((l2) => l2.indexOf(' argv --dir ' + path.join(dir, 'win') + ' ') >= 0));
+        d.posFedAt = 0;
+        subs.currentItemTime({ elapsed: 1000, total: 600000 });
+        await waitUntil(() => fs.readFileSync(ctl + '.stdin', 'utf8').indexOf('pos 1000\n') >= 0);   // no RAM: still fed the position
+    });
+
+    await t('buffering: true when the clock nears the fetched video, the watchdog spares ytdec; fetcher done -> false', async () => {
+        c.clear(); fs.writeFileSync(ytlog, ''); setMode('stall');
+        tick(11500);
+        const b = await c.waitFor((x) => x.ev === 'state' && x.buffering === true);
+        assert.strictEqual(b.state, 'playing');
+        d.child.kill('SIGKILL'); // death 1: restarted, now a ytdec that decodes nothing
+        const wd = logs.filter((l) => /watchdog/.test(l)).length;
+        await sleep(2000);
+        assert.strictEqual(logs.filter((l) => /watchdog/.test(l)).length, wd, 'no watchdog kill while buffering');
+        assert.strictEqual(ytdecLines().filter((l) => / argv /.test(l)).length, 1);
+        fs.writeFileSync(ctl, 'done');
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'playing' && x.buffering === false);
+        assert.strictEqual(d.fetchedMs, Infinity);
+        assert.ok(d.fetcher === null && d.preparing === null);
+        // the window's video (holes behind playback) is no copy to play again
+        assert.ok(fs.existsSync(path.join(cache, 'FFFFFFFFFF1', 'win', 'video.h264')) && !isPlayable(path.join(cache, 'FFFFFFFFFF1')));
+        setMode('ok');
+        c.send({ cmd: 'stop' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'idle');
+    });
+
+    await t('fetcher error after playback began (and twice again): one "video incomplete" error, audio plays on', async () => {
+        fs.writeFileSync(ctl, 'spill');   // a whole fetch (resumeFetch's; a stream restreams: WP8)
+        await fetchPlay('FFFFFFFFFF2');
+        fs.writeFileSync(ctl, 'error');
+        await c.waitFor((x) => x.ev === 'error' && x.msg === 'video incomplete: HTTP 403');
+        await sleep(300);
+        assert.strictEqual(c.evs.filter((x) => x.ev === 'error').length, 1);
+        assert.strictEqual(d.state, 'playing');
+        assert.strictEqual(ours().length, 1);
+        c.send({ cmd: 'stop' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'idle');
+    });
+
+    await t('stop kills the fetcher', async () => {
+        fs.writeFileSync(ctl, '');
+        await fetchPlay('FFFFFFFFFF3');
+        const pid = fetchLog().pid;
+        assert.ok(alive(pid));
+        c.send({ cmd: 'stop' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'idle');
+        assert.ok(!alive(pid), 'gone by the idle state');
+        assert.ok(d.fetcher === null && d.preparing === null);
+    });
+
+    // ---- WP8: the playing video streams through RAM (d.ram set for these cases, reset by the last one)
+    const ramRoot = path.join(tmp, 'ram-media');
+    mkdirp(ramRoot);
+    d.ram = ramRoot;
+    const tickAt = (ms) => subs.currentItemTime({ elapsed: ms, total: 600000 });
+    const posLines = () => { try { return fs.readFileSync(ctl + '.stdin', 'utf8').split('\n').filter(Boolean); } catch (e) { return []; } };
+    const argAfter = (argv, n) => argv[argv.indexOf(n) + 1];
+    const newFetch = async (oldPid) => {   // the next fetcher's log (a fresh pid)
+        await waitUntil(() => { try { return fetchLog().pid !== oldPid; } catch (e) { return false; } }, 4000);
+        return fetchLog();
+    };
+    const wp8Stop = async () => {
+        c.send({ cmd: 'stop' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'idle');
+    };
+    const ramPlay = async (id) => {
+        fs.writeFileSync(ctl, '');
+        d.posFedAt = 0;
+        await fetchPlay(id);
+        return fetchLog();
+    };
+
+    await t('WP8: chownFetch takes a direct child of the RAM folder (the fetch uid owns it), still nothing deeper or elsewhere', async () => {
+        d.chownFetch(path.join(d.ram, 'WP8CHOWN001'));
+        assert.throws(() => d.chownFetch(path.join(d.ram, 'WP8CHOWN001', 'deeper')), /outside the cache/);
+        assert.throws(() => d.chownFetch(path.join(tmp, 'elsewhere')), /outside the cache/);
+    });
+
+    await t('WP8: with RAM the video window goes there (--video-dir, --budget); the audio, meta and lookup stay in the folder on flash', async () => {
+        const id = 'WP8RAMPLAY1', dir = path.join(cache, id), vram = path.join(ramRoot, id);
+        const l = await ramPlay(id);
+        assert.strictEqual(argAfter(l.argv, '--stream'), '120000,45000');
+        assert.strictEqual(argAfter(l.argv, '--video-dir'), vram);
+        assert.strictEqual(argAfter(l.argv, '--budget'), String(256 << 20));
+        assert.ok(l.argv.indexOf('--spill-dir') < 0);
+        assert.strictEqual(l.argv[l.argv.length - 1], dir);
+        assert.ok(l.argv.indexOf('--start-ms') < 0 && l.argv.indexOf('--video-only') < 0, 'a first fetch: from the start, audio too');
+        assert.strictEqual(fs.statSync(vram).mode & 0o777, 0o711);
+        assert.strictEqual(called('playFile').slice(-1)[0].a.path, path.join(dir, 'audio.m4a'), 'the audio from flash');
+        assert.ok(fs.existsSync(path.join(dir, 'audio.m4a')) && fs.existsSync(path.join(dir, 'meta.json')));
+        assert.ok(fs.existsSync(path.join(vram, 'index.bin')) && !fs.existsSync(path.join(vram, 'audio.m4a')), 'only the video in RAM');
+        assert.ok(!fs.existsSync(path.join(dir, 'index.bin')) && !fs.existsSync(path.join(dir, 'win')));
+        assert.strictEqual(d.cur.stream, true);
+        assert.strictEqual(d.cur.vdir, vram);
+        await waitUntil(() => ytdecLines().some((x) => x.indexOf(' argv --dir ' + vram + ' ') >= 0));
+        const pl = c.evs.filter((x) => x.ev === 'state' && x.state === 'playing').pop();
+        assert.strictEqual(pl.stored, 'ram', 'a streaming play says so');
+        await wp8Stop();
+    });
+
+    await t('WP8: the window on flash after all (low memory, says ytfetch.py): the RAM folder goes, ytdec reads <dir>/win', async () => {
+        const id = 'WP8FLASHWN1', dir = path.join(cache, id);
+        fs.writeFileSync(ctl, 'flashwin');
+        d.posFedAt = 0;
+        const pl = await fetchPlay(id);
+        assert.strictEqual(argAfter(fetchLog().argv, '--video-dir'), path.join(ramRoot, id));
+        assert.strictEqual(pl.stored, 'flash');
+        assert.strictEqual(d.cur.vdir, path.join(dir, 'win'));
+        assert.ok(!fs.existsSync(path.join(ramRoot, id)), 'the RAM folder is gone');
+        await waitUntil(() => ytdecLines().some((x) => x.indexOf(' argv --dir ' + path.join(dir, 'win') + ' ') >= 0));
+        tickAt(3000);
+        await waitUntil(() => posLines().length === 1);   // still a stream: fed the position
+        // a restream later, with RAM to spare by then: its folder made again, the window back in RAM
+        fs.writeFileSync(ctl, '');
+        const old = fetchLog().pid;
+        c.send({ cmd: 'seek', ms: 100000 });   // past 12000 fetched + streamJumpMs
+        const l = await newFetch(old);
+        assert.strictEqual(argAfter(l.argv, '--video-dir'), path.join(ramRoot, id));
+        await waitUntil(() => d.cur.vdir === path.join(ramRoot, id) && d.fetchedMs === 112000);
+        assert.ok(fs.existsSync(path.join(ramRoot, id, 'index.bin')));
+        await wp8Stop();
+    });
+
+    await t('WP8: the position goes to the fetcher once a second, at once for a seek inside RAM (no new fetch)', async () => {
+        await ramPlay('WP8RAMPOS01');
+        const pid = fetchLog().pid;
+        tickAt(1000);
+        await waitUntil(() => posLines().length === 1);
+        tickAt(1300);
+        await sleep(200);
+        assert.deepStrictEqual(posLines(), ['pos 1000'], 'two ticks within a second: one line');
+        c.send({ cmd: 'seek', ms: 14000 });
+        await waitUntil(() => posLines().length === 2);
+        assert.deepStrictEqual(posLines(), ['pos 1000', 'pos 14000']);
+        await sleep(200);
+        assert.strictEqual(fetchLog().pid, pid, 'no new fetcher');
+        assert.ok(!d.cur.restreams, 'no restream');
+        await wp8Stop();
+    });
+
+    await t('WP8: a seek back outside RAM restreams from there: video only, audio kept, the old video files unlinked (no trim needed)', async () => {
+        const id = 'WP8SEEKBACK', dir = path.join(ramRoot, id), fdir = path.join(cache, id);
+        await ramPlay(id);
+        const old = fetchLog().pid;
+        assert.strictEqual(d.cur.dir, fdir);
+        assert.strictEqual(d.cur.vdir, dir);
+        d.fetchedMs = 120000;                       // as if the fetch had gone on (the fake stops at 12 s)
+        tickAt(100000);
+        await waitUntil(() => posLines().indexOf('pos 100000') >= 0);
+        assert.strictEqual(d.cur.fedMax, 100000);
+        assert.ok(!d.cur.restreams, 'ticks only');
+        // the old fetch's files: a marker video.h264, and hard links that keep the old index.bin / .part inodes
+        fs.writeFileSync(path.join(dir, 'video.h264'), 'OLD');
+        fs.writeFileSync(path.join(dir, 'index.bin'), 'OLDINDEX');
+        fs.writeFileSync(path.join(dir, 'video.h264.part'), 'OLDPART');
+        fs.linkSync(path.join(dir, 'index.bin'), path.join(tmp, 'wp8-old-index'));
+        fs.linkSync(path.join(dir, 'video.h264.part'), path.join(tmp, 'wp8-old-part'));
+        c.send({ cmd: 'seek', ms: 20000 });
+        const l = await newFetch(old);
+        assert.ok(!alive(old), 'the old fetcher is gone');
+        assert.ok(l.argv.indexOf('--video-only') >= 0);
+        assert.strictEqual(argAfter(l.argv, '--start-ms'), '20000');
+        assert.strictEqual(argAfter(l.argv, '--info'), path.join(fdir, 'stream-info.json'));
+        assert.strictEqual(argAfter(l.argv, '--video-dir'), dir);
+        assert.strictEqual(argAfter(l.argv, '--stream'), '120000,45000');
+        assert.strictEqual(l.argv[l.argv.length - 1], fdir);
+        assert.ok(fs.existsSync(path.join(fdir, 'audio.m4a')), 'the audio is kept');
+        assert.ok(!fs.existsSync(path.join(dir, 'video.h264')), 'video.h264 unlinked');
+        assert.strictEqual(fs.readFileSync(path.join(tmp, 'wp8-old-index'), 'utf8'), 'OLDINDEX', 'index.bin was unlinked, not written over');
+        assert.strictEqual(fs.readFileSync(path.join(tmp, 'wp8-old-part'), 'utf8'), 'OLDPART', 'video.h264.part was unlinked, not written over');
+        assert.strictEqual(d.cur.restreams, 1);
+        await waitUntil(() => d.fetchedMs === 32000);   // the new fetch's own events: from 20000
+        await wp8Stop();
+        fs.unlinkSync(path.join(tmp, 'wp8-old-index'));
+        fs.unlinkSync(path.join(tmp, 'wp8-old-part'));
+    });
+
+    await t('WP8: a seek forwards past what is fetched + streamJumpMs restreams there', async () => {
+        const id = 'WP8SEEKFWD1';
+        await ramPlay(id);
+        const old = fetchLog().pid;
+        assert.strictEqual(d.fetchedMs, 12000);
+        c.send({ cmd: 'seek', ms: 43000 });         // 12000 + 30000 + 1000
+        const l = await newFetch(old);
+        assert.ok(!alive(old));
+        assert.ok(l.argv.indexOf('--video-only') >= 0);
+        assert.strictEqual(argAfter(l.argv, '--start-ms'), '43000');
+        assert.strictEqual(argAfter(l.argv, '--info'), path.join(cache, id, 'stream-info.json'));
+        assert.strictEqual(d.cur.restreams, 1);
+        await wp8Stop();
+    });
+
+    // car, 2026-11-20: a resume at 46.8 s streamed from there; a seek to 0 while the head played left ytdec at its first
+    // record (46.8 s) for good. The restream waits for audio.m4a (the fetcher writes it), then the first tick takes it.
+    const seekBackBeforeStream = async (id, atMs, playOnHead) => {
+        const was = d.opts.resume;
+        d.opts.resume = true;
+        try {
+            fs.writeFileSync(ctl, 'hold'); fs.writeFileSync(ytlog, ''); setMode('ok');
+            d.posFedAt = 0;
+            c.clear();
+            c.send({ cmd: 'play', id: id, rect: '1280x720', at: atMs });
+            await c.waitFor((x) => x.ev === 'state' && x.state === 'playing', 4000);
+            const l0 = fetchLog();
+            assert.strictEqual(argAfter(l0.argv, '--start-ms'), String(atMs));
+            await waitUntil(() => d.cur.lowMs === atMs);
+            subs.playerState('PLAYER_STATE_PLAY');
+            tickAt(0);                                  // the first tick takes the play to its resume point
+            await waitUntil(() => ytdecLines().some((x) => new RegExp(' in seek ' + atMs + '$').test(x)));
+            if (playOnHead) tickAt(atMs); else await waitUntil(() => d.headWait);
+            c.send({ cmd: 'seek', ms: 0 });
+            await waitUntil(() => ytdecLines().some((x) => / in seek 0$/.test(x)));
+            await sleep(300);
+            assert.ok(!d.cur.restreams, 'no restream while the fetcher still writes the audio');
+            assert.strictEqual(fetchLog().pid, l0.pid);
+            fs.writeFileSync(ctl, 'full');
+            await waitUntil(() => d.head === null && !d.switching && !d.headWait, 4000);
+            // the player's times go on (the switch while waiting replays on a new connection, which takes its first one)
+            const ticks = setInterval(() => tickAt(d.elapsed + 200), 100);
+            let l;
+            try { l = await newFetch(l0.pid); } finally { clearInterval(ticks); }
+            assert.ok(l.argv.indexOf('--video-only') >= 0);
+            assert.ok(Number(argAfter(l.argv, '--start-ms')) < 5000, 'from where it plays: ' + argAfter(l.argv, '--start-ms'));
+            assert.strictEqual(d.cur.restreams, 1);
+            await waitUntil(() => d.cur.lowMs < 5000);
+            tickAt(d.elapsed + 400);
+            await sleep(200);
+            assert.strictEqual(d.cur.restreams, 1, 'once');
+        } finally {
+            d.opts.resume = was;
+        }
+        await wp8Stop();
+        fs.writeFileSync(ctl, '');
+    };
+    await t('WP8: a resume, then a seek back before the stream while the head plays: restreams there once audio.m4a is in', async () => {
+        await seekBackBeforeStream('WP8BEFORE01', 40000, true);
+    });
+    await t('WP8: a resume past the head, then a seek back before the stream while it waits for audio.m4a: restreams there after', async () => {
+        await seekBackBeforeStream('WP8BEFORE02', 90000, false);
+    });
+
+    await t('WP8: a far seek before audio.m4a: not fed to the fetcher (it would fetch toward it beside the audio), restreamed there once audio.m4a is in', async () => {
+        fs.writeFileSync(ctl, 'hold'); fs.writeFileSync(ytlog, ''); setMode('ok');
+        d.posFedAt = 0;
+        c.clear();
+        c.send({ cmd: 'play', id: 'WP8FARWAIT1', rect: '1280x720' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'playing', 4000);
+        const l0 = fetchLog();
+        subs.playerState('PLAYER_STATE_PLAY');
+        tickAt(1000);
+        await waitUntil(() => posLines().indexOf('pos 1000') >= 0);
+        c.send({ cmd: 'seek', ms: 300000 });        // past the head (60 s) and past 12000 fetched + streamJumpMs
+        await waitUntil(() => d.headWait);
+        await sleep(300);
+        assert.ok(posLines().indexOf('pos 300000') < 0, 'not fed: ' + posLines().join(','));
+        assert.ok(!d.cur.restreams, 'no restream while the fetcher still writes the audio');
+        assert.strictEqual(fetchLog().pid, l0.pid);
+        fs.writeFileSync(ctl, 'full');
+        await waitUntil(() => d.head === null && !d.switching && !d.headWait, 4000);
+        const ticks = setInterval(() => tickAt(d.elapsed + 200), 100);
+        let l;
+        try { l = await newFetch(l0.pid); } finally { clearInterval(ticks); }
+        assert.ok(l.argv.indexOf('--video-only') >= 0);
+        assert.ok(Number(argAfter(l.argv, '--start-ms')) >= 300000, 'from the seek: ' + argAfter(l.argv, '--start-ms'));
+        assert.strictEqual(d.cur.restreams, 1);
+        await wp8Stop();
+        fs.writeFileSync(ctl, '');
+    });
+
+    await t('WP8: catch-up: a clock past fetched + streamJumpMs restreams at the clock, at most every restreamMs', async () => {
+        const was = d.opts.restreamMs;
+        try {
+            const id = 'WP8CATCHUP1';
+            await ramPlay(id);
+            const p0 = fetchLog().pid;
+            tickAt(50000);                              // past 12000 + 30000
+            const l1 = await newFetch(p0);
+            assert.strictEqual(argAfter(l1.argv, '--start-ms'), '50000');
+            assert.ok(l1.argv.indexOf('--video-only') >= 0);
+            assert.strictEqual(d.cur.restreams, 1);
+            await waitUntil(() => d.fetchedMs === 62000);
+            d.posFedAt = 0;
+            tickAt(100000);                             // behind again, but a restream began just now: not again
+            await sleep(400);
+            assert.strictEqual(fetchLog().pid, l1.pid, 'no second restream within restreamMs');
+            assert.strictEqual(d.cur.restreams, 1);
+            d.opts.restreamMs = 100;                    // long enough passed
+            tickAt(101000);
+            const l2 = await newFetch(l1.pid);
+            assert.strictEqual(argAfter(l2.argv, '--start-ms'), '101000');
+            assert.strictEqual(d.cur.restreams, 2);
+        } finally {
+            d.opts.restreamMs = was;
+        }
+        await wp8Stop();
+    });
+
+    await t('WP8: the fetcher ends early while streaming: the video again from where it plays (not from zero), buffering meanwhile', async () => {
+        const was = d.opts.fetchRetryMs;
+        try {
+            d.opts.fetchRetryMs = [800, 800];           // a window to see the gap in (the test daemon has none)
+            const id = 'WP8DIED0001';
+            await ramPlay(id);
+            const old = fetchLog().pid;
+            tickAt(8000);                               // 9000 <= 12000 fetched: not buffering
+            assert.strictEqual(d.isBuffering(), false);
+            fs.writeFileSync(ctl, 'error');
+            await waitUntil(() => logs.some((m) => /WP8DIED0001: HTTP 403 - the video again in 800 ms \(1 of 5\)/.test(m)), 4000);
+            fs.writeFileSync(ctl, '');                  // the next fetcher lives
+            assert.strictEqual(d.fetcher, null);
+            c.clear();
+            tickAt(20000);                              // the clock is past what was fetched, and nothing fetches
+            const b = await c.waitFor((x) => x.ev === 'state' && x.state === 'playing' && x.buffering === true);
+            assert.strictEqual(b.buffering, true);
+            assert.strictEqual(d.isBuffering(), true);
+            const l = await newFetch(old);
+            assert.ok(l.argv.indexOf('--video-only') >= 0);
+            const at = Number(argAfter(l.argv, '--start-ms'));
+            assert.ok(at >= 20000 && at < 23000, 'from where it plays: ' + at);
+            assert.strictEqual(d.cur.restreamDied, 1);
+            assert.ok(!d.cur.fetchAgain, 'not resumeFetch\'s refetch from zero');
+            assert.strictEqual(c.evs.filter((x) => x.ev === 'error').length, 0, 'no "video incomplete"');
+            assert.strictEqual(d.state, 'playing');
+            await waitUntil(() => d.fetchedMs === at + 12000);
+            await c.waitFor((x) => x.ev === 'state' && x.state === 'playing' && x.buffering === false);
+        } finally {
+            d.opts.fetchRetryMs = was;
+        }
+        await wp8Stop();
+    });
+
+    await t('WP8: a video that cannot stream spills: the whole video on flash, the RAM folder gone, stream off', async () => {
+        const id = 'WP8SPILL001';
+        fs.writeFileSync(ctl, 'spill');
+        d.posFedAt = 0;
+        const spl = await fetchPlay(id);
+        assert.strictEqual(spl.stored, 'flash');
+        assert.strictEqual(called('playFile').slice(-1)[0].a.path, path.join(cache, id, 'audio.m4a'));
+        assert.ok(!fs.existsSync(path.join(ramRoot, id)), 'the RAM folder is gone');
+        assert.strictEqual(d.cur.stream, false);
+        assert.strictEqual(d.cur.dir, path.join(cache, id));
+        assert.ok(fs.existsSync(path.join(cache, id, 'audio.m4a')));
+        tickAt(3000);                                   // no position feed for a whole fetch
+        await sleep(150);
+        assert.deepStrictEqual(posLines(), []);
+        const old = fetchLog().pid;
+        fs.writeFileSync(ctl, 'error');                 // it dies: resumeFetch, whole again into the same folder, no RAM
+        const l = await newFetch(old);
+        assert.ok(l.argv.indexOf('--stream') < 0 && l.argv.indexOf('--video-dir') < 0, l.argv.join(' '));
+        assert.strictEqual(l.argv[l.argv.length - 1], path.join(cache, id));
+        assert.ok(!fs.existsSync(path.join(ramRoot, id)));
+        fs.writeFileSync(ctl, '');
+        await wp8Stop();
+        fs.writeFileSync(ctl, '');
+    });
+
+    await t('WP8: a resume that spills: the whole video from 0, so the window starts at 0 and fetched counts from 0', async () => {
+        const was = d.opts.resume;
+        d.opts.resume = true;
+        try {
+            const id = 'WP8SPILLAT1';
+            fs.writeFileSync(ctl, 'spill');
+            d.posFedAt = 0;
+            c.clear();
+            c.send({ cmd: 'play', id: id, rect: '1280x720', at: 40000 });
+            await c.waitFor((x) => x.ev === 'state' && x.state === 'playing', 4000);
+            assert.strictEqual(argAfter(fetchLog().argv, '--start-ms'), '40000', 'asked from there');
+            assert.strictEqual(d.cur.stream, false);
+            assert.strictEqual(d.cur.lowMs, 0);
+            assert.strictEqual(d.fetchedMs, 12000, 'not 40000 + what came');
+            assert.strictEqual(d.cur.vdir, path.join(cache, id));
+        } finally { d.opts.resume = was; }
+        await wp8Stop();
+        fs.writeFileSync(ctl, '');
+    });
+
+    await t('WP8: outsideRam: below lowMs, or below what it was told minus its behind (from the stream event) plus 2 s; past fetched + streamJumpMs', async () => {
+        const id = 'WP8BEHIND01';
+        fs.writeFileSync(ctl + '.behind', '20000');
+        try { await ramPlay(id); } finally { fs.unlinkSync(ctl + '.behind'); }
+        assert.strictEqual(d.cur.behindMs, 20000);
+        const x = Daemon({ cacheDir: path.join(tmp, 'cache-out'), noSetuid: true, log: () => undefined });
+        x.fullReady = true; x.head = null; x.fetchedMs = 150000;
+        x.cur = { stream: true, lowMs: 30000, fedMax: 100000, behindMs: 45000 };
+        assert.strictEqual(x.outsideRam(56900), true, 'within 2 s of the punched edge');
+        assert.strictEqual(x.outsideRam(57100), false);
+        assert.strictEqual(x.outsideRam(180000), false);
+        assert.strictEqual(x.outsideRam(180001), true);
+        x.cur.behindMs = 20000;
+        assert.strictEqual(x.outsideRam(81000), true, 'its own behind');
+        x.cur.fedMax = 31000;
+        assert.strictEqual(x.outsideRam(29999), true);
+        assert.strictEqual(x.outsideRam(30000), false, 'the stream\'s own start: no margin');
+        await wp8Stop();
+    });
+
+    await t('WP8: two seeks out of RAM while the old fetcher takes its time to exit: one new fetcher, for the newer seek, after the old one is gone', async () => {
+        const id = 'WP8TWOSEEK1';
+        fs.writeFileSync(ctl + '.slow', '500');   // (read at its start)
+        try {
+            await ramPlay(id);
+            const old = fetchLog().pid;
+            d.fetchedMs = 120000;
+            tickAt(100000);
+            await waitUntil(() => d.cur.fedMax === 100000);
+            c.send({ cmd: 'seek', ms: 20000 });
+            await sleep(50);
+            c.send({ cmd: 'seek', ms: 5000 });
+            const l = await newFetch(old);
+            assert.ok(!alive(old), 'the old one exited first');
+            assert.strictEqual(argAfter(l.argv, '--start-ms'), '5000');
+            assert.strictEqual(d.cur.restreams, 2);
+            await sleep(400);
+            assert.strictEqual(fetchLog().pid, l.pid, 'no third fetcher');
+            await waitUntil(() => d.fetchedMs === 17000);
+        } finally { fs.unlinkSync(ctl + '.slow'); }
+        await wp8Stop();
+    });
+
+    await t('WP8: the watchdog spares ytdec while the clock is before where the stream starts (it holds its first frame)', async () => {
+        const x = Daemon({ cacheDir: path.join(tmp, 'cache-wd'), noSetuid: true, log: () => undefined, watchdogMs: 100 });
+        let kills = 0;
+        x.child = { kill: () => { kills++; } };
+        x.state = 'playing'; x.videoOn = true; x.eof = false; x.headWait = false;
+        x.cur = { stream: true, lowMs: 40000 };
+        x.fetchedMs = 52000; x.elapsed = 10000; x.lastProgress = 0; x.played = 99999;
+        x.watchdog();
+        assert.strictEqual(kills, 0, 'before the stream');
+        x.elapsed = 41000; x.lastProgress = 0; x.played = 99999;
+        x.watchdog();
+        assert.strictEqual(kills, 1, 'inside it: a stall');
+    });
+
+    await t('WP8: a new play empties the RAM of the last one before its fetch plans', async () => {
+        await ramPlay('WP8PRUNE001');
+        await ramPlay('WP8PRUNE002');   // no stop between: the stop inside play() still protects the old one
+        const gone = logs.findIndex((l) => /^lru removed .*WP8PRUNE001/.test(l)), planned = logs.findIndex((l) => /^fetch WP8PRUNE002: h264 window in ram/.test(l));
+        assert.ok(gone >= 0 && planned > gone, 'removed at ' + gone + ', planned at ' + planned);
+        assert.ok(!fs.existsSync(path.join(ramRoot, 'WP8PRUNE001')));
+        assert.ok(fs.existsSync(path.join(ramRoot, 'WP8PRUNE002', 'index.bin')));
+        await wp8Stop();
+    });
+
+    await t('WP8: a quality change while streaming restarts the fetch at the position, at the new height', async () => {
+        const was = d.opts.streamJumpMs;
+        try {
+            d.opts.streamJumpMs = 120000;               // the fake fetches 12 s: no catch-up at 50 s
+            const id = 'WP8QUALITY1';
+            await ramPlay(id);
+            tickAt(50000);
+            assert.strictEqual(d.elapsed, 50000);
+            const old = fetchLog().pid;
+            c.send({ cmd: 'quality', quality: '480' });
+            const l = await newFetch(old);
+            await waitUntil(() => d.state === 'playing' && d.fetchedMs >= 62000, 4000);
+            assert.strictEqual(argAfter(l.argv, '--height'), '480');
+            assert.strictEqual(argAfter(l.argv, '--start-ms'), '50000');
+            assert.strictEqual(argAfter(l.argv, '--stream'), '120000,45000');
+            assert.strictEqual(l.argv[l.argv.length - 1], path.join(cache, id));
+            assert.strictEqual(argAfter(l.argv, '--video-dir'), path.join(ramRoot, id));
+            assert.strictEqual(d.cur.stream, true);
+        } finally {
+            d.opts.streamJumpMs = was;
+        }
+        await wp8Stop();
+    });
+
+    await t('WP8: ramMount: only a tmpfs mounted at the folder itself (the unit\'s capped one), never a folder on /run or /dev/shm', async () => {
+        const m = ['proc /proc proc rw 0 0', 'tmpfs /run tmpfs rw,size=400m 0 0', 'tmpfs /dev/shm tmpfs rw 0 0',
+            'tmpfs /run/jap-ridetube-media tmpfs rw,size=262144k,mode=711 0 0', '/dev/sda1 /var/data ext4 rw 0 0', 'tmpfs /my\\040ram tmpfs rw 0 0'].join('\n');
+        assert.strictEqual(ytdjs.ramMount('/run/jap-ridetube-media', m), true);
+        assert.strictEqual(ytdjs.ramMount('/my ram', m), true, 'an escaped space');
+        ['/dev/shm/media', '/run/jap-ridetube-media/sub', '/run/other', '/var/data', '/proc'].forEach((p) => assert.strictEqual(ytdjs.ramMount(p, m), false, p));
+        assert.strictEqual(ytdjs.ramMount('/run/jap-ridetube-media', ''), false, 'no /proc/mounts (not Linux): none');
+    });
+
+    await t('WP8: pickRam: ramDir only when it is a tmpfs mount point (ramCheck), root\'s own real folder, 0711; a symlink refused', async () => {
+        d.ram = null;   // (the cases after this one keep their videos on flash, whatever happens here)
+        const mk = (o) => Daemon(Object.assign({ someip: someip, srcGen: srcGen, cacheDir: cache, logDir: tmp, sock: path.join(tmp, 'pick.sock'), stateDir: stateDir,
+            noSetuid: true, log: () => undefined, ramCheck: true }, o));
+        const flash = path.join(tmp, 'notram'), any = path.join(tmp, 'anyram'), target = path.join(tmp, 'ram-target'), link = path.join(tmp, 'ram-link');
+        try {
+            assert.strictEqual(mk({ ramDir: flash }).pickRam(), null, 'not a tmpfs mount point: none');
+            assert.ok(!fs.existsSync(flash), 'and not created');
+            assert.strictEqual(mk({ ramDir: null }).pickRam(), null);
+            assert.strictEqual(mk({ ramDir: any, ramCheck: false }).pickRam(), any, 'ramCheck off: any folder');
+            assert.strictEqual(fs.statSync(any).mode & 0o777, 0o711);
+            // someone's symlink where the folder goes: refused, never followed or chmodded
+            fs.mkdirSync(target, 0o755);
+            fs.symlinkSync(target, link);
+            assert.strictEqual(mk({ ramDir: link, ramCheck: false }).pickRam(), null, 'a symlink: not used');
+            assert.strictEqual(fs.statSync(target).mode & 0o777, 0o755, 'its target left as it was');
+        } finally {
+            [flash, any, link, target].forEach(rmrf);
+            d.ram = null;
+        }
+    });
+
+    await t('speed: a warm spare takes the prefetch (stream lookup); the next spare takes the play, with --info', async () => {
+        fs.writeFileSync(ctl, ''); setMode('ok');
+        const id = 'FFFFFFFFFF5';
+        d.opts.spare = true;
+        c.send({ cmd: 'status' });                                   // the app in use
+        await waitUntil(() => d.spare && d.spare.warm, 3000);
+        const sp = d.spare.child.pid;
+        c.send({ cmd: 'prefetch', id: id });
+        await waitUntil(() => d.extracting, 1000);
+        assert.ok(d.spare && d.spare.child.pid !== sp, 'a new spare at once, not at the next poll');
+        await waitUntil(() => fs.existsSync(d.infoFile(id)) && !d.extracting, 3000);
+        const x = JSON.parse(fs.readFileSync(ctl + '.extract', 'utf8'));
+        assert.strictEqual(x.served, true);
+        assert.deepStrictEqual(x.argv, ['extract', '--cache-dir', path.join(cache, 'ytdlp'), '--', id, d.infoFile(id)]);
+        assert.ok(!alive(sp) || !d.spare || d.spare.child.pid !== sp, 'the spare was used up');
+        c.send({ cmd: 'prefetch', id: id });                         // fresh: not looked up again
+        assert.strictEqual(d.extracting, null);
+        await waitUntil(() => d.spare && d.spare.warm, 3000);
+        await fetchPlay(id);
+        const l = fetchLog();
+        assert.strictEqual(l.served, true);
+        assert.deepStrictEqual(l.argv.slice(1), ['fetch', '--cache-dir', path.join(cache, 'ytdlp'), '--height', '720', '--info', d.infoFile(id), '--stream', '120000,45000', '--', id, path.join(cache, id)]);
+        c.send({ cmd: 'stop' });
+        await c.waitFor((x2) => x2.ev === 'state' && x2.state === 'idle');
+        d.opts.spare = false;
+        d.keepWarm();
+        assert.strictEqual(d.spare, null, 'spare off: killed');
+    });
+
+    await t('extras: chapters + SponsorBlock (hashed prefix, cached), a segment skipped once; position kept, resumed', async () => {
+        const id = 'SSSSSSSSSS1', dir = path.join(cache, id);
+        mkVideo(id);
+        fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify({ id: id, title: 'T', channel: 'C', duration_s: 60, chapters: [[0, 'Intro'], [30000, 'Main']] }));
+        const pre = require('crypto').createHash('sha256').update(id).digest('hex').slice(0, 4);
+        yt.sb = (url) => ({ status: 200, body: JSON.stringify([{ videoID: 'other111111', segments: [{ category: 'sponsor', actionType: 'skip', segment: [1, 50] }] },
+            { videoID: id, segments: [{ category: 'sponsor', actionType: 'skip', segment: [10, 20] }, { category: 'filler', actionType: 'skip', segment: [40, 45] }, { category: 'intro', actionType: 'mute', segment: [0, 5] }] }]) });
+        yt.calls.length = 0;
+        await playing(id);
+        const ex = await c.waitFor((x) => x.ev === 'extras' && x.segments.length);
+        assert.deepStrictEqual(ex, { ev: 'extras', id: id, chapters: [[0, 'Intro'], [30000, 'Main']], segments: [[10000, 20000, 'sponsor']] });
+        const sbUrl = yt.calls.find((x) => /sponsor/.test(x.url)).url;
+        assert.ok(sbUrl.indexOf('skipSegments/' + pre + '?') > 0 && /categories=/.test(sbUrl), sbUrl);
+        calls.length = 0;
+        tick(12000);
+        const sk = await c.waitFor((x) => x.ev === 'skipped');
+        assert.deepStrictEqual(sk, { ev: 'skipped', category: 'sponsor', ms: 10000 });
+        await waitUntil(() => called('setTime').length);
+        assert.strictEqual(called('setTime').slice(-1)[0].a.newTimeElapsed, 20000);
+        tick(15000);                                                 // back into it: played
+        await sleep(100);
+        assert.strictEqual(c.evs.filter((x) => x.ev === 'skipped').length, 1);
+        tick(25000);
+        c.send({ cmd: 'stop' });
+        const pos = await c.waitFor((x) => x.ev === 'positions');
+        assert.deepStrictEqual([pos.items[0].id, pos.items[0].ms, pos.items[0].done], [id, 25000, false]);
+        assert.strictEqual(JSON.parse(fs.readFileSync(path.join(cache, 'positions.json'), 'utf8'))[id].ms, 25000);
+        assert.strictEqual(fs.statSync(path.join(cache, 'positions.json')).mode & 0o777, 0o600, 'the watch history: root only');
+        d.opts.resume = true; calls.length = 0; yt.calls.length = 0;
+        await playing(id);
+        tick(500);
+        await waitUntil(() => called('setTime').length);
+        assert.strictEqual(called('setTime')[0].a.newTimeElapsed, 25000, 'resumed where it was left');
+        assert.strictEqual(yt.calls.filter((x) => /sponsor/.test(x.url)).length, 0, 'segments from sb.json');
+        c.send({ cmd: 'stop' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'idle');
+        d.opts.resume = false;
+        rmrf(dir);
+    });
+
+    await t('SponsorBlock: the play\'s skip list; other categories (outro) only in extras, for the app\'s Skip button', async () => {
+        const id = 'SSSSSSSSSS2', dir = path.join(cache, id);
+        mkVideo(id);
+        fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify({ id: id, title: 'T', channel: 'C', duration_s: 60 }));
+        yt.sb = () => ({ status: 200, body: JSON.stringify([{ videoID: id, segments: [{ category: 'sponsor', actionType: 'skip', segment: [10, 20] },
+            { category: 'outro', actionType: 'skip', segment: [50, 58] }] }]) });
+        c.clear();
+        c.send({ cmd: 'play', id: id, rect: '1280x720', skip: ['outro'] });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'playing');
+        subs.playerState('PLAYER_STATE_PLAY');
+        const ex = await c.waitFor((x) => x.ev === 'extras' && x.segments.length);
+        assert.deepStrictEqual(ex.segments, [[10000, 20000, 'sponsor'], [50000, 58000, 'outro']]);
+        tick(12000);
+        await sleep(150);
+        assert.strictEqual(c.evs.filter((x) => x.ev === 'skipped').length, 0, 'sponsor not in this play\'s list: played');
+        tick(51000);
+        const sk = await c.waitFor((x) => x.ev === 'skipped');
+        assert.strictEqual(sk.category, 'outro');
+        c.send({ cmd: 'stop' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'idle');
+        rmrf(dir);
+    });
+
+    await t('fetcher error before playable -> error state + "fetch: <msg>", nothing played', async () => {
+        fs.writeFileSync(ctl, 'fail'); c.clear(); calls.length = 0;
+        c.send({ cmd: 'play', id: 'FFFFFFFFFF4', rect: '1280x720' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'error', 4000);
+        await c.waitFor((x) => x.ev === 'error' && x.msg === 'fetch: boom');
+        assert.strictEqual(called('playFile').length, 0);
+        assert.strictEqual(d.fetcher, null);
+    });
+
+    await t('fetcher error before playable: retried after a wait (retry event), then plays', async () => {
+        fs.writeFileSync(ctl, 'fail'); c.clear(); calls.length = 0;
+        d.opts.fetchRetryMs = [300];
+        c.send({ cmd: 'play', id: 'FFFFFFFFFR4', rect: '1280x720' });
+        const r = await c.waitFor((x) => x.ev === 'retry', 4000);
+        assert.deepStrictEqual(r, { ev: 'retry', id: 'FFFFFFFFFR4', n: 1, msg: 'boom' });
+        fs.writeFileSync(ctl, '');                          // the network back
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'playing' && x.id === 'FFFFFFFFFR4', 4000);
+        assert.ok(!c.evs.some((x) => x.ev === 'state' && x.state === 'error'), 'no error on the way');
+        d.opts.fetchRetryMs = [];
+        c.send({ cmd: 'stop' }); await c.waitFor((x) => x.ev === 'state' && x.state === 'idle');
+        rmrf(path.join(cache, 'FFFFFFFFFR4'));
+    });
+
+    await t('yt-dlp updates: looked for only online; the update loaded by later fetches (--pyz); off: the service\'s own; a failed play looks again', async () => {
+        const lease = path.join(tmp, 'lease.json'), ytc = path.join(cache, 'ytdlp'), upLog = () => JSON.parse(fs.readFileSync(ctl + '.update.log', 'utf8'));
+        fs.writeFileSync(ctl + '.update', 'new:2026.11.12'); fs.writeFileSync(ctl, ''); c.clear();
+        Object.assign(d.opts, { leaseFile: lease, ytdlpRetryMs: 700, ytdlpEveryMs: 60000 });
+        d.ytdlpNext = 0;
+        await sleep(500);
+        assert.ok(!fs.existsSync(ctl + '.update.log'), 'offline (no lease): no look');
+        fs.writeFileSync(lease, '{}');
+        const up = await c.waitFor((x) => x.ev === 'ytdlp' && x.version === '2026.11.12' && !x.checking);
+        assert.deepStrictEqual(up, { ev: 'ytdlp', auto: true, version: '2026.11.12', bundled: '2026.10.26', checking: false });
+        assert.deepStrictEqual(upLog().argv.slice(1), ['update', '--cache-dir', ytc]);
+        assert.deepStrictEqual(upLog().env.filter((k) => k !== '__CF_USER_TEXT_ENCODING'), [], 'a clean environment, as every fetch-uid child');   // (macOS adds that one to any process)
+        assert.ok(d.ytdlpNext > Date.now() + 50000, 'the next look a day later');
+        // a play's fetch loads the update
+        const pyz = path.join(ytc, 'pyz', '2026.11.12', 'ytdlp.pyz');
+        c.send({ cmd: 'play', id: 'UPDATEDPYZ1', rect: '1280x720' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'playing' && x.id === 'UPDATEDPYZ1', 4000);
+        const argv = JSON.parse(fs.readFileSync(ctl + '.log', 'utf8')).argv;
+        assert.deepStrictEqual(argv.slice(argv.indexOf('--pyz'), argv.indexOf('--pyz') + 2), ['--pyz', pyz]);
+        c.send({ cmd: 'stop' }); await c.waitFor((x) => x.ev === 'state' && x.state === 'idle');
+        // off (the app's setting): kept in state/ytdlp.json, the service's own yt-dlp, no looks
+        c.clear();
+        c.send({ cmd: 'ytdlp', auto: false });
+        await c.waitFor((x) => x.ev === 'ytdlp' && x.auto === false);
+        assert.deepStrictEqual(JSON.parse(fs.readFileSync(path.join(stateDir, 'ytdlp.json'), 'utf8')), { auto: false });
+        assert.deepStrictEqual(d.pyzArgs(), []);
+        fs.unlinkSync(ctl + '.update.log'); d.ytdlpNext = 0;
+        await sleep(500);
+        assert.ok(!fs.existsSync(ctl + '.update.log'), 'off: no look');
+        // on again: the update again, a look soon
+        const onAt = Date.now();
+        c.send({ cmd: 'ytdlp', auto: true });
+        await c.waitFor((x) => x.ev === 'ytdlp' && x.auto === true);
+        // ytdlpNext is 0 since the step above, so that look starts at the next tick: let it end here. Left running, it could
+        // start after the steps below removed update.log, answer their waits early, and leave a look of theirs to come
+        // after they reset the timers ("a refused video: no look" failed now and then, and WP2's next case saw its --pyz)
+        await waitUntil(() => (d.ytdlpAt || 0) >= onAt && !d.ytdlpRun, 3000);
+        c.clear(); c.send({ cmd: 'ytdlp' });                      // auto left out: only the state
+        assert.strictEqual((await c.waitFor((x) => x.ev === 'ytdlp')).auto, true);
+        assert.deepStrictEqual(d.pyzArgs(), ['--pyz', pyz]);
+        // a current.json naming a file outside its folder is not loaded
+        const cj = path.join(ytc, 'pyz', 'current.json'), keep = fs.readFileSync(cj);
+        fs.writeFileSync(cj, JSON.stringify({ version: '2026.11.13', pyz: path.join(tmp, 'elsewhere.pyz') })); fs.writeFileSync(path.join(tmp, 'elsewhere.pyz'), 'x');
+        assert.deepStrictEqual(d.pyzArgs(), []);
+        fs.writeFileSync(cj, keep);
+        // a play failing after its retries (not a refused video) looks again, once ytdlpRetryMs has passed since the last look
+        fs.writeFileSync(ctl + '.update', 'same');
+        d.ytdlpNext = Date.now() + 60000; d.ytdlpAt = Date.now() - 1000; if (fs.existsSync(ctl + '.update.log')) fs.unlinkSync(ctl + '.update.log');
+        fs.writeFileSync(ctl, 'fail'); c.clear();
+        c.send({ cmd: 'play', id: 'UPDATEFAIL1', rect: '1280x720' });
+        await c.waitFor((x) => x.ev === 'error' && x.msg === 'fetch: boom', 4000);
+        await waitUntil(() => fs.existsSync(ctl + '.update.log'), 3000);
+        await c.waitFor((x) => x.ev === 'ytdlp' && x.version === '2026.11.12' && !x.checking);
+        // a refused video does not
+        fs.unlinkSync(ctl + '.update.log'); d.ytdlpAt = 0; d.ytdlpNext = Date.now() + 60000;
+        fs.writeFileSync(ctl, 'gone');
+        c.send({ cmd: 'play', id: 'UPDATEGONE1', rect: '1280x720' });
+        await c.waitFor((x) => x.ev === 'error' && x.msg === 'fetch: Video unavailable', 4000);
+        await sleep(500);
+        assert.ok(!fs.existsSync(ctl + '.update.log'), 'a refused video: no look');
+        // a failed look: again after ytdlpRetryMs, not a day
+        fs.writeFileSync(ctl + '.update', 'fail'); d.ytdlpNext = 0;
+        await waitUntil(() => fs.existsSync(ctl + '.update.log'), 3000);
+        await waitUntil(() => !d.ytdlpRun, 3000);
+        assert.ok(d.ytdlpNext <= Date.now() + 700, 'again in ytdlpRetryMs');
+        assert.ok(logs.some((l) => l === 'yt-dlp update: yt-dlp releases: offline'), logs.slice(-3).join(' | '));
+        Object.assign(d.opts, { leaseFile: '/nonexistent/lease.json' }); d.ytdlpNext = Infinity;
+        fs.rmSync(path.join(ytc, 'pyz'), { recursive: true, force: true }); fs.unlinkSync(path.join(stateDir, 'ytdlp.json')); d.ytdlpOn = undefined;
+        ['UPDATEDPYZ1', 'UPDATEFAIL1', 'UPDATEGONE1'].forEach((id) => fs.rmSync(path.join(cache, id), { recursive: true, force: true }));
+        fs.writeFileSync(ctl, '');
+    });
+
+    await t('a refused video (unavailable) is not retried', async () => {
+        fs.writeFileSync(ctl, 'gone'); c.clear();
+        d.opts.fetchRetryMs = [300];
+        c.send({ cmd: 'play', id: 'FFFFFFFFFG4', rect: '1280x720' });
+        await c.waitFor((x) => x.ev === 'error' && x.msg === 'fetch: Video unavailable', 4000);
+        assert.ok(!c.evs.some((x) => x.ev === 'retry'), 'no retry');
+        d.opts.fetchRetryMs = [];
+        fs.writeFileSync(ctl, '');
+    });
+
+    await t('a second play during the first one\'s playFile keeps the second\'s audio', async () => {
+        c.clear(); slowPlayFile = 300;
+        c.send({ cmd: 'play', id: 'DemoVideo01', rect: '1280x720' });
+        await sleep(50);
+        c.send({ cmd: 'play', id: 'PPPPPPPPPPP', rect: '1280x720' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'playing' && x.id === 'PPPPPPPPPPP', 4000);
+        await sleep(800);
+        slowPlayFile = 0;
+        assert.strictEqual(ours().length, 1, JSON.stringify(ours()));
+        assert.strictEqual(called('playFile').slice(-1)[0].a.path, path.join(cache, 'PPPPPPPPPPP', 'audio.m4a'));
+        c.send({ cmd: 'stop' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'idle');
+        assert.strictEqual(ours().length, 0);
+    });
+
+    // ---- head start: audio.head.m4a first, audio.m4a when the fetcher has it all
+    const headPlay = async (id, m) => {
+        fs.writeFileSync(ctl, m); fs.writeFileSync(ytlog, ''); setMode('ok'); calls.length = 0;
+        const pl = await fetchPlay(id);
+        calls.splice(0, calls.findIndex((x) => x.m === 'connect')); // the previous play's STOP
+        subs.playerState('PLAYER_STATE_PLAY');
+        return pl;
+    };
+    const hdir = (id) => path.join(cache, id);
+    const ytdecIns = () => ytdecLines().map((l) => l.split(' ').slice(1).join(' ')).filter((l) => /^in (pause|resume|seek)/.test(l));
+    const stopIdle = async () => { c.send({ cmd: 'stop' }); await c.waitFor((x) => x.ev === 'state' && x.state === 'idle'); };
+    const spawns = () => ytdecLines().filter((l) => / argv /.test(l)).length;
+    const last = () => ytdecIns().slice(-1)[0];
+
+    await t('seek past the video fetched: the seek, then a new ytdec at the clock once the video is there; once', async () => {
+        // ytdec reads its index again only when it runs out of frames: a seek past it decoded up to the target unseen
+        // (car, 2026-11-20: ~100 s of a frozen picture after a quality restart at 23 min)
+        fs.writeFileSync(ctl, 'spill'); fs.writeFileSync(ytlog, ''); setMode('ok');   // a whole fetch (a stream restreams there: WP8)
+        await fetchPlay('FFFFFFFFFS1');
+        await waitUntil(() => d.fetchedMs === 12000 && spawns() === 1);
+        c.send({ cmd: 'seek', ms: 2000 }); // within what it knew at its start: a plain seek
+        await waitUntil(() => last() === 'in seek 2000');
+        c.send({ cmd: 'seek', ms: 300000 }); // past the video fetched: the seek now
+        await waitUntil(() => last() === 'in seek 300000');
+        tick(300200); tick(300400);
+        await sleep(150);
+        assert.strictEqual(spawns(), 1, 'no new ytdec before the video is there');
+        fs.writeFileSync(ctl, 'done');
+        await waitUntil(() => d.fetchedMs === Infinity);
+        tick(300600); // the next tick sees the video there
+        await waitUntil(() => spawns() === 2 && /^in seek 30/.test(last()));
+        assert.ok(/^in seek 30\d{4}$/.test(last()) && Number(last().slice(8)) >= 300400, last());
+        assert.ok(logs.some((l) => /past the seek: ytdec again at/.test(l)));
+        tick(301000); tick(301300);
+        c.send({ cmd: 'seek', ms: 40000 }); // the new one read all of it: a plain seek (the fake ticks say 60 s in all)
+        await waitUntil(() => last() === 'in seek 40000');
+        assert.strictEqual(spawns(), 2, 'once');
+        await stopIdle();
+    });
+
+    await t('edge-of-fetch buffering without a seek: no new ytdec; a seek past what it knew at its start: a new one there', async () => {
+        fs.writeFileSync(ctl, ''); fs.writeFileSync(ytlog, ''); setMode('ok');
+        await fetchPlay('FFFFFFFFFS2');
+        await waitUntil(() => d.fetchedMs === 12000 && spawns() === 1);
+        tick(11500);
+        await c.waitFor((x) => x.ev === 'state' && x.buffering === true);
+        fs.writeFileSync(ctl, 'done');
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'playing' && x.buffering === false);
+        tick(12500); tick(13000);
+        await sleep(150);
+        assert.strictEqual(spawns(), 1);
+        c.send({ cmd: 'seek', ms: 30000 }); // fetched now, but this ytdec started with 12 s of it
+        await waitUntil(() => spawns() === 2 && last() === 'in seek 30000');
+        await stopIdle();
+    });
+
+    await t('head: plays audio.head.m4a on audio_head + 10 s video; audio_ready -> playFile(audio.m4a) on the same connection + setTime; head removed', async () => {
+        const id = 'FFFFFFFFFH1';
+        const pl = await headPlay(id, 'head');
+        assert.strictEqual(pl.buffering, false);
+        assert.strictEqual(called('playFile')[0].a.path, path.join(hdir(id), 'audio.head.m4a'));
+        await waitUntil(() => called('setTime').length === 1);
+        assert.deepStrictEqual(called('playFile').map((x) => path.basename(x.a.path)), ['audio.head.m4a', 'audio.m4a']);
+        assert.ok(called('setTime')[0].a.newTimeElapsed < 2000, JSON.stringify(called('setTime')[0].a));
+        assert.strictEqual(called('connect').length, 1, 'one connection');
+        assert.strictEqual(ours().length, 1);
+        assert.ok(!fs.existsSync(path.join(hdir(id), 'audio.head.m4a')), 'head removed after the switch');
+        assert.strictEqual(d.head, null);
+        assert.strictEqual(d.state, 'playing');
+        await stopIdle();
+    });
+
+    await t('head: total is the video\'s (meta), not the head file\'s; switch seeks to the extrapolated clock; stale times after it ignored', async () => {
+        const id = 'FFFFFFFFFH2';
+        await headPlay(id, 'hold');
+        c.clear();
+        tick(20000);
+        const tm = await c.waitFor((x) => x.ev === 'time');
+        assert.deepStrictEqual(tm, { ev: 'time', elapsed: 20000, total: 600000 });
+        await sleep(200);
+        fs.writeFileSync(ctl, 'full');
+        await waitUntil(() => called('setTime').length === 1);
+        const at = called('setTime')[0].a.newTimeElapsed;
+        assert.ok(at >= 20200 && at < 22000, 'clock extrapolated: ' + at);
+        assert.strictEqual(path.basename(called('playFile').slice(-1)[0].a.path), 'audio.m4a');
+        tick(300); // the restart's own time before the setTime landed
+        assert.ok(d.elapsed >= 20000, 'stale time ignored: ' + d.elapsed);
+        assert.ok(!ytdecLines().some((l) => / in clock 300 /.test(l)), 'ytdec never sees the restart at 0');
+        await stopIdle();
+    });
+
+    await t('head: the full file\'s PLAY during the switch still arms its end -> ended', async () => {
+        await headPlay('FFFFFFFFFH9', 'hold');
+        tick(20000);
+        slowPlayFile = 300;
+        fs.writeFileSync(ctl, 'done');
+        await waitUntil(() => called('playFile').length === 2);
+        subs.playerState('PLAYER_STATE_STOP'); // the head stops for the new file: ignored
+        subs.playerState('PLAYER_STATE_PLAY'); // the full file starts, before our setTime
+        await waitUntil(() => called('setTime').length === 1);
+        slowPlayFile = 0;
+        assert.strictEqual(d.state, 'playing');
+        subs.currentItemTime({ elapsed: 598000, total: 600000 });
+        subs.playerState('PLAYER_STATE_STOP');
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'ended');
+        assert.strictEqual(ours().length, 0);
+    });
+
+    await t('head runs out before audio.m4a: buffering, player paused, STOP at its end is not `ended`; audio_ready resumes there', async () => {
+        const id = 'FFFFFFFFFH3';
+        await headPlay(id, 'hold');
+        c.clear();
+        tick(58600); // within headMarginMs of the 60 s head
+        const b = await c.waitFor((x) => x.ev === 'state' && x.buffering === true);
+        assert.strictEqual(b.state, 'playing');
+        assert.deepStrictEqual(called('sendButtonEvent').map((x) => x.a.button), ['STOP']);
+        subs.playerState('PLAYER_STATE_STOP');
+        tick(59500);
+        await sleep(200);
+        assert.strictEqual(d.state, 'playing');
+        assert.strictEqual(d.elapsed, 58600);
+        assert.ok(!c.evs.some((x) => x.ev === 'state' && x.state === 'ended'));
+        assert.strictEqual(ours().length, 1);
+        assert.deepStrictEqual(ytdecIns(), ['in pause']);
+        fs.writeFileSync(ctl, 'done'); // all of it: past the 12 s of video fetched, buffering ends with the fetch
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'playing' && x.buffering === false);
+        // the stopped player ignores playFile on its connection (car, 2026-11-20): audio.m4a on a new one, set there after
+        // its first tick, and the ticks after that move the clock again
+        await waitUntil(() => called('playFile').length === 2);
+        assert.strictEqual(path.basename(called('playFile').slice(-1)[0].a.path), 'audio.m4a');
+        assert.deepStrictEqual(calls.filter((x) => x.m === 'connect' || x.m === 'disconnect').map((x) => x.m), ['connect', 'disconnect', 'connect'], 'released and connected again');
+        assert.strictEqual(called('setTime').length, 0, 'no setTime before the new file ticks');
+        tick(300);
+        await waitUntil(() => called('setTime').length === 1);
+        assert.deepStrictEqual(called('setTime').map((x) => x.a.newTimeElapsed), [58600]);
+        assert.deepStrictEqual(ytdecIns(), ['in pause', 'in seek 58600', 'in resume']);
+        c.clear();
+        tick(58700); tick(59900);
+        const tm = await c.waitFor((x) => x.ev === 'time');
+        assert.ok(tm.elapsed >= 58700, JSON.stringify(tm));
+        assert.strictEqual(d.elapsed, 59900);
+        await stopIdle();
+    });
+
+    await t('head runs out, audio.m4a then, video behind: the new file\'s ticks before its waiter move nothing (QJZ9TX, 0.4.7)', async () => {
+        // car log: "head -> full (waiting)", then "79000 fetched, past the seek: ytdec again at 0" and the place saved at 0
+        await headPlay('FFFFFFFFFHQ', 'hold');
+        await waitUntil(() => d.fetchedMs === 12000);
+        c.clear();
+        tick(58600);
+        await c.waitFor((x) => x.ev === 'state' && x.buffering === true);
+        subs.playerState('PLAYER_STATE_STOP');
+        const from = logs.length, again = () => logs.slice(from).filter((l) => /ytdec again at/.test(l));
+        slowPlayFile = 300;
+        try {
+            fs.writeFileSync(ctl, 'full'); // audio.m4a complete, the video still at 12 s
+            await waitUntil(() => called('playFile').length === 2);
+            tick(150); await sleep(20); tick(400);
+            assert.strictEqual(d.elapsed, 58600, 'place kept');
+            assert.deepStrictEqual(again(), [], 'no ytdec at 0');
+            d.fetchedMs = 79000; d.checkBuffering(); // the video now ahead of the place: no new ytdec while the file restarts
+            assert.deepStrictEqual(again(), [], 'no ytdec while replaying');
+            d.fetchedMs = 12000;
+            await waitUntil(() => d.tickWaiter);
+            tick(600);
+            await waitUntil(() => called('setTime').length === 1);
+            assert.deepStrictEqual(called('setTime').map((x) => x.a.newTimeElapsed), [58600]);
+            assert.ok(!c.evs.some((x) => x.ev === 'time' && x.elapsed < 1000), 'no time at 0 sent');
+            assert.deepStrictEqual(again(), [], 'still no ytdec at 0');
+            await waitUntil(() => d.replaying === null);
+            d.fetchedMs = 79000; d.checkBuffering(); // after the replay the clock extrapolates from the setTime, not the stop
+            const at = again().map((l) => Number(l.split('ytdec again at ')[1]));
+            assert.ok(at.length === 1 && at[0] >= 58600 && at[0] < 58900, 'ytdec at the place: ' + at);
+        } finally { slowPlayFile = 0; }
+        await stopIdle();
+    });
+
+    await t('preparing on the head: pct moves with the video lead', async () => {
+        c.clear();
+        await headPlay('FFFFFFFFFHA', 'head');
+        assert.deepStrictEqual(c.evs.filter((x) => x.ev === 'state' && x.state === 'preparing').map((x) => x.pct), [0, 35, 70, 94, 99]);
+        await stopIdle();
+    });
+
+    await t('seek past the head before audio.m4a: buffering, no setTime on the head; audio_ready -> playFile + setTime there', async () => {
+        const id = 'FFFFFFFFFH4';
+        await headPlay(id, 'hold');
+        c.clear();
+        c.send({ cmd: 'seek', ms: 300000 });
+        await c.waitFor((x) => x.ev === 'state' && x.buffering === true);
+        assert.strictEqual(called('setTime').length, 0);
+        assert.deepStrictEqual(called('sendButtonEvent').map((x) => x.a.button), ['STOP']);
+        c.send({ cmd: 'pause' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'paused');
+        c.send({ cmd: 'resume' }); // still waiting: playing + buffering, no PLAY
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'playing' && x.buffering === true);
+        assert.ok(!called('sendButtonEvent').some((x) => x.a.button === 'PLAY'));
+        fs.writeFileSync(ctl, 'done'); // all of it: past the 12 s of video fetched, buffering ends with the fetch
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'playing' && x.buffering === false);
+        await waitUntil(() => called('playFile').length === 2);
+        tick(300); // the new connection's first tick
+        await waitUntil(() => called('setTime').length === 1);
+        assert.deepStrictEqual(called('setTime').map((x) => x.a.newTimeElapsed), [300000]);
+        await waitUntil(() => ytdecIns().slice(-2).join() === 'in seek 300000,in resume');
+        await stopIdle();
+    });
+
+    await t('paused on the head when audio.m4a arrives: no switch until resume, which plays audio.m4a at that point', async () => {
+        const id = 'FFFFFFFFFH5';
+        await headPlay(id, 'hold');
+        tick(15000);
+        c.send({ cmd: 'pause' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'paused');
+        fs.writeFileSync(ctl, 'full');
+        await waitUntil(() => d.fullReady);
+        await sleep(100);
+        assert.strictEqual(called('playFile').length, 1);
+        tick(15000); // the paused head file's time: still the video's total, not the head's 60 s (car, 0.4.9: 1:04)
+        assert.strictEqual(d.total, 600000);
+        c.send({ cmd: 'resume' });
+        await waitUntil(() => called('setTime').length === 1, 5000);   // (no tick comes: resume's 3 s tick wait runs out first)
+        assert.strictEqual(path.basename(called('playFile').slice(-1)[0].a.path), 'audio.m4a');
+        assert.deepStrictEqual(called('setTime')[0].a, { newTimeElapsed: 15000 });
+        assert.ok(!called('sendButtonEvent').some((x) => x.a.button === 'PLAY'));
+        await stopIdle();
+    });
+
+    await t('paused on the head but the player plays on (car, 0.4.9): the clock holds, STOP again, then the audio goes; resume connects at the place', async () => {
+        await headPlay('FFFFFFFFFHB', 'hold');
+        tick(15000);
+        c.send({ cmd: 'pause' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'paused');
+        await waitUntil(() => called('sendButtonEvent').length === 1);
+        c.clear();
+        const stops = () => called('sendButtonEvent').filter((x) => x.a.button === 'STOP').length;
+        tick(16000);   // within 1.5 s of the STOP: it may still land
+        tick(17000);   // plays on, but a STOP just went (heldStopMs)
+        assert.strictEqual(stops(), 1);
+        assert.strictEqual(d.elapsed, 15000, 'the clock holds while paused');
+        d.heldStopAt = 0;
+        tick(18000);
+        assert.strictEqual(stops(), 2, 'STOP again');
+        assert.ok(logs.some((l) => /plays on at 18000 while paused at 15000: STOP again/.test(l)));
+        c.send({ cmd: 'seek', ms: 40000 });   // a seek while paused moves the place; the player's own times still say it plays on
+        await waitUntil(() => d.stoppedAt === 40000);
+        tick(19000);
+        assert.strictEqual(called('disconnect').length, 0, 'rate-limited');
+        d.heldStopAt = 0;
+        tick(20000);
+        await waitUntil(() => ours().length === 0);
+        assert.ok(logs.some((l) => /still plays at 20000 after a second STOP: audio released/.test(l)));
+        d.heldStopAt = 0;
+        tick(21000);
+        subs.playerState('PLAYER_STATE_STOP');   // (the head file running out meanwhile: still paused there)
+        await sleep(100);
+        assert.strictEqual(called('disconnect').length, 1, 'released once, then quiet');
+        assert.strictEqual(d.elapsed, 40000);
+        assert.strictEqual(d.state, 'paused');
+        assert.ok(!c.evs.some((x) => x.ev === 'time'), 'no time while paused: ' + JSON.stringify(c.evs.filter((x) => x.ev === 'time')));
+        c.send({ cmd: 'resume' });
+        await waitUntil(() => called('connect').length === 2);
+        tick(300);
+        await waitUntil(() => called('setTime').length === 1, 5000);
+        assert.deepStrictEqual(called('setTime')[0].a, { newTimeElapsed: 40000 });
+        assert.strictEqual(path.basename(called('playFile').slice(-1)[0].a.path), 'audio.head.m4a');
+        await stopIdle();
+    });
+
+    await t('a play starting past the head (its resume point): one `time` with the length while it waits for audio.m4a, a pause adds none', async () => {
+        await headPlay('FFFFFFFFFHT', 'hold');
+        d.cur.durationMs = 600000;
+        c.clear();
+        c.send({ cmd: 'seek', ms: 300000 });   // before the first tick: where the start goes, as a resume point does
+        await sleep(50);
+        tick(0);
+        await waitUntil(() => d.headWait);
+        await c.waitFor((x) => x.ev === 'time');
+        c.send({ cmd: 'pause' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'paused');
+        assert.deepStrictEqual(c.evs.filter((x) => x.ev === 'time').map((x) => [x.elapsed, x.total]), [[300000, 600000]]);
+        await stopIdle();
+    });
+
+    await t('paused, then a seek past the head (waiting for audio.m4a), the player playing on: STOP again there too', async () => {
+        await headPlay('FFFFFFFFFHC', 'hold');
+        tick(15000);
+        c.send({ cmd: 'pause' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'paused');
+        c.send({ cmd: 'seek', ms: 300000 });
+        await waitUntil(() => d.headWait);
+        const n = called('sendButtonEvent').length;
+        d.heldStopAt = 0;
+        tick(18000);
+        assert.strictEqual(called('sendButtonEvent').length, n + 1, 'STOP again');
+        assert.ok(d.headWait && d.state === 'paused');
+        await stopIdle();
+    });
+
+    await t('stop during the switch: release waits for the playFile, no setTime after, audio released', async () => {
+        const id = 'FFFFFFFFFH6';
+        await headPlay(id, 'hold');
+        tick(10000);
+        slowPlayFile = 400;
+        fs.writeFileSync(ctl, 'full');
+        await waitUntil(() => called('playFile').length === 2);
+        c.send({ cmd: 'stop' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'idle');
+        slowPlayFile = 0;
+        await sleep(300);
+        assert.strictEqual(called('setTime').length, 0);
+        assert.strictEqual(ours().length, 0);
+        const ms = calls.map((x) => x.m);
+        assert.ok(ms.lastIndexOf('playFile') < ms.indexOf('disconnect'), ms.join());
+    });
+
+    await t('a new play during the switch: the old switch does nothing more, the new video plays', async () => {
+        await headPlay('FFFFFFFFFH7', 'hold');
+        slowPlayFile = 300;
+        fs.writeFileSync(ctl, 'full');
+        await waitUntil(() => called('playFile').length === 2);
+        c.clear();
+        c.send({ cmd: 'play', id: 'DemoVideo01', rect: '1280x720' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'playing' && x.id === 'DemoVideo01', 4000);
+        slowPlayFile = 0;
+        await sleep(300);
+        assert.strictEqual(called('setTime').length, 0);
+        assert.strictEqual(ours().length, 1);
+        assert.strictEqual(called('playFile').slice(-1)[0].a.path, path.join(cache, 'DemoVideo01', 'audio.m4a'));
+        await stopIdle();
+    });
+
+    await t('fetcher dies while only the head is there (and twice again): error state, audio released', async () => {
+        await headPlay('FFFFFFFFFH8', 'hold');
+        fs.writeFileSync(ctl, 'dead');
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'error', 4000);
+        await c.waitFor((x) => x.ev === 'error' && x.msg === 'fetch: HTTP 403');
+        assert.strictEqual(ours().length, 0);
+    });
+
+    // ---- account and feeds
+    const authEv = (st) => (x) => x.ev === 'auth' && x.state === st;
+    const readAcct = () => JSON.parse(fs.readFileSync(acct, 'utf8'));
+    const ok = (o) => ({ status: 200, body: JSON.stringify(o) });
+
+    await t('zoom while playing: ytdec again with the other mode at the clock, no error; same mode does nothing', async () => {
+        await sleep(300); fs.writeFileSync(ytlog, ''); setMode('ok');
+        await playing();
+        await waitUntil(() => ytdecLines().some((l) => / argv /.test(l)));
+        tick(4000);
+        c.send({ cmd: 'fill', on: true });
+        await waitUntil(() => ytdecLines().filter((l) => / argv /.test(l)).length === 2 && ytdecLines().some((l) => / in seek /.test(l)));
+        const argv = ytdecLines().filter((l) => / argv /.test(l));
+        assert.ok(!/--fill/.test(argv[0]) && /--rect 1280x720 --fill /.test(argv[1]), argv.join('\n'));
+        // the seek reaches the fake's log a moment after its argv line (it raced, now and then): wait for it, then check where
+        await waitUntil(() => ytdecLines().filter((l) => / in seek /.test(l)).length > 0);
+        assert.ok(ytdecLines().some((l) => / in seek 40\d\d$/.test(l)), 'at the clock');
+        c.send({ cmd: 'fill', on: true });
+        await sleep(300);
+        assert.strictEqual(ytdecLines().filter((l) => / argv /.test(l)).length, 2);
+        assert.ok(!c.evs.some((x) => x.ev === 'error'));
+        c.send({ cmd: 'stop' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'idle');
+    });
+
+    await t('quality while playing: fetched again at that height; same height: nothing', async () => {
+        fs.writeFileSync(ctl, ''); setMode('ok');
+        const id = 'FFFFFFFFFF7';
+        await fetchPlay(id);
+        c.send({ cmd: 'quality', quality: '720' });            // auto is 720 here
+        await sleep(300);
+        assert.ok(!c.evs.some((x) => x.ev === 'state' && x.state === 'preparing' && c.evs.indexOf(x) > c.evs.findIndex((y) => y.state === 'playing')));
+        c.clear();
+        c.send({ cmd: 'quality', quality: '480' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'playing', 4000);
+        assert.deepStrictEqual(fetchLog().argv.slice(1, 5), ['fetch', '--cache-dir', path.join(cache, 'ytdlp'), '--height'].slice(0, 4));
+        assert.strictEqual(fetchLog().argv[fetchLog().argv.indexOf('--height') + 1], '480');
+        c.send({ cmd: 'stop' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'idle');
+    });
+
+    await t('auth_status with no account: signed out', async () => {
+        c.clear();
+        c.send({ cmd: 'auth_status' });
+        await c.waitFor(authEv('signed_out'));
+    });
+
+    await t('auth: creds from the base script, device code, polled until signed in; account 0600 in a dir others cannot list', async () => {
+        c.clear(); yt.calls.length = 0;
+        let polls = 0;
+        yt.token = (b) => (++polls < 3 ? { error: 'authorization_pending' } : { access_token: 'ACCESS-1', refresh_token: 'REFRESH-1', expires_in: 72000 });
+        c.send({ cmd: 'auth' });
+        const e = await c.waitFor(authEv('code'));
+        assert.strictEqual(e.code, 'ABC-DEF-GHI');
+        assert.strictEqual(e.url, 'https://www.google.com/device');
+        assert.ok(e.expires > 1700 && e.expires <= 1800, String(e.expires));
+        const dc = ytCalls('/device/code')[0].body;
+        assert.strictEqual(dc.client_id, '123-abc.apps.googleusercontent.com');
+        assert.ok(/^[0-9a-f]{32}$/.test(dc.device_id) && dc.device_model === 'ytlr::' && /gdata\.youtube\.com/.test(dc.scope));
+        c.send({ cmd: 'auth' }); // again while the code is shown: the same code, no second device flow
+        await c.waitFor((x) => x.ev === 'auth' && x.state === 'code' && c.evs.filter(authEv('code')).length === 2);
+        await c.waitFor(authEv('signed_in'), 3000);
+        assert.strictEqual(ytCalls('/device/code').length, 1);
+        assert.deepStrictEqual(ytCalls('/oauth2/token')[0].body, { client_id: '123-abc.apps.googleusercontent.com', client_secret: 'SeCrEt-1', code: 'DEV-CODE-XYZ', grant_type: 'http://oauth.net/grant_type/device/1.0' });
+        assert.strictEqual(fs.statSync(acct).mode & 0o777, 0o600);
+        assert.strictEqual(fs.statSync(path.dirname(acct)).mode & 0o077, 0, 'state dir stays 0700');
+        const a = readAcct();
+        assert.ok(a.access === 'ACCESS-1' && a.refresh === 'REFRESH-1' && a.exp > Date.now() + 71000e3);
+        assert.ok(!fs.existsSync(acct + '.tmp'));
+        c.send({ cmd: 'auth_status' });
+        await c.waitFor((x) => authEv('signed_in')(x) && c.evs.filter(authEv('signed_in')).length === 2);
+    });
+
+    await t('feed subs: TVHTML5 browse with the token; video tiles and shorts (short:true), each once, channel and length, LIVE in the length: live:true', async () => {
+        c.clear(); yt.calls.length = 0;
+        yt.browse = (h, b) => ok(BROWSE);
+        c.send({ cmd: 'feed', which: 'subs' });
+        const e = await c.waitFor((x) => x.ev === 'feed');
+        const v1 = { id: 'VVVVVVVVVV1', title: 'First', channel: 'Chan A', duration_s: 2390, meta: ['1K views'] };
+        const v2 = { id: 'VVVVVVVVVV2', title: 'Second', channel: 'Chan C', duration_s: 3723, meta: ['1K views'] };
+        const v3 = { id: 'VVVVVVVVVV3', title: 'Live', channel: 'Chan D', duration_s: null, meta: ['1K views'], live: true };
+        const s1 = { id: 'SSSSSSSSSS1', title: 'A short', channel: 'Chan B', duration_s: null, meta: ['1K views'], short: true };
+        assert.deepStrictEqual(e, { ev: 'feed', which: 'subs', items: [v1, s1, v2, v3],
+            shelves: [{ title: '', items: [v1, s1] }, { title: '', items: [v2, v1, v3] }] });
+        const b = ytCalls('/browse')[0];
+        assert.strictEqual(b.headers.Authorization, 'Bearer ACCESS-1');
+        assert.strictEqual(b.body.browseId, 'FEsubscriptions');
+        assert.strictEqual(b.body.context.client.clientName, 'TVHTML5');
+        assert.strictEqual(ytCalls('/oauth2/token').length, 0, 'no refresh with 20 h left');
+        c.send({ cmd: 'feed', which: 'wl' });
+        await c.waitFor((x) => x.ev === 'feed' && x.which === 'wl');
+        assert.strictEqual(ytCalls('/browse')[1].body.browseId, 'VLWL');
+        c.send({ cmd: 'feed', which: 'nope' });
+        await c.waitFor((x) => x.ev === 'feed' && x.which === 'nope' && x.error === 'unknown feed');
+        c.send({ cmd: 'search', q: 'bunny' });
+        await c.waitFor((x) => x.ev === 'results');
+        assert.strictEqual(ytCalls('/youtubei/v1/search')[0].headers.Authorization, 'Bearer ACCESS-1', 'signed in: searched with the token');
+    });
+
+    await t('token with < 5 min left refreshed before the browse; a 401 forces one more refresh', async () => {
+        const a = readAcct(); a.exp = Date.now() + 60000; fs.writeFileSync(acct, JSON.stringify(a), { mode: 0o600 });
+        c.clear(); yt.calls.length = 0;
+        let n = 1;
+        yt.token = (b) => { assert.deepStrictEqual(b, { client_id: '123-abc.apps.googleusercontent.com', client_secret: 'SeCrEt-1', refresh_token: 'REFRESH-1', grant_type: 'refresh_token' }); return { access_token: 'ACCESS-' + (++n), expires_in: 3600 }; };
+        yt.browse = (h) => (h.Authorization === 'Bearer ACCESS-2' ? { status: 401, body: '{}' } : ok(BROWSE));
+        c.send({ cmd: 'feed', which: 'home' });
+        const e = await c.waitFor((x) => x.ev === 'feed');
+        assert.strictEqual(e.items.length, 4, JSON.stringify(e));
+        assert.deepStrictEqual(ytCalls('/browse').map((x) => x.headers.Authorization), ['Bearer ACCESS-2', 'Bearer ACCESS-3']);
+        assert.strictEqual(ytCalls('/browse')[0].body.browseId, 'FEwhat_to_watch');
+        const a2 = readAcct();
+        assert.ok(a2.access === 'ACCESS-3' && a2.refresh === 'REFRESH-1' && a2.exp > Date.now() + 3500e3);
+        assert.strictEqual(fs.statSync(acct).mode & 0o777, 0o600);
+    });
+
+    await t('youtube offline: feed error, still signed in', async () => {
+        c.clear();
+        yt.browse = () => Promise.reject(new Error('ENETUNREACH'));
+        c.send({ cmd: 'feed', which: 'subs' });
+        await c.waitFor((x) => x.ev === 'feed' && x.error === 'feed offline');
+        assert.ok(fs.existsSync(acct));
+    });
+
+    await t('refresh answered invalid_grant: signed out, account gone, the feed says so', async () => {
+        const a = readAcct(); a.exp = Date.now() - 1000; fs.writeFileSync(acct, JSON.stringify(a), { mode: 0o600 });
+        c.clear();
+        yt.token = () => ({ error: 'invalid_grant' });
+        c.send({ cmd: 'feed', which: 'subs' });
+        await c.waitFor(authEv('signed_out'));
+        await c.waitFor((x) => x.ev === 'feed' && x.error === 'signed out');
+        assert.ok(!fs.existsSync(acct));
+    });
+
+    await t('sign_out deletes the account; a code left to expire -> signed out; no creds -> auth error', async () => {
+        fs.writeFileSync(acct, JSON.stringify({ cid: 'x', sec: 'y', access: 'ACCESS-1', refresh: 'REFRESH-1', exp: Date.now() + 1e7 }), { mode: 0o600 });
+        c.clear();
+        c.send({ cmd: 'sign_out' });
+        await c.waitFor(authEv('signed_out'));
+        assert.ok(!fs.existsSync(acct));
+        c.clear(); yt.inline = true; yt.expiresIn = 0.15;
+        yt.token = () => ({ error: 'authorization_pending' });
+        c.send({ cmd: 'auth' });
+        await c.waitFor(authEv('code'));
+        await c.waitFor(authEv('signed_out'), 2000);
+        c.clear(); yt.creds = false; d.account.cred = null; // a fresh process: the page has no client id
+        c.send({ cmd: 'auth' });
+        const e = await c.waitFor(authEv('error'));
+        assert.ok(/no client id/.test(e.msg));
+        yt.creds = undefined; yt.inline = false; yt.expiresIn = 1800;
+    });
+
+    await t('feed: prototype names are unknown feeds; asks while one is in flight share its browse', async () => {
+        fs.writeFileSync(acct, JSON.stringify({ cid: 'x', sec: 'y', access: 'ACCESS-1', refresh: 'REFRESH-1', exp: Date.now() + 1e7 }), { mode: 0o600 });
+        c.clear(); yt.calls.length = 0;
+        ['constructor', 'toString', '__proto__', 'hasOwnProperty'].forEach((w) => c.send({ cmd: 'feed', which: w }));
+        await c.waitFor(() => c.evs.filter((x) => x.ev === 'feed' && x.error === 'unknown feed').length === 4);
+        assert.strictEqual(ytCalls('/browse').length, 0);
+        yt.slow = { '/browse': 200 }; yt.browse = () => ok(BROWSE);
+        for (let i = 0; i < 5; i++) c.send({ cmd: 'feed', which: 'subs' });
+        await c.waitFor((x) => x.ev === 'feed' && x.which === 'subs' && x.items);
+        await sleep(300);
+        assert.strictEqual(ytCalls('/browse').length, 1, 'one browse for five asks');
+        c.send({ cmd: 'feed', which: 'subs' });
+        await c.waitFor(() => ytCalls('/browse').length === 2, 2000);
+        yt.slow = null;
+    });
+
+    await t('sign_out while a refresh is in flight: the new token is not written back', async () => {
+        fs.writeFileSync(acct, JSON.stringify({ cid: 'x', sec: 'y', access: 'ACCESS-1', refresh: 'REFRESH-1', exp: Date.now() - 1000 }), { mode: 0o600 });
+        c.clear(); yt.calls.length = 0;
+        yt.slow = { '/oauth2/token': 200 }; yt.token = () => ({ access_token: 'ACCESS-2', expires_in: 3600 });
+        c.send({ cmd: 'feed', which: 'home' });
+        await waitUntil(() => ytCalls('/oauth2/token').length === 1);
+        c.send({ cmd: 'sign_out' });
+        await c.waitFor(authEv('signed_out'));
+        await c.waitFor((x) => x.ev === 'feed' && x.error === 'signed out', 2000);
+        await sleep(100);
+        assert.ok(!fs.existsSync(acct), 'still signed out');
+        assert.strictEqual(ytCalls('/browse').length, 0);
+        yt.slow = null;
+    });
+
+    await t('sign_out during the device-code request: no code, no polling', async () => {
+        c.clear(); yt.calls.length = 0;
+        yt.slow = { '/device/code': 200 }; yt.token = () => ({ error: 'authorization_pending' });
+        c.send({ cmd: 'auth' });
+        await waitUntil(() => ytCalls('/device/code').length === 1);
+        c.send({ cmd: 'sign_out' });
+        await sleep(400);
+        assert.strictEqual(c.evs.filter(authEv('code')).length, 0, JSON.stringify(c.evs));
+        assert.strictEqual(d.account.pending, null);
+        assert.strictEqual(ytCalls('/oauth2/token').length, 0, 'no poll');
+        yt.slow = null;
+    });
+
+    await t('sign_out while a poll is offline: not re-armed', async () => {
+        c.clear(); yt.calls.length = 0;
+        yt.slow = { '/oauth2/token': 150 }; yt.token = () => { throw new Error('ENETUNREACH'); };
+        c.send({ cmd: 'auth' });
+        await c.waitFor(authEv('code'));
+        await waitUntil(() => ytCalls('/oauth2/token').length === 1);
+        c.send({ cmd: 'sign_out' });
+        await sleep(500);
+        assert.strictEqual(ytCalls('/oauth2/token').length, 1, 'no poll after the sign-out');
+        yt.slow = null;
+    });
+
+    await t('client id/secret scraped once a process; scraped again once when the device code is refused', async () => {
+        c.clear(); yt.calls.length = 0;
+        yt.token = () => ({ error: 'authorization_pending' });
+        c.send({ cmd: 'auth' });
+        await c.waitFor(authEv('code'));
+        assert.strictEqual(ytCalls('/tv').length, 0, 'cached: no scrape');
+        c.send({ cmd: 'sign_out' }); await c.waitFor(authEv('signed_out'));
+        c.clear(); yt.calls.length = 0; yt.refuse = 1;
+        c.send({ cmd: 'auth' });
+        await c.waitFor(authEv('code'));
+        assert.strictEqual(ytCalls('/tv').length, 1, 'refused: one scrape');
+        assert.strictEqual(ytCalls('/device/code').length, 2);
+        c.send({ cmd: 'sign_out' }); await c.waitFor(authEv('signed_out'));
+        c.clear(); yt.calls.length = 0; yt.refuse = 2;
+        c.send({ cmd: 'auth' });
+        const e = await c.waitFor(authEv('error'));
+        assert.ok(/refused/.test(e.msg) && ytCalls('/tv').length === 1 && ytCalls('/device/code').length === 2, 'refused twice: an error, no loop');
+        yt.refuse = 0;
+    });
+
+    // ---- the fetch uid and the fetch helper
+    const fsRoot = path.join(tmp, 'uidfs');
+    const mkdirs = mkdirp;
+    const put = (f, text) => { mkdirs(path.dirname(f)); fs.writeFileSync(f, text); };
+    const rejects = (p, re) => p.then(() => { throw new Error('resolved, expected ' + re); }, (e) => assert.ok(re.test(e.message), e.message)); // (Node 8: no assert.rejects)
+    const uo = { stateDir: path.join(fsRoot, 'var/opt/jap-ridetube-d/state'), etcDir: path.join(fsRoot, 'etc'), oapRoot: path.join(fsRoot, 'oap'),
+        toolRoot: path.join(fsRoot, 'var/opt'), procDir: path.join(fsRoot, 'proc'), log: (m) => logs.push(m),
+        mainapps: [{ root: path.join(fsRoot, 'mainapp'), hmi: 'HmiMain3D' }, { root: path.join(fsRoot, 'mainapp21'), hmi: 'Hmi8' }] };
+
+    await t('fetch uid: none without MainApp\'s ranges; then the lowest free above them, written for the uplink', async () => {
+        assert.strictEqual(pickFetchUid(uo), null);
+        assert.ok(logs.some((l) => /internet uid: none: MainApp/.test(l)));
+        assert.ok(!fs.existsSync(path.join(uo.stateDir, 'internet-uids')));
+        put(path.join(fsRoot, 'mainapp/config/base.json'), JSON.stringify({ usableUidsAndGids: { min: 10000, max: 12499 },
+            usableUidsAndGidsRse: { rse1: { min: 12600, max: 12700 } }, mainAppUids: [12701] }));
+        put(path.join(fsRoot, 'etc/passwd'), 'root:x:0:0::/root:/bin/sh\nfoo:x:12702:12703::/:/bin/false\n');
+        put(path.join(fsRoot, 'etc/group'), 'root:x:0:\nbar:x:12704:\n');
+        mkdirs(path.join(fsRoot, 'oap/oap_12705'));
+        put(path.join(fsRoot, 'oap/oap_12201/data/apps/x.json'), JSON.stringify({ userId: 12706 }));
+        put(path.join(fsRoot, 'oap/oap_12201/security/uids.txt'), '12707=some.app\n');
+        put(path.join(fsRoot, 'var/opt/mgu-uplink/uids.d/mgu-updater'), '12708\n');
+        put(path.join(fsRoot, 'var/opt/mgu-uplink/uids.d/iteriodev-tailscale'), '3910 12709 # two\n');
+        put(path.join(fsRoot, 'var/opt/mgu-uplink/uids.d/jap-ridetube-d'), '12710\n');              // our own: not taken
+        mkdirs(path.join(fsRoot, 'var/opt/mgu-uplink/current'));
+        put(path.join(fsRoot, 'var/opt/mgu-updater/state/uids.json'), JSON.stringify({ build: 12711, fetch: 12712, web: 12713 }));
+        put(path.join(fsRoot, 'proc/77/status'), 'Name:\tx\nUid:\t12714\t12714\t12714\t12714\nGid:\t12715\t12715\t12715\t12715\n');
+        assert.strictEqual(pickFetchUid(uo), 12710, 'every lower one is taken; our own drop-in is not');
+        const rd = (f) => fs.readFileSync(path.join(fsRoot, f), 'utf8');
+        assert.strictEqual(rd('var/opt/jap-ridetube-d/state/internet-uids'), '12710\n');
+        assert.deepStrictEqual(JSON.parse(rd('var/opt/jap-ridetube-d/state/uids.json')), { fetch: 12710 });
+        assert.strictEqual(rd('var/opt/mgu-uplink/uids.d/jap-ridetube-d'), '12710\n');
+        assert.strictEqual(fs.statSync(uo.stateDir).mode & 0o777, 0o700);
+    });
+
+    await t('fetch uid: kept while free (its own processes do not count); taken since -> picked again; two MainApps: the running one', async () => {
+        put(path.join(fsRoot, 'proc/78/status'), 'Uid:\t12710\t12710\t12710\t12710\n');     // our helper running
+        assert.strictEqual(pickFetchUid(uo), 12710, 'kept');
+        fs.appendFileSync(path.join(fsRoot, 'etc/passwd'), 'new:x:12710:12710::/:/bin/false\n');
+        assert.strictEqual(pickFetchUid(uo), 12716, 'taken: the next free (12714/15 run, 12710 in passwd)');
+        assert.strictEqual(fs.readFileSync(path.join(fsRoot, 'var/opt/mgu-uplink/uids.d/jap-ridetube-d'), 'utf8'), '12716\n');
+        put(path.join(fsRoot, 'mainapp21/config/base.json'), JSON.stringify({ usableUidsAndGids: { min: 20000, max: 29999 } }));
+        fs.unlinkSync(path.join(uo.stateDir, 'uids.json'));
+        assert.strictEqual(pickFetchUid(uo), null, 'two configs, neither HMI running: unknown');
+        put(path.join(fsRoot, 'proc/90/comm'), 'Hmi8\n');
+        assert.strictEqual(pickFetchUid(uo), 30000, "iDrive 8's MainApp runs: above its range");
+    });
+
+    const fakeFetch = path.join(__dirname, 'fake_fetch.js');
+    // as root (Docker): a real switch to a uid nothing has; else no switch (only root can)
+    const root = process.getuid() === 0, me = root ? 12345 : process.getuid();
+    const flogDir = path.join(tmp, 'flog');
+    fs.mkdirSync(flogDir); fs.chmodSync(flogDir, 0o777); fs.chmodSync(tmp, 0o711);
+    const flog = path.join(flogDir, 'fetch.log');
+    const fo = (mode) => ({ noSetuid: !root, childEnv: {}, fetchCmd: [process.execPath, fakeFetch, flog, mode] });
+    const req = { method: 'POST', url: 'https://www.youtube.com/o/oauth2/token', headers: { Authorization: 'Bearer ACCESS-1' },
+        body: { client_secret: 'SeCrEt-1', refresh_token: 'REFRESH-1' }, timeoutMs: 300 };
+
+    await t('fetch helper: spawned as the uid, the request (secrets) on stdin only, the answer from stdout', async () => {
+        const r = await fetchRequest(fo('ok'), me, req);
+        assert.deepStrictEqual(r, { status: 200, body: 'hello' });
+        const l = JSON.parse(fs.readFileSync(flog, 'utf8'));
+        assert.deepStrictEqual(l.req, req);
+        assert.strictEqual(l.uid, me, root ? 'switched to the fetch uid' : 'own uid (not root)');
+        const argv = l.argv.join(' ');
+        SECRETS.concat(['Bearer']).forEach((x) => assert.ok(argv.indexOf(x) < 0, x + ' in argv'));
+        assert.ok(l.env.every((k) => !/SECRET|TOKEN/i.test(k)) && l.env.length < 5, 'an empty env: ' + l.env);
+        await rejects(fetchRequest(fo('error'), me, req), /ENETUNREACH/);
+    });
+
+    await t('fetch helper: no answer by the timeout -> killed, rejected', async () => {
+        const t0 = Date.now();
+        await rejects(fetchRequest(fo('hang'), me, req), /timeout/);
+        assert.ok(Date.now() - t0 < 2500);
+        const pid = JSON.parse(fs.readFileSync(flog, 'utf8')).pid;
+        await sleep(100);
+        assert.throws(() => process.kill(pid, 0), 'the helper is gone');
+    });
+
+    await t('the real helper (ytd.js --fetch): a request it cannot make comes back as an error', async () => {
+        const o = { noSetuid: !root, childEnv: {}, fetchCmd: [process.execPath, '--max-http-header-size=65536', path.join(__dirname, '..', 'ytd.js'), '--fetch'] };
+        await rejects(fetchRequest(o, me, { method: 'GET', url: 'https://127.0.0.1:1/', headers: null, body: null, timeoutMs: 3000 }), /ECONNREFUSED/);
+    });
+
+    await t('daemon without a fetch uid: sign-in and feeds say so, nothing spawned, no crash', async () => {
+        const evs = [];
+        const d2 = new Daemon({ someip: someip, srcGen: srcGen, cacheDir: cache, logDir: tmp, sock: path.join(tmp, 'ctl3.sock'),
+            accountFile: path.join(tmp, 'acct2.json'), stateDir: path.join(tmp, 'st2'), etcDir: uo.etcDir, oapRoot: uo.oapRoot,
+            toolRoot: path.join(tmp, 'none'), procDir: uo.procDir, mainapps: [], fetchCmd: [process.execPath, fakeFetch, flog, 'ok'], log: (m) => logs.push(m) });
+        d2.emit = (o) => evs.push(o);
+        try { fs.unlinkSync(flog); } catch (e) { /* none */ }
+        await d2.account.start();
+        assert.deepStrictEqual(evs.pop(), { ev: 'auth', state: 'error', msg: 'no internet uid on the car (see the log)' });
+        fs.writeFileSync(path.join(tmp, 'acct2.json'), JSON.stringify({ cid: 'x', sec: 'y', access: 'A', refresh: 'R', exp: Date.now() + 1e7 }));
+        await d2.account.feed('subs');
+        assert.deepStrictEqual(evs.pop(), { ev: 'feed', which: 'subs', error: 'no internet uid on the car (see the log)' });
+        assert.ok(!fs.existsSync(flog), 'nothing spawned');
+    });
+
+    await t('the service version is component.json\'s', async () => {
+        assert.strictEqual(VERSION, JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'component.json'), 'utf8')).version);
+    });
+
+    await t('every log line (daemon, Account, Audio) is kept in the ring; send_logs answers on the socket', async () => {
+        ['sign-in: ', 'connect {', 'listening on '].forEach((x) => assert.ok(d.ring.some((l) => l.indexOf(x) > 0), x + ' (Account, Audio, the daemon) not in the ring: ' + d.ring.length));
+        assert.ok(d.ring.every((l) => /^\d{4}-\d\d-\d\dT[\d:.]+Z /.test(l)) && d.ring.length <= 1500);
+        c.clear();
+        c.send({ cmd: 'send_logs', app: '0.3.12' });   // (the fake youtube.com answers 404: the relay is not there)
+        assert.deepStrictEqual(await c.waitFor((x) => /^logs_/.test(x.ev)), { ev: 'logs_error', msg: 'failed' });
+    });
+
+    // ---- send_logs through the real fetch helper to a fake relay on 127.0.0.1 (MGU_YT_REPORT_URL)
+    const relay = { mode: 200, got: [], delay: 0 };
+    const srv = require('http').createServer((req, res) => {
+        let b = '';
+        req.on('data', (x) => { b += x; });
+        req.on('end', () => {
+            relay.got.push({ url: req.url, method: req.method, type: req.headers['content-type'], body: JSON.parse(b) });
+            if (relay.mode === 'hang') return;
+            setTimeout(() => {
+                const ans = { 200: { id: 'ABC123' }, 410: { error: 'closed' }, 429: { error: 'busy' }, 413: { error: 'too big' }, 500: { error: 'x' }, bad: { id: '<b>no</b>' } };
+                res.writeHead(relay.mode === 'bad' ? 200 : relay.mode, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify(ans[relay.mode]));
+            }, relay.delay);
+        });
+    });
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    const rdir = path.join(tmp, 'report'), rcache = path.join(rdir, 'cache'), rstate = path.join(rdir, 'state'), retc = path.join(rdir, 'etc');
+    [rdir, rcache, rstate, retc].forEach((x) => fs.mkdirSync(x));
+    const FAKE = { cid: '777-fakeclient.apps.googleusercontent.com', sec: 'FaKeSeCrEt99', access: 'ya29.FAKE-ACCESS-TOKEN', refresh: '1//FAKEREFRESHTOKEN0123456789abcd', exp: 1999999999123 };
+    fs.writeFileSync(path.join(rstate, 'account.json'), JSON.stringify(FAKE));
+    fs.writeFileSync(path.join(retc, 'os-release'), ['NAME="MGU"', 'VERSION="22w45"', 'ID=mgu', 'A=1', 'B=2', 'C=3', 'D=4'].join('\n'));
+    const kdir = path.join(rcache, 'KnownVid001');
+    fs.mkdirSync(kdir);
+    fs.writeFileSync(path.join(kdir, 'meta.json'), JSON.stringify({ id: 'KnownVid001', title: 'My Secret Holiday Video', channel: 'Private Channel Name', duration_s: 60 }));
+    fs.writeFileSync(path.join(rcache, 'positions.json'), JSON.stringify({ PosVideo002: { ms: 1, total: 9, title: 'Another Watched Title', channel: 'Some Other Channel', at: 1 } }));
+    fs.writeFileSync(path.join(rdir, 'ytdec.log'), Array.from({ length: 400 }, (_, i) => 'ytdec line ' + i + ' dir=' + rcache + '/KnownVid001').join('\n') + '\n');
+    process.env.MGU_YT_REPORT_URL = 'http://127.0.0.1:' + srv.address().port;
+    const rlogs = [], revs = [];
+    const dr = new Daemon({ someip: someip, srcGen: srcGen, cacheDir: rcache, logDir: rdir, stateDir: rstate, accountFile: path.join(rstate, 'account.json'),
+        etcDir: retc, noSetuid: !root, fetchCmd: [process.execPath, path.join(__dirname, '..', 'ytd.js'), '--fetch'], reportTimeoutMs: 400, log: (m) => rlogs.push(m) });
+    delete process.env.MGU_YT_REPORT_URL;
+    dr.fetchUid = me;
+    dr.emit = (o) => revs.push(o);
+    const send = async () => { revs.length = 0; await dr.sendLogs('0.3.12'); return revs.pop(); };
+    dr.account.pending = { cid: 'PendingClientId.apps', sec: 'PendingSecret42', device: 'DEVICE-CODE-777', code: 'USR-CDE-XYZ', timer: null };
+    dr.onLine(JSON.stringify({ cmd: 'prefetch', id: 'SeenThumb03' }));      // an id the app sent (spare off: nothing runs)
+    dr.onLine(JSON.stringify({ cmd: 'playlist', id: 'PLseenplaylist0042' }));
+    [
+        'sign-in: odd answer ' + FAKE.sec + ' / ' + FAKE.access + ' / ' + FAKE.refresh + ' / ' + FAKE.cid + ' exp ' + FAKE.exp,
+        'sign-in poll: client_secret=PendingSecret42 device DEVICE-CODE-777 code USR-CDE-XYZ for PendingClientId.apps',
+        'fetch KnownVid001: ERROR: [youtube] KnownVid001: Video unavailable',
+        'ytfetch: GET https://rr3---sn-abc.googlevideo.com/videoplayback?ip=81.82.83.84&sig=XYZ&id=o-AB',
+        "ytfetch: HTTPSConnectionPool(host='rr3---sn-abc.googlevideo.com', port=443): Max retries exceeded with url: /videoplayback?expire=1&ip=2a02%3A1810%3Aabcd%3A%3A1&sig=QQQ (Caused by timeout)",
+        'ytfetch: odd ip=81.82.83.85 alone',
+        'thumb UnknownId04: timeout', 'lru removed UnknownId05,KnownVid001', 'ytdec --dir ' + rcache + '/UnknownId06 --rect 1280x720',
+        'ytfetch: [youtube] UnknownId07: Downloading webpage', 'playlist list=PLsecretplaylist123 and PLseenplaylist0042', 'positions PosVideo002 SeenThumb03',
+        'meta My Secret Holiday Video by Private Channel Name; Another Watched Title', 'channel UCabcdefghijklmnopqrstuv', 'mail someone.private@example.com',
+        'vin WBA12345678901234', 'uplink 81.82.83.84 via 192.168.1.1, 10.0.0.2, 172.20.1.1, 127.0.0.1, 8.8.4.4 and 2a02:1810:abcd::1',
+        'hdr Authorization: Bearer abc.def-ghi and access_token=zzz123456&x=1', 'Cookie: SAPISID=abc; YSC=def',
+        'playback error {"code":3,"path":"' + rcache + '/UnknownId08/audio.m4a"}',
+        'internet uid: 30000', 'audio: head -> full at 1234 (waiting)', 'clientVersion 7.20251101.10.00'
+    ].forEach((l) => dr.log(l));
+
+    await t('send_logs: one POST to MGU_YT_REPORT_URL/v1/report as the fetch helper -> logs_sent with the relay\'s id', async () => {
+        assert.strictEqual(dr.opts.reportUrl, 'http://127.0.0.1:' + srv.address().port, 'the env override');
+        assert.strictEqual(new Daemon({ reportUrl: 'https://x.example' }).opts.reportUrl, 'https://x.example', 'the option wins');
+        assert.strictEqual(new Daemon({}).opts.reportUrl, REPORT_URL, 'else the constant');
+        assert.deepStrictEqual(await send(), { ev: 'logs_sent', id: 'ABC123' });
+        const g = relay.got.pop();
+        assert.deepStrictEqual([g.method, g.url, g.type], ['POST', '/v1/report', 'application/json']);
+        assert.deepStrictEqual([g.body.app, g.body.service], ['0.3.12', VERSION]);
+        assert.strictEqual(g.body.os, 'NAME="MGU"\nVERSION="22w45"\nID=mgu\nA=1\nB=2', 'the first 5 lines of os-release');
+        const ytl = g.body.log.split('\n').filter((l) => /^ytdec line/.test(l));
+        assert.deepStrictEqual([ytl.length, ytl[0].split(' dir=')[0], ytl[299].split(' dir=')[0]], [300, 'ytdec line 100', 'ytdec line 399'], 'ytdec.log: its last 300 lines');
+        relay.last = g.body.log;
+    });
+
+    await t('send_logs redaction: account values, ids (tagged, one tag per id in a report), titles, URLs, IPs, e-mail, VIN, tokens', async () => {
+        const log = relay.last;
+        [FAKE.cid, FAKE.sec, FAKE.access, FAKE.refresh, String(FAKE.exp), 'FAKE-ACCESS', 'FAKEREFRESH', 'PendingSecret42', 'DEVICE-CODE-777', 'USR-CDE-XYZ', 'PendingClientId',
+            'KnownVid001', 'PosVideo002', 'SeenThumb03', 'UnknownId04', 'UnknownId05', 'UnknownId06', 'UnknownId07', 'UnknownId08', 'PLsecretplaylist123', 'PLseenplaylist0042',
+            'UCabcdefghijklmnopqrstuv', 'My Secret Holiday Video', 'Private Channel Name', 'Another Watched Title', 'someone.private', 'example.com', 'WBA12345678901234',
+            '81.82.83.84', '81.82.83.85', '8.8.4.4', '2a02:1810', '2a02%3A', 'expire=', 'sig=QQQ', 'videoplayback', 'sig=XYZ', 'abc.def-ghi', 'zzz123456', 'SAPISID=abc', 'YSC=def']
+            .forEach((x) => assert.ok(log.indexOf(x) < 0, x + ' left in:\n' + log.split('\n').filter((l) => l.indexOf(x) >= 0).join('\n')));
+        Object.keys(FAKE).forEach((key) => assert.ok(log.indexOf(String(FAKE[key])) < 0, 'account.' + key));
+        const line = (re) => log.split('\n').find((l) => re.test(l)) || '';
+        const k1 = /^fetch (v#[0-9a-f]{4}): ERROR: \[youtube\] (v#[0-9a-f]{4}): Video/.exec(line(/ fetch v#/).slice(25));
+        assert.ok(k1 && k1[1] === k1[2], 'a known id: v# + 4 hex, the same each time: ' + line(/ fetch v#/));
+        assert.ok(line(/lru removed/).indexOf(',' + k1[1]) > 0 && line(/ytdec line 399/).indexOf(rcache + '/' + k1[1]) > 0, 'the same tag in the LRU line and in ytdec.log');
+        assert.ok(/thumb v#[0-9a-f]{4}: timeout/.test(log) && /--dir \S+\/v#[0-9a-f]{4} --rect/.test(log) && /\[youtube\] v#[0-9a-f]{4}: Downloading/.test(log), 'ids by context');
+        assert.ok(/list=p#[0-9a-f]{4} and p#[0-9a-f]{4}/.test(log) && /channel c#[0-9a-f]{4}/.test(log), 'playlists p#, channels c#');
+        assert.ok(log.indexOf('GET https://rr3---sn-abc.googlevideo.com\n') > 0, 'a URL: scheme and host');
+        assert.ok(log.indexOf('with url: /[path] (Caused by timeout)') > 0 && log.indexOf('odd ip=[ip] alone') > 0, 'a bare path with a query, a lone ip=');
+        assert.ok(log.indexOf('meta [title] by [title]; [title]') > 0 && log.indexOf('mail [email]') > 0 && log.indexOf('vin [vin]') > 0);
+        assert.ok(log.indexOf('uplink [ip] via 192.168.1.1, 10.0.0.2, 172.20.1.1, 127.0.0.1, [ip] and [ip]') > 0, line(/uplink/));
+        assert.ok(log.indexOf('Bearer [secret]') > 0 && log.indexOf('access_token=[secret]') > 0 && log.indexOf('Cookie: [secret]') > 0);
+        ['internet uid: 30000', 'audio: head -> full at 1234 (waiting)', 'clientVersion 7.20251101.10.00', 'sign-in poll: client_secret=[secret]']
+            .forEach((x) => assert.ok(log.indexOf(x) > 0, 'kept: ' + x));
+        assert.ok(rlogs.join('\n').indexOf('ABC123') < 0, 'the code is not logged');
+        await send();
+        const k2 = /fetch (v#[0-9a-f]{4}):/.exec(relay.got.pop().body.log);
+        assert.ok(k2 && k2[1] !== k1[1], 'another report, another salt: ' + k2[1]);
+    });
+
+    await t('send_logs: closed, busy, too big, a bad answer, no answer, nobody there; one at a time', async () => {
+        for (const [mode, msg] of [[410, 'closed'], [429, 'busy'], [413, 'failed'], [500, 'failed'], ['bad', 'failed'], ['hang', 'offline']]) {
+            relay.mode = mode;
+            assert.deepStrictEqual(await send(), { ev: 'logs_error', msg: msg }, String(mode));
+        }
+        relay.mode = 200; relay.delay = 300; relay.got.length = 0; revs.length = 0;
+        const p1 = dr.sendLogs('0.3.12');
+        await dr.sendLogs('0.3.12');                 // while the first is in flight: ignored
+        await p1;
+        assert.deepStrictEqual([relay.got.length, revs], [1, [{ ev: 'logs_sent', id: 'ABC123' }]]);
+        relay.delay = 0;
+        assert.strictEqual(relay.got.pop().body.app, '0.3.12');
+        revs.length = 0; await dr.sendLogs('1.0; rm -rf');
+        assert.strictEqual(relay.got.pop().body.app, 'unknown', 'a bad app version is not sent');
+        await new Promise((r) => srv.close(r));
+        assert.deepStrictEqual(await send(), { ev: 'logs_error', msg: 'offline' }, 'connection refused');
+    });
+
+    await t('send_logs: the log is capped at 200 KB, the newest lines kept; the ring at 1500 lines', async () => {
+        for (let i = 0; i < 3000; i++) dr.log('filler ' + i + ' ' + 'x'.repeat(200));
+        assert.strictEqual(dr.ring.length, 1500);
+        const b = dr.report('0.3.12');
+        assert.ok(Buffer.byteLength(b.log) <= 200 * 1024 && Buffer.byteLength(b.log) > 190 * 1024, 'size ' + Buffer.byteLength(b.log));
+        assert.ok(/filler 2999 x+$/.test(b.log) && b.log.indexOf('filler 1500 ') < 0, 'the newest kept, the oldest dropped');
+    });
+
+    await t('no token, secret or device code in the log', async () => {
+        const all = logs.join('\n');
+        SECRETS.forEach((s) => assert.ok(all.indexOf(s) < 0, s + ' logged'));
+        assert.ok(/sign-in: signed in/.test(all) && /token refreshed/.test(all));
+    });
+
+    await t('feedItems: an empty or odd answer is no items', async () => {
+        assert.deepStrictEqual(feedItems({}), []);
+        assert.deepStrictEqual(feedItems({ a: [null, 1, 'x', { tileRenderer: { contentType: 'TILE_CONTENT_TYPE_VIDEO', contentId: 'bad' } }] }), []);
+        const tap = (ep) => ({ commandContext: { onTap: { innertubeCommand: ep } } });
+        assert.deepStrictEqual(feedItems({ a: [
+            { lockupViewModel: { contentId: 'PLxxxxxxxxxxxxxxxx', rendererContext: tap({ watchEndpoint: { videoId: 'AAAAAAAAAAA' } }) } },
+            { lockupViewModel: { contentId: 'UCxxxxxxxxxxxxxxxxxxxxxx', rendererContext: tap({ browseEndpoint: { browseId: 'UCx' } }) } },
+            { lockupViewModel: { contentId: 'SSSSSSSSSS1', rendererContext: tap({ reelWatchEndpoint: { videoId: 'SSSSSSSSSS1' } }) } }] }),
+            [{ id: 'SSSSSSSSSS1', title: 'SSSSSSSSSS1', channel: '', duration_s: null, meta: [], short: true }], 'playlist, channel dropped; a short kept');
+        assert.deepStrictEqual(feedItems({ lockupViewModel: { contentId: 'AAAAAAAAAAA', rendererContext: tap({ watchEndpoint: { videoId: 'AAAAAAAAAAA' } }) } }),
+            [{ id: 'AAAAAAAAAAA', title: 'AAAAAAAAAAA', channel: '', duration_s: null, meta: [] }], 'a bare lockup');
+    });
+
+    await t('members-only tiles flagged (their badge); Video quality: 360/480/720, auto = 720 on Wi-Fi or unknown, 480 on phone data', async () => {
+        const mb = { lineItemRenderer: { badge: { metadataBadgeRenderer: { style: 'BADGE_STYLE_TYPE_MEMBERS_ONLY', label: 'Members only' } } } };
+        const items = feedItems({ a: [tile('MMMMMMMMMM1', 'TILE_CONTENT_TYPE_VIDEO', 'Perk', 'Chan', '9:00', [mb]), tile('MMMMMMMMMM2', 'TILE_CONTENT_TYPE_VIDEO', 'Free', 'Chan', '9:00')] });
+        assert.deepStrictEqual(items.map((x) => !!x.members), [true, false]);
+        const { qualityHeight } = require('../ytd.js');
+        assert.deepStrictEqual([qualityHeight('360'), qualityHeight(480), qualityHeight('720'), qualityHeight('1080', null)], [360, 480, 720, 720]);
+        assert.strictEqual(qualityHeight('auto', { interface: 'wlan0' }), 720);
+        assert.strictEqual(qualityHeight('auto', { interface: 'usb0' }), 480);
+        assert.strictEqual(qualityHeight(undefined, null), 720, 'no uplink known: as before');
+    });
+
+    await t('feedShelves: titles, per-channel and mixed groups, shorts shelf kept, per-shelf dedup, meta, caps', async () => {
+        const V = 'TILE_CONTENT_TYPE_VIDEO';
+        const txt = (x) => ({ lineItemRenderer: { text: { simpleText: x } } });
+        const badge = (x) => ({ lineItemRenderer: { badge: { metadataBadgeRenderer: { style: 'BADGE_STYLE_TYPE_SIMPLE', label: x } } } });
+        const shelf = (header, tiles) => ({ shelfRenderer: Object.assign({ content: { horizontalListRenderer: { items: tiles } } }, header) });
+        const avatar = (runs) => ({ headerRenderer: { shelfHeaderRenderer: { avatarLockup: { avatarLockupRenderer: { title: { runs: runs.map((x) => ({ text: x })) } } } } } });
+        const page = (shelves) => ({ contents: { tvBrowseRenderer: { content: { tvSurfaceContentRenderer: { content: { sectionListRenderer: { contents: shelves } } } } } } });
+        const id = (n) => 'fake' + ('0000000' + n).slice(-7);
+        const many = [];
+        for (let i = 0; i < 13; i++) many.push(tile(id(100 + i), V, 'M' + i, 'Chan M', '1:00'));
+        const root = page([
+            shelf(avatar(['Consumer Electronics', ' and more']), [
+                tile(id(1), V, 'One', 'Chan A', '4:05', [badge('4K'), txt('125K views'), txt('•'), txt('1 day ago')]),
+                tile(id(2), V, 'Two', 'Chan B', '10:00', [])]),
+            shelf(avatar(['Shorts']), [tile(id(3), 'TILE_CONTENT_TYPE_SHORTS', 'Short', 'Chan C', null)]),
+            shelf({ tvhtml5Metadata: { retainShelfIndex: true } }, [
+                tile(id(4), V, 'Four', 'Chan D', '2:00'), tile(id(5), V, 'Five', 'Chan D', '3:00'), tile(id(4), V, 'Four', 'Chan D', '2:00')]),
+            shelf({ tvhtml5Metadata: { retainShelfIndex: true } }, [tile(id(1), V, 'One', 'Chan A', '4:05'), tile(id(6), V, 'Six', 'Chan E', '1:00')]),
+            shelf({ headerRenderer: { shelfHeaderRenderer: { title: { simpleText: 'Plain title' } } } }, many)]);
+        const sh = feedShelves(root);
+        assert.deepStrictEqual(sh.map((x) => x.title), ['Consumer Electronics and more', 'Shorts', 'Chan D', '', 'Plain title']);
+        assert.deepStrictEqual(sh[0].items[0], { id: id(1), title: 'One', channel: 'Chan A', duration_s: 245, meta: ['125K views', '1 day ago'] });
+        assert.deepStrictEqual(sh[0].items[1].meta, []);
+        assert.deepStrictEqual(sh[1].items.map((x) => [x.id, x.short]), [[id(3), true]], 'the Shorts shelf, its tiles marked');
+        assert.deepStrictEqual(sh[2].items.map((x) => x.id), [id(4), id(5)], 'dedup inside a shelf');
+        assert.deepStrictEqual(sh[3].items.map((x) => x.id), [id(1), id(6)], 'a video in two shelves stays in both');
+        assert.strictEqual(sh[4].items.length, 12);
+        const flat = feedItems(root).map((x) => x.id);
+        assert.strictEqual(flat.filter((x) => x === id(1)).length, 1, 'flat items deduped across shelves');
+        assert.deepStrictEqual(flat.slice(0, 6), [id(1), id(2), id(3), id(4), id(5), id(6)]);
+        assert.strictEqual(flat.length, 19);
+        const ten = [];
+        for (let i = 0; i < 10; i++) ten.push(shelf(avatar(['S' + i]), [tile(id(200 + i), V, 'T', 'C', '1:00')]));
+        assert.deepStrictEqual(feedShelves(page(ten)).map((x) => x.title), ['S0', 'S1', 'S2', 'S3', 'S4', 'S5', 'S6', 'S7']);
+        // Watch later: a playlist, tiles without shelves
+        const wl = { contents: { tvBrowseRenderer: { content: { tvSecondaryNavRenderer: { sections: [{ playlistVideoListRenderer: { contents: [tile(id(7), V, 'Seven', 'Chan F', '5:00')] } }] } } } } };
+        assert.deepStrictEqual(feedShelves(wl), []);
+        assert.deepStrictEqual(feedItems(wl).map((x) => x.id), [id(7)]);
+        assert.deepStrictEqual(feedShelves({}), []);
+    });
+
+    await t('thumbs: cached thumb.rgba by its length, else thumbs/<id>.rgba, else the helper (env {}, cwd /), checked, kept, 150 at most', async () => {
+        const evs = [], tlog = path.join(tmp, 'thumb.log'), tdir = path.join(cache, 'thumbs');
+        const d3 = new Daemon({ someip: someip, srcGen: srcGen, ytdec: fakeYtdec, cacheDir: cache, logDir: tmp, sock: path.join(tmp, 'ctl3.sock'),
+            accountFile: path.join(tmp, 'acct3.json'), noSetuid: true, thumbCmd: [process.execPath, path.join(__dirname, 'fake_thumb.js'), tlog],
+            ytRequest: fakeYt, log: (m) => logs.push(m) });
+        d3.emit = (o) => evs.push(o);
+        const sizes = () => evs.map((e) => [e.id, e.w, e.h, Buffer.from(e.rgba, 'base64').length]);
+        const put = (vid, n) => { fs.mkdirSync(path.join(cache, vid)); fs.writeFileSync(path.join(cache, vid, 'thumb.rgba'), Buffer.alloc(n, 1)); };
+        put('TTTTTTTTTT1', 57600); put('TTTTTTTTTT2', 230400);
+        await d3.thumb('TTTTTTTTTT1'); await d3.thumb('TTTTTTTTTT2');
+        assert.deepStrictEqual(sizes(), [['TTTTTTTTTT1', 160, 90, 57600], ['TTTTTTTTTT2', 320, 180, 230400]]);
+        assert.ok(!fs.existsSync(tlog), 'cached thumbs: no helper');
+        fs.mkdirSync(tdir);
+        for (let i = 0; i < 150; i++) {
+            const f = path.join(tdir, 'X' + i + '.rgba'), tm = new Date(Date.now() - (i + 1) * 60000);
+            fs.writeFileSync(f, ''); fs.utimesSync(f, tm, tm);
+        }
+        evs.length = 0;
+        await Promise.all([d3.thumb('NNNNNNNNNN1'), d3.thumb('ZZZZZZZZZZZ'), d3.thumb('SSSSSSSSSS1')]);
+        assert.deepStrictEqual(sizes(), [['NNNNNNNNNN1', 320, 180, 230400]]);
+        assert.ok(logs.some((m) => /ZZZZZZZZZZZ: thumb helper exit 1, 0 bytes: no thumbnail/.test(m)));
+        assert.ok(logs.some((m) => /SSSSSSSSSS1: thumb helper exit 0, 1000 bytes/.test(m)));
+        const hl = fs.readFileSync(tlog, 'utf8').split('\n').filter(Boolean).map((x) => JSON.parse(x));
+        assert.deepStrictEqual(hl.map((x) => x.id).sort(), ['NNNNNNNNNN1', 'SSSSSSSSSS1', 'ZZZZZZZZZZZ']);
+        assert.ok(hl.every((x) => x.cwd === '/' && x.env.length < 5), JSON.stringify(hl[0]));
+        const tf = path.join(tdir, 'NNNNNNNNNN1.rgba');
+        assert.strictEqual(fs.statSync(tf).size, 230400);
+        assert.strictEqual(fs.statSync(tf).mode & 0o777, 0o600, "root only: the thumbnails show what was watched");
+        assert.strictEqual(fs.readdirSync(tdir).length, 150, 'capped');
+        assert.ok(!fs.existsSync(path.join(tdir, 'X149.rgba')), 'the oldest went');
+        fs.unlinkSync(tlog); evs.length = 0;
+        await d3.thumb('NNNNNNNNNN1');
+        assert.deepStrictEqual(sizes(), [['NNNNNNNNNN1', 320, 180, 230400]]);
+        assert.ok(!fs.existsSync(tlog), 'from thumbs/: no helper');
+        assert.ok(listCache(cache).every((x) => x.id !== 'thumbs'), 'thumbs/ is not a video');
+        fs.readdirSync(tdir).forEach((n) => fs.unlinkSync(path.join(tdir, n))); fs.rmdirSync(tdir);
+        ['TTTTTTTTTT1', 'TTTTTTTTTT2'].forEach((v) => { fs.unlinkSync(path.join(cache, v, 'thumb.rgba')); fs.rmdirSync(path.join(cache, v)); });
+    });
+
+    await t('channels: the FEchannels tiles -> id, name, @handle; videos, playlists and repeats skipped', async () => {
+        const { channelTiles } = require('../ytd.js');
+        const line = (txt) => ({ lineRenderer: { items: [{ lineItemRenderer: { text: { simpleText: txt } } }] } });
+        const tile = (id, type, title, lines) => ({ tileRenderer: { contentId: id, contentType: type, onSelectCommand: { browseEndpoint: { browseId: id } },
+            metadata: { tileMetadataRenderer: { title: { simpleText: title }, lines: lines.map(line) } } } });
+        const page = { contents: { shelfRenderer: { content: { horizontalListRenderer: { items: [
+            tile('UCdemo000000000000000001', 'TILE_CONTENT_TYPE_CHANNEL', 'Demo Detailing', ['@demo_detailing', '135K subscribers']),
+            tile('DemoVideo01', 'TILE_CONTENT_TYPE_VIDEO', 'a video', []),
+            tile('UCdemo000000000000000002', 'TILE_CONTENT_TYPE_CHANNEL', 'Seven Demo', ['1M subscribers']),
+            tile('UCdemo000000000000000001', 'TILE_CONTENT_TYPE_CHANNEL', 'Demo Detailing', [])] } } } } };
+        assert.deepStrictEqual(channelTiles(page), [
+            { id: 'UCdemo000000000000000001', title: 'Demo Detailing', handle: '@demo_detailing' },
+            { id: 'UCdemo000000000000000002', title: 'Seven Demo', handle: '' }]);
+    });
+
+    await t('playlists: the TV Playlists page tiles -> id, name, count, meta, the picture\'s video; Watch later, videos and repeats skipped', async () => {
+        const { playlistTiles, playlistTitle, addToPlaylistItems } = require('../ytd.js');
+        // as FEplaylist_aggregation answers (TVHTML5, 2026-11): a gridRenderer of tiles, the count on the thumbnail's
+        // overlay ("No videos", "1 video", "12 videos"), one lineRenderer a text, no_thumbnail.jpg when empty
+        const line = (...txt) => ({ lineRenderer: { items: txt.map((x) => ({ lineItemRenderer: { text: { simpleText: x } } })) } });
+        const tile = (id, type, title, lines, count, pic, o) => ({ tileRenderer: Object.assign({ style: 'TILE_STYLE_YTLR_DEFAULT', contentId: id, contentType: type,
+            onSelectCommand: { browseEndpoint: { browseId: 'VL' + id } },
+            header: { tileHeaderRenderer: { thumbnail: { thumbnails: [{ url: pic ? 'https://i.ytimg.com/vi/' + pic + '/hqdefault.jpg' : 'https://i.ytimg.com/img/no_thumbnail.jpg', width: 480, height: 360 }] },
+                thumbnailOverlays: [{ thumbnailOverlayTimeStatusRenderer: { text: { runs: [{ text: count }] }, style: 'DEFAULT', icon: { iconType: 'PLAYLISTS' } } },
+                    { thumbnailOverlayStackingEffectRenderer: {} }] } },
+            metadata: { tileMetadataRenderer: { title: { simpleText: title }, lines: lines } } }, o || {}) });
+        const page = { contents: { tvBrowseRenderer: { content: { tvSurfaceContentRenderer: { content: { gridRenderer: { items: [
+            tile('WL', 'TILE_CONTENT_TYPE_PLAYLIST', 'Watch later', [line('Private'), line('Updated today')], 'No videos'),
+            tile('PLdemo00000000000000000000000001', 'TILE_CONTENT_TYPE_PLAYLIST', 'Road trip', [line('Private'), line('Updated today')], '12 videos', 'DemoVideo01'),
+            tile('DemoVideo01', 'TILE_CONTENT_TYPE_VIDEO', 'a video', [], '1:00'),
+            tile('LL', 'TILE_CONTENT_TYPE_PLAYLIST', 'Liked videos', [line('Private')], 'No videos'),
+            tile('PLdemo00000000000000000000000003', 'TILE_CONTENT_TYPE_PLAYLIST', 'One', [line('Public', '•', 'Updated 3 days ago')], '1 video', null,
+                { onSelectCommand: { watchEndpoint: { videoId: 'DemoVideo04', playlistId: 'PLdemo00000000000000000000000003' } } }),
+            tile('PLdemo00000000000000000000000001', 'TILE_CONTENT_TYPE_PLAYLIST', 'Road trip', [], '12 videos')] } } } } } },
+            // lockups (the web's newer format; not seen from TVHTML5 yet): the playlist id in the tap command, the count on a badge
+            more: { lockupViewModel: { contentId: 'PLdemo00000000000000000000000002', contentType: 'LOCKUP_CONTENT_TYPE_PLAYLIST',
+                contentImage: { collectionThumbnailViewModel: { primaryThumbnail: { thumbnailViewModel: {
+                    image: { sources: [{ url: 'https://i.ytimg.com/vi/DemoVideo03/hqdefault.jpg' }] },
+                    overlays: [{ thumbnailOverlayBadgeViewModel: { thumbnailBadges: [{ thumbnailBadgeViewModel: { text: '1,204 videos' } }] } }] } } } },
+                metadata: { lockupMetadataViewModel: { title: { content: 'Everything' } } },
+                rendererContext: { commandContext: { onTap: { innertubeCommand: { browseEndpoint: { browseId: 'VLPLdemo00000000000000000000000002' } } } } } } } };
+        assert.deepStrictEqual(playlistTiles(page), [
+            { id: 'PLdemo00000000000000000000000001', title: 'Road trip', count: 12, meta: ['Private', 'Updated today'], thumb: 'DemoVideo01' },
+            { id: 'LL', title: 'Liked videos', count: 0, meta: ['Private'], thumb: null },
+            { id: 'PLdemo00000000000000000000000003', title: 'One', count: 1, meta: ['Public', 'Updated 3 days ago'], thumb: 'DemoVideo04' },
+            { id: 'PLdemo00000000000000000000000002', title: 'Everything', count: 1204, meta: [], thumb: 'DemoVideo03' }]);
+        assert.deepStrictEqual(playlistTiles({ tileRenderer: { contentType: 'TILE_CONTENT_TYPE_PLAYLIST' } }), [], 'no id: skipped');
+        // a playlist's page (VL + id): its name in the TV header, else the web's
+        const entity = { contents: { tvBrowseRenderer: { content: { tvSurfaceContentRenderer: { content: { twoColumnRenderer: {
+            leftColumn: { entityMetadataRenderer: { title: { simpleText: 'Liked videos' }, bylines: [line('Private', '•', 'No videos')] } },
+            rightColumn: { genericPromoRenderer: { bodyText: { simpleText: 'No videos in this playlist yet' } } } } } } } } } };
+        assert.strictEqual(playlistTitle(entity), 'Liked videos');
+        assert.strictEqual(playlistTitle({ header: { playlistHeaderRenderer: { title: { runs: [{ text: 'Road ' }, { text: 'trip' }] } } } }), 'Road trip');
+        assert.strictEqual(playlistTitle({}), '');
+        // the Save to playlist list (the fallback): ids, names, privacy; Watch later skipped
+        const opt = (id, title, privacy, pic) => ({ playlistAddToOptionRenderer: { playlistId: id, title: { simpleText: title }, privacy: privacy, containsSelectedVideos: 'NONE',
+            thumbnailRenderer: pic ? { playlistVideoThumbnailRenderer: { thumbnail: { thumbnails: [{ url: 'https://i.ytimg.com/vi/' + pic + '/default.jpg' }] } } } : {} } });
+        assert.deepStrictEqual(addToPlaylistItems({ contents: [{ addToPlaylistRenderer: { playlists: [opt('WL', 'Watch later', 'PRIVATE'),
+            opt('PLdemo00000000000000000000000001', 'Road trip', 'UNLISTED', 'DemoVideo01'), opt('bad id', 'Bad', 'PUBLIC')] } }] }), [
+            { id: 'PLdemo00000000000000000000000001', title: 'Road trip', count: null, meta: ['Unlisted'], thumb: 'DemoVideo01' }]);
+    });
+
+    await t('playlists: the TV page; the Save to playlist list when the page refuses or lists none; its error only when both fail', async () => {
+        const { Account } = require('../ytd.js');
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pl-')), file = path.join(dir, 'account.json');
+        fs.writeFileSync(file, JSON.stringify({ cid: 'c', sec: 's', access: 'tok', refresh: 'r', exp: Date.now() + 3600000 }));
+        const tvTile = { tileRenderer: { contentId: 'PLtv', contentType: 'TILE_CONTENT_TYPE_PLAYLIST', onSelectCommand: { browseEndpoint: { browseId: 'VLPLtv' } },
+            metadata: { tileMetadataRenderer: { title: { simpleText: 'From the page' } } } } };
+        const saveList = { contents: [{ addToPlaylistRenderer: { playlists: [{ playlistAddToOptionRenderer: { playlistId: 'PLsave', title: { simpleText: 'From the list' }, privacy: 'PRIVATE' } }] } }] };
+        const run = async (page, list) => {
+            const asked = [], evs = [], logs2 = [];
+            const yt = (method, url) => {
+                asked.push(/browse/.test(url) ? 'page' : 'list');
+                const a = /browse/.test(url) ? page : list;
+                return Promise.resolve({ status: a[0], body: JSON.stringify(a[1]) });
+            };
+            await new Account({ accountFile: file, ytRequest: yt, ytTimeoutMs: 1000, log: (m) => logs2.push(m) }, (e) => evs.push(e)).playlists();
+            return { asked, ev: evs[0], logs: logs2 };
+        };
+        let x = await run([200, { contents: tvTile }], [200, saveList]);
+        assert.deepStrictEqual([x.asked, x.ev.items.map((p) => p.title)], [['page'], ['From the page']], 'the page lists some: the list not asked');
+        x = await run([404, {}], [200, saveList]);
+        assert.deepStrictEqual([x.asked, x.ev.items.map((p) => p.title)], [['page', 'list'], ['From the list']], 'the page refuses: the list');
+        x = await run([200, { contents: { somethingNew: {} } }], [200, saveList]);
+        assert.deepStrictEqual([x.asked, x.ev.items.map((p) => p.title)], [['page', 'list'], ['From the list']], 'the page answers, nothing we read: the list');
+        x = await run([200, { contents: {} }], [500, {}]);
+        assert.deepStrictEqual([x.ev.items, x.ev.error], [[], undefined], 'the page empty, the list failing: the page\'s empty answer');
+        assert.ok(x.logs.some((m) => /none on the page, save list 500/.test(m)), 'logged');
+        x = await run([404, {}], [500, {}]);
+        assert.deepStrictEqual([x.ev.items, x.ev.error], [undefined, 'feed offline'], 'both fail: offline');
+    });
+
+    await t('playlist, Watch later: their next pages followed (TVHTML5 sends 15 a page, #17), the first page sent at once; a failing page keeps the rest; Home asks none', async () => {
+        const { Account, nextPageToken } = require('../ytd.js');
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-')), file = path.join(dir, 'account.json');
+        fs.writeFileSync(file, JSON.stringify({ cid: 'c', sec: 's', access: 'tok', refresh: 'r', exp: Date.now() + 3600000 }));
+        const vid = (n) => 'V' + String(n).padStart(10, '0');   // 11 characters, as a video id
+        const tile = (n) => ({ tileRenderer: { contentId: vid(n), contentType: 'TILE_CONTENT_TYPE_VIDEO', onSelectCommand: { watchEndpoint: { videoId: vid(n) } },
+            metadata: { tileMetadataRenderer: { title: { simpleText: 'Song ' + n } } } } });
+        const list = (from, next) => ({ contents: [from, from + 1, from + 2].map(tile), continuations: next ? [{ nextContinuationData: { continuation: next } }] : undefined });
+        // as VL<id> answers (2026-11): the list in the right column, the next page's token under it; a next page in continuationContents
+        const first = { contents: { tvBrowseRenderer: { content: { tvSurfaceContentRenderer: { content: { twoColumnRenderer: { rightColumn: { playlistVideoListRenderer: list(0, 'p2') } } } } } } } };
+        const more = { p2: { continuationContents: { playlistVideoListContinuation: list(3, 'p3') } }, p3: { continuationContents: { playlistVideoListContinuation: list(6, null) } } };
+        assert.deepStrictEqual([nextPageToken(first), nextPageToken(more.p2), nextPageToken(more.p3), nextPageToken({})], ['p2', 'p3', null, null]);
+        const run = async (fail) => {
+            const asked = [], evs = [], logs2 = [];
+            const yt = (method, url, headers, body) => {
+                const b = body; asked.push(b.continuation || b.browseId);
+                if (b.continuation === fail) return Promise.reject(new Error('timeout'));
+                return Promise.resolve({ status: 200, body: JSON.stringify(b.continuation ? more[b.continuation] : first) });
+            };
+            const acc = new Account({ accountFile: file, ytRequest: yt, ytTimeoutMs: 1000, log: (m) => logs2.push(m) }, (e) => evs.push(e));
+            if (feed) await acc.feed(feed); else await acc.playlist('PLlongplaylist0001');
+            return { asked, evs, ev: evs[evs.length - 1], logs: logs2 };
+        };
+        let feed = null, x = await run(null);
+        assert.deepStrictEqual([x.asked, x.ev.items.map((v) => v.title)], [['VLPLlongplaylist0001', 'p2', 'p3'], [0, 1, 2, 3, 4, 5, 6, 7, 8].map((n) => 'Song ' + n)], 'all three pages');
+        assert.deepStrictEqual(x.evs.map((e) => [e.partial, e.items.length, e.title]), [[true, 3, ''], [undefined, 9, '']], 'the first page at once (partial), then the whole list');
+        x = await run('p3');
+        assert.deepStrictEqual([x.ev.error, x.ev.items.length], [undefined, 6], 'the third page fails: the first two still show');
+        assert.ok(x.logs.some((m) => /next page: browse timeout/.test(m)), 'logged');
+        feed = 'wl'; x = await run(null);
+        assert.deepStrictEqual([x.asked, x.evs.map((e) => [e.ev, e.which, e.partial, e.items.length])], [['VLWL', 'p2', 'p3'], [['feed', 'wl', true, 3, ], ['feed', 'wl', undefined, 9]]], 'Watch later: the same');
+        feed = 'home'; x = await run(null);
+        assert.deepStrictEqual([x.asked, x.evs.length, x.ev.items.length], [['FEwhat_to_watch'], 1, 3], 'Home: one page, no next one asked (only playlists are read page by page)');
+        // a Mix (RD + its video): no VL page (400), read from /next's playlist shelf, as the car got it 2026-11-20
+        const mixAsked = [], mixEvs = [];
+        const nextBody = { contents: { singleColumnWatchNextResults: { playlist: { playlist: { title: 'Mix - Rock Mafia' } }, pivot: { sectionListRenderer: { contents: [
+            { shelfRenderer: { content: { horizontalListRenderer: { items: [tile(9)] } } } },
+            { shelfRenderer: { content: { horizontalListRenderer: { items: [1, 2].map((n) => ({ playlistPanelVideoWrapperRenderer: { primaryRenderer: tile(n) } })) } } } }] } } } } };
+        const myt = (method, url, headers, body) => { mixAsked.push([url.replace(/^.*\/v1\//, ''), body.playlistId, body.videoId]); return Promise.resolve({ status: 200, body: JSON.stringify(nextBody) }); };
+        await new Account({ accountFile: file, ytRequest: myt, ytTimeoutMs: 1000, log: () => {} }, (e) => mixEvs.push(e)).playlist('RDZ1KRmp65PyE');
+        assert.deepStrictEqual(mixAsked, [['next', 'RDZ1KRmp65PyE', 'Z1KRmp65PyE']], 'one /next with the Mix and its video');
+        assert.deepStrictEqual([mixEvs.length, mixEvs[0].title, mixEvs[0].items.map((v) => v.title)], [1, 'Mix - Rock Mafia', ['Song 1', 'Song 2']], 'the panel shelf, not the suggestions');
+        const bad = [];
+        await new Account({ accountFile: file, ytRequest: () => Promise.resolve({ status: 400, body: '{}' }), ytTimeoutMs: 1000, log: () => {} }, (e) => bad.push(e)).playlist('RDZ1KRmp65PyE');
+        assert.deepStrictEqual(bad.map((e) => e.error), ['feed offline'], 'a failed /next: the usual error');
+    });
+
+    await t('setTime is never 0 (the car\'s player ignores it): the start is asked as 1 ms', async () => {
+        const { Audio } = require('../ytd.js');
+        const got = [];
+        const a = new Audio({ log: () => {} }, {});
+        a.mp = { callMethod: async (m, x) => { got.push([m, x.newTimeElapsed]); return { EntError: 'OK' }; } };
+        await a.seek(0); await a.seek(0.4); await a.seek(25000);
+        assert.deepStrictEqual(got, [['setTime', 1], ['setTime', 1], ['setTime', 25000]]);
+    });
+
+    await t('LRU keeps 6 newest, never the playing one', async () => {
+        const lru = path.join(tmp, 'lru');
+        fs.mkdirSync(lru);
+        const ids = [];
+        for (let i = 0; i < 9; i++) {
+            const id = 'L' + String(i).repeat(10);
+            const dd = path.join(lru, id);
+            fs.mkdirSync(dd);
+            const tm = new Date(Date.now() - (i + 1) * 60000); // L0 newest ... L8 oldest
+            fs.utimesSync(dd, tm, tm);
+            ids.push(id);
+        }
+        const removed = pruneCache(lru, 6, [ids[8]], () => {});
+        assert.deepStrictEqual(removed.sort(), [ids[6], ids[7]].sort());
+        assert.deepStrictEqual(listCache(lru).map((x) => x.id).sort(), ids.slice(0, 6).concat([ids[8]]).sort());
+    });
+
+    await t('fetch helper resolves through the uplink lease, else the system resolver', async () => {
+        const { uplinkLookup } = require('../ytd.js');
+        const lease = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'lease-')), 'lease.json');
+        assert.strictEqual(uplinkLookup(lease), undefined, 'no lease: system resolver');
+        fs.writeFileSync(lease, JSON.stringify({ dns: [] }));
+        assert.strictEqual(uplinkLookup(lease), undefined, 'no servers: system resolver');
+        fs.writeFileSync(lease, JSON.stringify({ dns: ['192.0.2.53'] }));
+        assert.strictEqual(typeof uplinkLookup(lease), 'function');
+    });
+
+    await t('a played video is deleted once stopped (only a download is kept)', async () => {
+        c.send({ cmd: 'stop' }); await c.waitFor((x) => x.ev === 'state' && x.state === 'idle');
+        d.opts.keep = 0;
+        fs.writeFileSync(ctl, 'done');
+        c.clear();
+        c.send({ cmd: 'play', id: 'UUUUUUUUUU1', rect: '1280x720' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'playing', 5000);
+        assert.ok(fs.existsSync(path.join(cache, 'UUUUUUUUUU1')), 'kept while it plays');
+        c.send({ cmd: 'stop' }); await c.waitFor((x) => x.ev === 'state' && x.state === 'idle');
+        assert.ok(!fs.existsSync(path.join(cache, 'UUUUUUUUUU1')), 'gone');
+        assert.deepStrictEqual(fs.readdirSync(cache).filter((n) => /^[\w-]{11}$/.test(n)), [], 'no other video left either');
+        d.opts.keep = 40;
+    });
+
+    await t('history: signed in, /player then a playback ping, watchtime at pause and a final one when it ended', async () => {
+        const saved = d.account, id = 'HHHHHHHHHH1';
+        mkVideo(id);
+        d.account = Object.assign(Object.create(Object.getPrototypeOf(saved)), saved, { status: () => ({ state: 'signed_in' }), token: async () => 'TOK' });
+        yt.calls.length = 0;
+        await playing(id);
+        await waitUntil(() => yt.calls.some((x) => /stats\/playback/.test(x.url)));
+        const pl = yt.calls.find((x) => /v1\/player/.test(x.url));
+        assert.strictEqual(pl.headers.Authorization, 'Bearer TOK'); assert.strictEqual(pl.body.videoId, id);
+        const pb = yt.calls.find((x) => /stats\/playback/.test(x.url));
+        assert.ok(/^https:\/\/s\.youtube\.com\/api\/stats\/playback\?docid=x&ei=E&ns=yt&ver=2&cpn=[\w-]{16}&len=60&cmt=0\.0$/.test(pb.url), pb.url);
+        assert.strictEqual(pb.headers.Authorization, 'Bearer TOK');
+        tick(30000);
+        c.send({ cmd: 'pause' });
+        await waitUntil(() => yt.calls.some((x) => /stats\/watchtime/.test(x.url)));
+        assert.ok(/&st=0&et=30\.0$/.test(yt.calls.find((x) => /watchtime/.test(x.url)).url));
+        c.send({ cmd: 'resume' });
+        await sleep(100);
+        tick(59000);
+        d.stop('ended');
+        await waitUntil(() => yt.calls.some((x) => /watchtime.*final=1/.test(x.url)));
+        assert.ok(/st=60&et=60&final=1$/.test(yt.calls.filter((x) => /watchtime/.test(x.url)).pop().url));
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'ended');
+        d.account = saved;
+        rmrf(path.join(cache, id));
+    });
+
+    await t('feed tiles carry the account\'s watched share and resume point', async () => {
+        const j = { contents: [{ tileRenderer: { contentType: 'TILE_CONTENT_TYPE_VIDEO', contentId: 'AUTOAUTO003',
+            metadata: { tileMetadataRenderer: { title: { simpleText: 'A' } } },
+            header: { tileHeaderRenderer: { thumbnailOverlays: [{ thumbnailOverlayTimeStatusRenderer: { text: { simpleText: '5:00' } } },
+                { thumbnailOverlayResumePlaybackRenderer: { percentDurationWatched: 40 } }] } },
+            onSelectCommand: { watchEndpoint: { videoId: 'AUTOAUTO003', startTimeSeconds: 120 } } } }] };
+        assert.strictEqual(feedItems(j)[0].watched_pct, 40); assert.strictEqual(feedItems(j)[0].start_s, 120);
+    });
+
+    // ======== WP0 foundations: the protocol table, hello, the stub commands
+    await t('the README protocol table lists exactly the onLine commands, and every event ytd.js sends', async () => {
+        const src = fs.readFileSync(path.join(__dirname, '..', 'ytd.js'), 'utf8');
+        const body = src.slice(src.indexOf('Daemon.prototype.onLine = '), src.indexOf('\n};', src.indexOf('Daemon.prototype.onLine = ')));
+        const cases = (body.match(/case '[a-z_]+'/g) || []).map((x) => x.slice(6, -1)).sort();
+        const readme = fs.readFileSync(path.join(__dirname, '..', 'README.md'), 'utf8');
+        const table = readme.slice(readme.indexOf('App → daemon'), readme.indexOf('Daemon → app:'));
+        const rows = table.split('\n').filter((l) => /^\| `\{"cmd"/.test(l)).map((l) => l.split(' | ')[0]);
+        const documented = [].concat(...rows.map((l) => (l.match(/"cmd":"[a-z_]+"/g) || []).map((x) => x.slice(7, -1)))).sort();
+        assert.ok(cases.length >= 28, 'the switch was found: ' + cases.length);
+        assert.deepStrictEqual(documented, cases, 'README rows vs onLine cases');
+        const sent = Array.from(new Set((src.match(/ev: '[a-z_]+'/g) || []).map((x) => x.slice(5, -1))));
+        const told = readme.slice(readme.indexOf('Daemon → app:'));
+        assert.deepStrictEqual(sent.filter((e) => told.indexOf('"ev":"' + e + '"') < 0), [], 'events sent but not in the README');
+    });
+
+    await t('hello: service version and caps; lang / region kept for the connection; a bad one dropped, never refused', async () => {
+        const FROZEN = ['health', 'related', 'hist', 'ytdlp', 'remote', 'proxy', 'stream', 'download'];
+        assert.deepStrictEqual(CAPS, ['related', 'hist', 'health', 'remote', 'ytdlp', 'download', 'proxy'], 'what of the protocol answers for real (WP1: related, hist; WP4: health; WP9: remote; WP6: ytdlp; 0.5.0: download; 0.5.3: proxy, store or off)');
+        assert.ok(CAPS.every((x) => FROZEN.indexOf(x) >= 0), 'caps only from the frozen names');
+        c.clear();
+        c.send({ cmd: 'hello', app: '0.4.0', lang: 'ru', region: 'RU' });
+        assert.deepStrictEqual(await c.waitFor((x) => x.ev === 'hello'), { ev: 'hello', service: VERSION, caps: CAPS });
+        assert.deepStrictEqual([d.hl, d.gl], ['ru', 'RU']);
+        for (const [lang, region, want] of [['RU', 'ru', [null, null]], ['rus', 'R1', [null, null]], [7, ['RU'], [null, null]],
+            ['de', undefined, ['de', null]], [undefined, 'DE', [null, 'DE']], ['e\n', 'GB\n', [null, null]]]) {
+            c.clear(); logs.length = 0;
+            c.send({ cmd: 'hello', app: '0.4.0', lang: lang, region: region });
+            const e = await c.waitFor((x) => x.ev === 'hello');
+            assert.deepStrictEqual([e.service, e.caps, d.hl, d.gl], [VERSION, CAPS].concat(want), JSON.stringify([lang, region]));
+            const l = logs.find((x) => /^hello: /.test(x));
+            assert.strictEqual(/bad lang/.test(l), lang !== undefined && want[0] === null, l);
+            assert.strictEqual(/bad region/.test(l), region !== undefined && want[1] === null, l);
+        }
+        c.send({ cmd: 'hello', app: '<x>', lang: 'fr', region: 'FR' });
+        await waitUntil(() => d.hl === 'fr');
+        assert.ok(logs.some((x) => x === 'hello: app unknown, lang fr, region FR'), 'an odd app version is not logged as sent');
+        const c2 = await client(d.opts.sock);
+        await waitUntil(() => d.client && d.hl === null && d.gl === null);
+        c = c2;
+        c.send({ cmd: 'status' });
+        await c.waitFor((x) => x.ev === 'state');
+        assert.deepStrictEqual([d.hl, d.gl], [null, null], 'a new connection starts with none');
+    });
+
+    await t('a wrong clock: before BUILT only; hello says it, the fetcher and the lookups get --no-cert-time, `clock` when it changes', async () => {
+        const day = 86400000, built = Date.parse(BUILT);
+        assert.ok(/^\d{4}-\d\d-\d\d$/.test(BUILT) && built <= Date.now(), 'BUILT is a date, never in the future: ' + BUILT);
+        assert.deepStrictEqual([clockBehind(built - 36 * day), clockBehind(built - 1), clockBehind(built), clockBehind(built + 400 * day)],
+            [new Date(built - 36 * day).toISOString().slice(0, 10), new Date(built - 1).toISOString().slice(0, 10), null, null],
+            'behind BUILT: the date; at or after it (a clock ahead too): nothing');
+        const wrong = Date.parse('2026-10-13T08:00:00Z');
+        assert.ok(wrong < built);
+        const job = (id) => { d.spawnJob(['extract', '--cache-dir', cache, '--', id, path.join(tmp, id + '.json')]); };
+        const jobArgv = async (id) => { await waitUntil(() => fs.existsSync(ctl + '.extract') && JSON.parse(fs.readFileSync(ctl + '.extract', 'utf8')).argv.indexOf(id) >= 0); return JSON.parse(fs.readFileSync(ctl + '.extract', 'utf8')).argv; };
+        job('ClockRight1');
+        assert.deepStrictEqual(await jobArgv('ClockRight1'), ['extract', '--cache-dir', cache, '--', 'ClockRight1', path.join(tmp, 'ClockRight1.json')], 'the clock right: no flag');
+        d.opts.now = () => wrong;
+        c.clear(); logs.length = 0;
+        c.send({ cmd: 'hello', app: '0.4.0' });
+        assert.deepStrictEqual(await c.waitFor((x) => x.ev === 'hello'), { ev: 'hello', service: VERSION, caps: CAPS, clock: '2026-10-13' });
+        assert.ok(logs.indexOf('clock wrong (2026-10-13): certificate dates not checked') >= 0, logs.join('|'));
+        job('ClockWrong1');
+        assert.deepStrictEqual(await jobArgv('ClockWrong1'), ['extract', '--no-cert-time', '--cache-dir', cache, '--', 'ClockWrong1', path.join(tmp, 'ClockWrong1.json')], 'the clock wrong: the flag');
+        assert.ok(!c.evs.some((x) => x.ev === 'clock'), 'the same date: no clock event');
+        d.opts.now = () => wrong + day;
+        d.certTime();
+        assert.deepStrictEqual(await c.waitFor((x) => x.ev === 'clock'), { ev: 'clock', clock: '2026-10-14' }, 'the date shown moves on');
+        c.clear();
+        d.opts.now = null;               // the driver set the clock
+        job('ClockRight2');
+        assert.ok((await jobArgv('ClockRight2')).indexOf('--no-cert-time') < 0, 'set right: no flag at the next spawn');
+        assert.deepStrictEqual(await c.waitFor((x) => x.ev === 'clock'), { ev: 'clock', clock: null });
+        c.send({ cmd: 'hello', app: '0.4.0' });
+        assert.deepStrictEqual(await c.waitFor((x) => x.ev === 'hello'), { ev: 'hello', service: VERSION, caps: CAPS }, 'no clock key when it is right');
+    });
+
+    await t('a wrong clock: the daemon\'s own requests go through ytfetch.py request --no-cert-time (Node 8 cannot skip only the dates)', async () => {
+        const fl = path.join(tmp, 'clockfetch.log');
+        const dq = new Daemon({ cacheDir: cache, noSetuid: true, accountFile: path.join(tmp, 'acct-clock.json'), leaseFile: path.join(tmp, 'lease-clock.json'),
+            fetchCmd: [process.execPath, path.join(__dirname, 'fake_fetch.js'), fl + '.node', 'ok'],
+            fetcher: [process.execPath, path.join(__dirname, 'fake_fetch.js'), fl, 'ok'], log: () => {} });
+        dq.fetchUid = process.getuid();
+        const rq = { method: 'POST', url: 'https://www.youtube.com/youtubei/v1/search', headers: { Authorization: 'Bearer X' }, body: { q: 1 }, timeoutMs: 2000 };
+        assert.deepStrictEqual(await dq.opts.ytRequest(rq.method, rq.url, rq.headers, rq.body, rq.timeoutMs), { status: 200, body: 'hello' });
+        assert.ok(fs.existsSync(fl + '.node') && !fs.existsSync(fl), 'the clock right: ytd.js --fetch, as before');
+        dq.opts.now = () => Date.parse('2026-10-13T08:00:00Z');
+        assert.deepStrictEqual(await dq.opts.ytRequest(rq.method, rq.url, rq.headers, rq.body, rq.timeoutMs), { status: 200, body: 'hello' });
+        assert.ok(!fs.existsSync(fl), 'no hello yet (no app could warn): dates still checked');
+        dq.clockSaid = '2026-10-13';   // the app's hello was told
+        await dq.opts.ytRequest('POST', 'https://www.youtube.com/o/oauth2/token', {}, { refresh_token: 'R' }, 2000);
+        assert.ok(!fs.existsSync(fl), 'sign-in requests never skip the dates');
+        assert.deepStrictEqual(await dq.opts.ytRequest(rq.method, rq.url, rq.headers, rq.body, rq.timeoutMs), { status: 200, body: 'hello' });
+        const l = JSON.parse(fs.readFileSync(fl, 'utf8'));
+        assert.deepStrictEqual(l.argv.slice(4), ['request', '--no-cert-time', '--cache-dir', path.join(cache, 'ytdlp'), '--lease', path.join(tmp, 'lease-clock.json')]);
+        assert.deepStrictEqual(l.req, Object.assign({}, rq, { headers: { 'User-Agent': 'Mozilla/5.0 (Linux; Tizen 2.4.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/2.4.0 TV Safari/538.1', Authorization: 'Bearer X' } }),
+            'the request on stdin, with the User-Agent ytRequest would add');
+        assert.ok(l.argv.join(' ').indexOf('Bearer') < 0, 'secrets on stdin only');
+    });
+
+    await t('proxy: store or off only, told back; an unknown command as before', async () => {
+        c.clear();
+        c.send({ cmd: 'proxy', mode: 'socks5://evil:1' });
+        assert.deepStrictEqual(await c.waitFor((x) => x.ev === 'error'), { ev: 'error', cmd: 'proxy', msg: 'bad proxy mode' });
+        c.clear();
+        c.send({ cmd: 'proxy', mode: 'store' });
+        assert.deepStrictEqual(await c.waitFor((x) => x.ev === 'proxy'), { ev: 'proxy', mode: 'store', store: false }, 'no Store conf on this machine');
+        c.clear();
+        c.send({ cmd: 'bogus' });
+        assert.deepStrictEqual(await c.waitFor((x) => x.ev === 'error'), { ev: 'error', msg: 'unknown cmd bogus' });
+    });
+
+    // ---- WP1 feeds ----
+    // Real TVHTML5 answers (anonymous, from the Mac, 2026-11-19), trimmed to a few entries, session and tracking
+    // fields removed: /next for aqz-KE-bpKQ, and a search for "cat shorts" (LOCKUP_CONTENT_TYPE_SHORT lockups).
+    // History and Liked videos need an account: their answers below are built like the other browse fixtures.
+    const NEXT = JSON.parse(fs.readFileSync(path.join(__dirname, 'next_tvhtml5.json'), 'utf8'));
+    const SHORTS = JSON.parse(fs.readFileSync(path.join(__dirname, 'search_shorts_tvhtml5.json'), 'utf8'));
+    const NEXT_IDS = ['vE57fPUAQh0', 'rdGTgpVj0Cg', 'sAtlN4OMA1I', 'X2UoFpxy4qo'];
+    const signIn = () => fs.writeFileSync(acct, JSON.stringify({ cid: 'x', sec: 'y', access: 'ACCESS-1', refresh: 'REFRESH-1', exp: Date.now() + 1e7 }), { mode: 0o600 });
+    const signOut = () => { try { fs.unlinkSync(acct); } catch (e) { /* none */ } };
+    const V = 'TILE_CONTENT_TYPE_VIDEO';
+    const resumed = (tl, pct) => { tl.tileRenderer.header.tileHeaderRenderer.thumbnailOverlays.push({ thumbnailOverlayResumePlaybackRenderer: { percentDurationWatched: pct } }); return tl; };
+    const browsePage = (shelves) => ({ contents: { tvBrowseRenderer: { content: { tvSurfaceContentRenderer: { content: { sectionListRenderer: { contents: shelves } } } } } } });
+    const HIST = browsePage([{ shelfRenderer: { headerRenderer: { shelfHeaderRenderer: { title: { simpleText: 'Today' } } }, content: { horizontalListRenderer: { items: [
+        resumed(tile('HHHHHHHHHH1', V, 'Watched half', 'Chan H', '10:00'), 50), tile('HHHHHHHHHH2', 'TILE_CONTENT_TYPE_SHORTS', 'A short seen', 'Chan S', null)] } } } }]);
+    const LIKED = { contents: { tvBrowseRenderer: { content: { tvSecondaryNavRenderer: { sections: [{ playlistVideoListRenderer: { contents: [
+        tile('LLLLLLLLLL1', V, 'Liked one', 'Chan L', '3:00'), tile('LLLLLLLLLL2', V, 'Liked two', 'Chan L', '4:00')] } }] } } } } };
+
+    await t('feed hist / liked: FEhistory and VLLL browsed with the token, tiles parsed (watched share, a short); signed out: "signed out", nothing asked', async () => {
+        signIn();
+        c.clear(); yt.calls.length = 0;
+        yt.browse = (h, b) => ok(b.browseId === 'FEhistory' ? HIST : b.browseId === 'VLLL' ? LIKED : {});
+        c.send({ cmd: 'feed', which: 'hist' });
+        const h = await c.waitFor((x) => x.ev === 'feed' && x.which === 'hist');
+        const h1 = { id: 'HHHHHHHHHH1', title: 'Watched half', channel: 'Chan H', duration_s: 600, meta: ['1K views'], watched_pct: 50 };
+        const h2 = { id: 'HHHHHHHHHH2', title: 'A short seen', channel: 'Chan S', duration_s: null, meta: ['1K views'], short: true };
+        assert.deepStrictEqual(h, { ev: 'feed', which: 'hist', items: [h1, h2], shelves: [{ title: 'Today', items: [h1, h2] }] });
+        c.send({ cmd: 'feed', which: 'liked' });
+        const l = await c.waitFor((x) => x.ev === 'feed' && x.which === 'liked');
+        assert.deepStrictEqual([l.items.map((x) => x.id), l.shelves], [['LLLLLLLLLL1', 'LLLLLLLLLL2'], []], 'a playlist: no shelves');
+        assert.deepStrictEqual(ytCalls('/browse').map((x) => [x.body.browseId, x.headers.Authorization]), [['FEhistory', 'Bearer ACCESS-1'], ['VLLL', 'Bearer ACCESS-1']]);
+        signOut();
+        c.clear(); yt.calls.length = 0;
+        for (const which of ['hist', 'liked']) {
+            c.send({ cmd: 'feed', which: which });
+            assert.deepStrictEqual(await c.waitFor((x) => x.ev === 'feed' && x.which === which), { ev: 'feed', which: which, error: 'signed out' });
+        }
+        assert.strictEqual(ytCalls('/browse').length, 0, 'nothing asked without an account');
+    });
+
+    // car, 2026-11-23: watched to 22:40 on an iPad, played here from Continue watching: the car's own older 12:30 won
+    await t('resume: the furthest of the car\'s position and YouTube\'s (the tile\'s at, else the History); History slow or signed out: the car\'s', async () => {
+        const id = 'RESUMEYT001', was = d.opts.resume;
+        mkVideo(id);
+        const at = (s) => { const x = tile(id, V, 'Long one', 'Chan R', '1:00'); x.tileRenderer.onSelectCommand.watchEndpoint.startTimeSeconds = s; return x; };
+        const hist = (s) => browsePage([{ shelfRenderer: { content: { horizontalListRenderer: { items: [at(s)] } } } }]);
+        const start = async (carMs, play, done) => {
+            d.positions()[id] = { ms: carMs, total: 60000, done: !!done, at: Date.now() };
+            calls.length = 0; yt.calls.length = 0; c.clear();
+            c.send(Object.assign({ cmd: 'play', id: id, rect: '1280x720' }, play));
+            await c.waitFor((x) => x.ev === 'state' && x.state === 'playing', 5000);
+            subs.playerState('PLAYER_STATE_PLAY');
+            tick(500);
+            await waitUntil(() => called('setTime').length);
+            const ms = called('setTime')[0].a.newTimeElapsed;
+            c.send({ cmd: 'stop' });
+            await c.waitFor((x) => x.ev === 'state' && x.state === 'idle');
+            return [ms, ytCalls('/browse').map((x) => x.body.browseId)];
+        };
+        d.opts.resume = true;
+        try {
+            signIn();
+            yt.browse = (h, b) => ok(b.browseId === 'FEhistory' ? hist(40) : {});
+            assert.deepStrictEqual(await start(20000), [40000, ['FEhistory']], 'no at: the History\'s, further');
+            assert.deepStrictEqual(await start(50000), [50000, ['FEhistory']], 'the car further: the car\'s');
+            assert.deepStrictEqual(await start(20000, { at: 30000 }), [30000, []], 'the tile\'s at, further: no History asked');
+            assert.deepStrictEqual(await start(45000, { at: 30000 }), [45000, []], 'the car further than the tile');
+            assert.deepStrictEqual(await start(59000, undefined, true), [40000, ['FEhistory']], 'watched to the end here: YouTube\'s');
+            yt.slow = { '/youtubei/v1/browse': 3000 };
+            const logs0 = logs.length;
+            assert.deepStrictEqual((await start(20000))[0], 20000, 'History slow: the car\'s, after 2.5 s');
+            assert.ok(logs.slice(logs0).some((m) => /resume: history timed out/.test(m)), logs.slice(logs0).join('|'));
+            yt.slow = null;
+            signOut();
+            assert.deepStrictEqual(await start(20000), [20000, []], 'signed out: nothing asked');
+        } finally { d.opts.resume = was; yt.slow = null; signOut(); delete d.positions()[id]; }
+    });
+
+    await t('related: the watch-next tiles (real TVHTML5 /next), the video itself left out; anonymous signed out; kept 10 min per video and language; offline; bad id', async () => {
+        signOut();
+        const id = 'aqz-KE-bpKQ';
+        c.clear(); yt.calls.length = 0; d.relatedKept = {};
+        yt.next = (h, b) => ok({ a: NEXT, b: tile(b.videoId, V, 'Itself', 'Blender', '10:34') });
+        c.send({ cmd: 'related', id: id });
+        const e = await c.waitFor((x) => x.ev === 'related');
+        assert.deepStrictEqual(e.items.map((x) => x.id), NEXT_IDS, JSON.stringify(e));
+        assert.deepStrictEqual(e.items[0], { id: 'vE57fPUAQh0', title: 'The Good Dinosaur -  Best Scenes', channel: 'Hinl', duration_s: 1437, meta: ['17M views', '9 years ago'] });
+        assert.deepStrictEqual(Object.keys(e), ['ev', 'id', 'items']);
+        const r0 = ytCalls('/youtubei/v1/next')[0];
+        assert.strictEqual(r0.headers, null, 'anonymous');
+        assert.deepStrictEqual(r0.body, { context: { client: { clientName: 'TVHTML5', clientVersion: '7.20251101.10.00', hl: 'en' } }, videoId: id });
+        c.clear();
+        c.send({ cmd: 'related', id: id });
+        assert.deepStrictEqual(await c.waitFor((x) => x.ev === 'related'), e, 'kept');
+        assert.strictEqual(ytCalls('/youtubei/v1/next').length, 1, 'within 10 min: not asked again');
+        Object.keys(d.relatedKept).forEach((k) => { d.relatedKept[k].t -= 600001; });
+        c.clear();
+        c.send({ cmd: 'related', id: id });
+        await c.waitFor((x) => x.ev === 'related');
+        assert.strictEqual(ytCalls('/youtubei/v1/next').length, 2, 'after 10 min: asked again');
+        c.send({ cmd: 'hello', app: '0.4.0', lang: 'de', region: 'DE' });
+        await c.waitFor((x) => x.ev === 'hello');
+        c.clear();
+        c.send({ cmd: 'related', id: id });
+        await c.waitFor((x) => x.ev === 'related');
+        assert.strictEqual(ytCalls('/youtubei/v1/next').length, 3, 'another language: asked again');
+        assert.deepStrictEqual(ytCalls('/youtubei/v1/next')[2].body.context.client, { clientName: 'TVHTML5', clientVersion: '7.20251101.10.00', hl: 'de', gl: 'DE' });
+        c.send({ cmd: 'hello', app: '0.4.0' });
+        await waitUntil(() => d.hl === null);
+        signIn();
+        c.clear(); yt.calls.length = 0;
+        yt.next = (h, b) => (h ? { status: 401, body: '{}' } : ok(NEXT));
+        c.send({ cmd: 'related', id: 'XXXXXXXXXX1' });
+        assert.deepStrictEqual((await c.waitFor((x) => x.ev === 'related')).items.map((x) => x.id), NEXT_IDS);
+        assert.deepStrictEqual(ytCalls('/youtubei/v1/next').map((x) => x.headers && x.headers.Authorization), ['Bearer ACCESS-1', null], 'signed in, then anonymous on a 401');
+        c.send({ cmd: 'sign_out' });
+        await c.waitFor(authEv('signed_out'));
+        c.clear();
+        c.send({ cmd: 'related', id: 'XXXXXXXXXX1' });
+        await c.waitFor((x) => x.ev === 'related');
+        assert.strictEqual(ytCalls('/youtubei/v1/next').length, 3, 'sign_out drops what the account was shown');
+        c.clear(); logs.length = 0;
+        yt.next = () => Promise.reject(new Error('ENETUNREACH'));
+        c.send({ cmd: 'related', id: 'XXXXXXXXXX2' });
+        assert.deepStrictEqual(await c.waitFor((x) => x.ev === 'related'), { ev: 'related', id: 'XXXXXXXXXX2', error: 'related offline' });
+        assert.ok(logs.some((m) => m === 'related: ENETUNREACH'), logs.join('|'));
+        yt.next = () => ({ status: 500, body: 'x' });
+        c.clear();
+        c.send({ cmd: 'related', id: 'XXXXXXXXXX2' });
+        assert.deepStrictEqual(await c.waitFor((x) => x.ev === 'related'), { ev: 'related', id: 'XXXXXXXXXX2', error: 'related offline' }, 'an error answer is not kept');
+        c.clear();
+        c.send({ cmd: 'related', id: '../etc' });
+        assert.deepStrictEqual(await c.waitFor((x) => x.ev === 'related'), { ev: 'related', id: '../etc', error: 'bad id' });
+        yt.next = null;
+    });
+
+    await t('Shorts: a real TVHTML5 search of shorts (LOCKUP_CONTENT_TYPE_SHORT) and Shorts tiles come with short:true, plain videos without', async () => {
+        const items = feedItems(SHORTS);
+        assert.deepStrictEqual(items.map((x) => [x.id, x.short, x.duration_s]), [['odPXcj2id8k', true, null], ['TsIvLpSJQbk', true, null], ['SgbNfUpnLj0', true, null], ['6W2q6g-qs4w', true, null]]);
+        assert.deepStrictEqual(items[0].meta, ['274M views', '1 year ago']);
+        assert.ok(feedItems(SEARCH).concat(feedItems(NEXT)).every((x) => !('short' in x)), 'no flag on plain videos');
+        signOut();
+        c.clear();
+        yt.search = () => ok(SHORTS);
+        c.send({ cmd: 'search', q: 'cat shorts' });
+        assert.deepStrictEqual((await c.waitFor((x) => x.ev === 'results')).items, items);
+        yt.search = () => ok(SEARCH);
+    });
+
+    await t('live: a live or upcoming tile / lockup (a real one, its overlay made live) has live:true and no length; plain videos none', async () => {
+        const json = (o) => JSON.parse(JSON.stringify(o));
+        const findAll = (o, k, out) => { if (o && typeof o === 'object') { if (o[k]) out.push(o[k]); Object.keys(o).forEach((x) => findAll(o[x], k, out)); } return out; };
+        const lk = json(findAll(SEARCH, 'lockupViewModel', [])[0]), tl = json(findAll(NEXT, 'tileRenderer', []).filter((x) => x.contentType === 'TILE_CONTENT_TYPE_VIDEO')[0]);
+        const lkBadge = lk.contentImage.thumbnailViewModel.overlays[0].thumbnailBottomOverlayViewModel.badges[0].thumbnailBadgeViewModel;
+        const tlOv = tl.header.tileHeaderRenderer.thumbnailOverlays.filter((x) => x.thumbnailOverlayTimeStatusRenderer)[0].thumbnailOverlayTimeStatusRenderer;
+        const plain = feedItems({ a: [{ lockupViewModel: lk }, { tileRenderer: tl }] });
+        assert.ok(plain.length === 2 && plain.every((x) => !('live' in x) && x.duration_s > 0), 'as captured: not live');
+        assert.ok(feedItems(SEARCH).concat(feedItems(NEXT), feedItems(SHORTS)).every((x) => !('live' in x)), 'no flag on the captured videos');
+        Object.assign(lkBadge, { text: 'LIVE', badgeStyle: 'THUMBNAIL_OVERLAY_BADGE_STYLE_LIVE' });
+        Object.assign(tlOv, { text: { runs: [{ text: 'EN DIRECT' }] }, style: 'LIVE' });       // (style, whatever the language)
+        const up = json(tl); up.contentId = 'UPCOMING001';
+        up.header.tileHeaderRenderer.thumbnailOverlays.filter((x) => x.thumbnailOverlayTimeStatusRenderer)[0].thumbnailOverlayTimeStatusRenderer = { text: { simpleText: 'UPCOMING' }, style: 'UPCOMING' };
+        const now = json(tl); now.contentId = 'LIVENOW0001';
+        now.header.tileHeaderRenderer.thumbnailOverlays = [];
+        now.metadata.tileMetadataRenderer.lines[1].lineRenderer.items.unshift({ lineItemRenderer: { badge: { metadataBadgeRenderer: { style: 'BADGE_STYLE_TYPE_LIVE_NOW', label: 'LIVE' } } } });
+        const items = feedItems({ a: [{ lockupViewModel: lk }, { tileRenderer: tl }, { tileRenderer: up }, { tileRenderer: now }] });
+        assert.deepStrictEqual(items.map((x) => [x.live, x.duration_s]), [[true, null], [true, null], [true, null], [true, null]]);
+        assert.deepStrictEqual([items[0].id, items[0].title, items[0].channel], [plain[0].id, plain[0].title, plain[0].channel], 'the rest as before');
+        const named = json(findAll(SEARCH, 'lockupViewModel', [])[0]); named.metadata.lockupMetadataViewModel.title.content = 'LIVE';
+        assert.ok(!('live' in feedItems({ a: [{ lockupViewModel: named }] })[0]), 'a title "LIVE" is not a live stream');
+    });
+
+    await t('100 videos per list; the worst-case feed line (100 items + 8 shelves of 12) stays under the app\'s 1 MiB MAX_LINE', async () => {
+        const MAX_LINE = 1 << 20;   // apps/jap_ridetube/yt.js
+        // the longest text JSON can make: 100 control characters, each written as \u00XX (6 bytes)
+        const big = new Array(101).join('\u0001'), part = { lineItemRenderer: { text: { simpleText: big } } };
+        const id = (n) => 'W' + ('000000000' + n).slice(-10);
+        const fat = (n) => resumed(tile(id(n), V, big, big, '10:00:00', [part, part, part]), 99);
+        const shelves = [];
+        for (let s = 0; s < 11; s++) { const tl = []; for (let i = 0; i < 12; i++) tl.push(fat(s * 12 + i)); shelves.push({ shelfRenderer: { content: { horizontalListRenderer: { items: tl } } } }); }
+        signIn();
+        c.clear();
+        yt.browse = () => ok(browsePage(shelves));
+        c.send({ cmd: 'feed', which: 'home' });
+        const e = await c.waitFor((x) => x.ev === 'feed' && x.which === 'home');
+        assert.deepStrictEqual([e.items.length, e.shelves.length, e.shelves.every((x) => x.items.length === 12)], [100, 8, true]);
+        const line = JSON.stringify(e) + '\n';
+        assert.ok(line.length < MAX_LINE && Buffer.byteLength(line) < MAX_LINE, 'feed line ' + Buffer.byteLength(line) + ' bytes');
+        assert.ok(Buffer.byteLength(line) > 400000, 'the worst case really is big: ' + Buffer.byteLength(line));
+        yt.search = () => ok(browsePage(shelves));
+        c.clear();
+        c.send({ cmd: 'search', q: 'x' });
+        assert.strictEqual((await c.waitFor((x) => x.ev === 'results')).items.length, 100);
+        yt.next = () => ok(browsePage(shelves));
+        c.send({ cmd: 'related', id: 'YYYYYYYYYY1' });
+        assert.strictEqual((await c.waitFor((x) => x.ev === 'related')).items.length, 100);
+        yt.search = () => ok(SEARCH); yt.next = null;
+    });
+
+    await t('hl / gl from hello reach feeds, search and related; the Playlists page stays English; no hello: hl en, no gl; caps related + hist', async () => {
+        assert.ok(CAPS.indexOf('related') >= 0 && CAPS.indexOf('hist') >= 0);
+        signIn();
+        yt.browse = () => ok(BROWSE);
+        yt.next = () => ok(NEXT);
+        const ask = async () => {
+            yt.calls.length = 0; c.clear();
+            c.send({ cmd: 'feed', which: 'subs' }); await c.waitFor((x) => x.ev === 'feed');
+            c.send({ cmd: 'search', q: 'q' }); await c.waitFor((x) => x.ev === 'results');
+            c.send({ cmd: 'related', id: 'ZZZZZZZZZZ' + (d.hl ? '1' : '2') }); await c.waitFor((x) => x.ev === 'related');
+            c.send({ cmd: 'playlists' }); await c.waitFor((x) => x.ev === 'playlists');
+            return yt.calls.filter((x) => x.body && x.body.context).map((x) => [x.url.replace(/.*v1\//, ''), x.body.browseId || '', x.body.context.client]);
+        };
+        c.send({ cmd: 'hello', app: '0.4.0', lang: 'ru', region: 'RU' });
+        await waitUntil(() => d.hl === 'ru');
+        const ru = { clientName: 'TVHTML5', clientVersion: '7.20251101.10.00', hl: 'ru', gl: 'RU' };
+        const en = { clientName: 'TVHTML5', clientVersion: '7.20251101.10.00', hl: 'en' };
+        const got = await ask();
+        assert.deepStrictEqual(got.slice(0, 4), [['browse', 'FEsubscriptions', ru], ['search', '', ru], ['next', '', ru], ['browse', 'FEplaylist_aggregation', en]]);
+        c.send({ cmd: 'hello', app: '0.4.0', region: 'RU' });
+        await waitUntil(() => d.hl === null);
+        assert.deepStrictEqual((await ask()).slice(0, 3).map((x) => x[2]), [1, 2, 3].map(() => ({ clientName: 'TVHTML5', clientVersion: '7.20251101.10.00', hl: 'en', gl: 'RU' })), 'a region alone');
+        c.send({ cmd: 'hello', app: '0.4.0' });
+        await waitUntil(() => d.gl === null);
+        assert.deepStrictEqual((await ask()).slice(0, 3).map((x) => x[2]), [en, en, en], 'none: as before');
+        yt.next = null;
+    });
+
+    // ---- WP3 socket + security ----
+    const cp = require('child_process');
+    const realChown = fs.chownSync, realSpawnSync = cp.spawnSync;
+    const chowns = [];
+    const recordChown = (fail) => { chowns.length = 0; fs.chownSync = (p, u, g) => { chowns.push([p, u, g]); if (fail === true || fail === u) throw Object.assign(new Error('EPERM'), { code: 'EPERM' }); }; };
+    const wroot = path.join(tmp, 'wp3'), wcache = path.join(wroot, 'cache'), wlogs = [];
+    const reg = path.join(wroot, 'oap', 'oap_12201', 'data', 'apps', 'jap_ridetube.json');
+    mkdirp(path.dirname(reg)); mkdirp(wcache);
+    const wsock = path.join(tmp, 'w3.sock');
+    const modeOf = (p) => fs.statSync(p).mode & 0o777;
+    const wmain = [{ root: path.join(wroot, 'mainapp'), hmi: 'HmiMain3D' }];   // app uids 20000-29999
+    mkdirp(path.join(wroot, 'mainapp', 'config'));
+    fs.writeFileSync(path.join(wroot, 'mainapp', 'config', 'base.json'), JSON.stringify({ usableUidsAndGids: { min: 20000, max: 29999 } }));
+    const ds = new Daemon({ someip: { buildProxy: () => new Promise(() => {}) }, srcGen: srcGen, cacheDir: wcache, logDir: wroot, sock: wsock,
+        oapRoot: path.join(wroot, 'oap'), mgrUid: process.getuid(), mainapps: wmain, tickMs: 100, noSetuid: !root, spare: false, ytRequest: fakeYt, keep: 20,
+        accountFile: path.join(wroot, 'account.json'), stateDir: path.join(wroot, 'state'), log: (m) => wlogs.push(m) });
+
+    await t('WP3 registry: trusted only when MainApp (or root) owns every part, no symlink, not world-writable', async () => {
+        fs.writeFileSync(reg, JSON.stringify({ appId: 'jap_ridetube', userId: 23456 }));
+        assert.strictEqual(ds.regOk(reg), true);
+        const other = new Daemon({ oapRoot: path.join(wroot, 'oap'), mgrUid: process.getuid() + 1, mainapps: wmain, ytRequest: fakeYt,
+            accountFile: path.join(wroot, 'acct-x.json'), stateDir: path.join(wroot, 'state-x'), log: () => {} });
+        assert.strictEqual(root ? true : other.regOk(reg) === false && other.appUid() === null && other.appRemoved() === false, true);
+        fs.chmodSync(reg, 0o666);
+        assert.strictEqual(ds.regOk(reg), false);
+        assert.strictEqual(ds.appUid(), null);
+        fs.chmodSync(reg, 0o644);
+        const real = path.join(wroot, 'apps-real'), apps = path.dirname(reg);
+        fs.renameSync(apps, real); fs.symlinkSync(real, apps);
+        try { assert.strictEqual(ds.regOk(reg), false); assert.strictEqual(ds.appUid(), null); assert.strictEqual(ds.appRemoved(), false); }
+        finally { fs.unlinkSync(apps); fs.renameSync(real, apps); }
+        assert.strictEqual(ds.appUid(), 23456);
+    });
+    await t('WP3 socket: owner and mode from MainApp\'s registry (<app uid>:root 0600)', async () => {
+        fs.writeFileSync(reg, JSON.stringify({ appId: 'jap_ridetube', userId: 23456 }));
+        recordChown(false);
+        try {
+            ds.start();
+            await waitUntil(() => ds.sockUid === 23456, 2000);
+            assert.deepStrictEqual(chowns.slice(-1)[0], [wsock, 23456, 0]);
+            assert.strictEqual(modeOf(wsock), 0o600);
+            assert.strictEqual(ds.sockShared(), false);
+            assert.ok(wlogs.indexOf('ctl.sock: app uid 23456 only (0600)') >= 0, wlogs.join('\n'));
+        } finally { fs.chownSync = realChown; }
+    });
+
+    await t('WP3 socket: a new app uid (reinstall) re-chowns within one tick', async () => {
+        recordChown(false);
+        try {
+            await sleep(250);
+            assert.deepStrictEqual(chowns, [], 'nothing re-applied while the uid stays');
+            fs.writeFileSync(reg, JSON.stringify({ appId: 'jap_ridetube', userId: 23457 }));
+            await waitUntil(() => chowns.length, 250);
+            assert.deepStrictEqual(chowns, [[wsock, 23457, 0]]);
+            assert.strictEqual(modeOf(wsock), 0o600);
+        } finally { fs.chownSync = realChown; }
+    });
+
+    await t('WP3 socket: registry entry removed (uninstall) after a uid was known -> root only (0600) until it comes back', async () => {
+        recordChown(false);
+        const keep = fs.readFileSync(reg);
+        try {
+            fs.unlinkSync(reg);
+            await waitUntil(() => ds.sockUid === 0, 350);
+            assert.deepStrictEqual([chowns.slice(-1)[0], modeOf(wsock), ds.sockShared()], [[wsock, 0, 0], 0o600, false]);
+            assert.strictEqual(wlogs.filter((m) => /no longer in MainApp's registry: root only$/.test(m)).length, 1, 'logged once');
+            fs.writeFileSync(reg, keep);
+            await waitUntil(() => ds.sockUid === 23457, 350);
+            assert.deepStrictEqual(chowns.slice(-1)[0], [wsock, 23457, 0]);
+        } finally { fs.chownSync = realChown; }
+    });
+
+    await t('WP3 socket: registry unreadable or not an app uid -> the last uid kept (logged once), never shared; a failed chown keeps the previous owner', async () => {
+        recordChown(false);
+        try {
+            fs.writeFileSync(reg, '{');
+            await sleep(350);
+            assert.deepStrictEqual([ds.sockUid, chowns, modeOf(wsock), ds.sockShared()], [23457, [], 0o600, false]);
+            ['{"userId":"root"}', '{"userId":true}', '{"userId":5}', '{"userId":23999}', '{"userId":23456.5}', '{'].forEach((txt) => {
+                ds.fetchUid = 23999;   // the fetch uid is never the app's
+                fs.writeFileSync(reg, txt);
+                ds.lockSocket();
+            });
+            ds.fetchUid = null;
+            await sleep(250);
+            assert.deepStrictEqual([ds.sockUid, chowns, modeOf(wsock)], [23457, [], 0o600]);
+            assert.strictEqual(wlogs.filter((m) => /kept 23457$/.test(m)).length, 1, 'logged once');
+            assert.ok(!wlogs.some((m) => /^ctl\.sock: shared/.test(m)), wlogs.join('\n'));
+            recordChown(23458);
+            fs.writeFileSync(reg, JSON.stringify({ userId: 23458 }));
+            await waitUntil(() => chowns.length >= 2, 250);                       // the try, then the previous owner back
+            assert.deepStrictEqual(chowns.slice(0, 2), [[wsock, 23458, 0], [wsock, 23457, 0]]);
+            assert.deepStrictEqual([ds.sockUid, modeOf(wsock), ds.sockShared()], [23457, 0o600, false]);
+            await sleep(250);
+            assert.strictEqual(wlogs.filter((m) => /EPERM: kept app uid 23457/.test(m)).length, 1, 'logged once');
+            recordChown(true);                                                    // the old owner cannot be put back either: root only
+            await waitUntil(() => ds.sockUid === 0, 350);
+            assert.deepStrictEqual([modeOf(wsock), ds.sockShared()], [0o600, false]);
+            recordChown(false);
+            await waitUntil(() => ds.sockUid === 23458, 350);
+        } finally {
+            fs.chownSync = realChown;
+            ds.timers.forEach(clearInterval); ds.timers = [];
+            ds.server.close();
+        }
+    });
+
+    // a daemon on its own socket and state, listening only (lockSocket by hand)
+    const wds = [];
+    const sockDaemon = async (name, state) => {
+        const x = new Daemon({ someip: someip, srcGen: srcGen, cacheDir: wcache, logDir: wroot, sock: path.join(tmp, name + '.sock'),
+            oapRoot: path.join(wroot, 'oap'), mgrUid: process.getuid(), mainapps: wmain, noSetuid: true, spare: false, ytRequest: fakeYt, keep: 20,
+            accountFile: path.join(wroot, 'account.json'), stateDir: state || path.join(wroot, 'st-' + name), log: (m) => wlogs.push(m) });
+        wds.push(x);
+        x.listen();
+        await waitUntil(() => x.sockUid !== undefined, 1000);
+        return x;
+    };
+
+    await t('WP3 socket: the last app uid is kept in state/app-uid.json (0600): a restart with no registry entry stays locked to it', async () => {
+        recordChown(false);
+        try {
+            const f = path.join(wroot, 'state', 'app-uid.json');
+            assert.deepStrictEqual([JSON.parse(fs.readFileSync(f, 'utf8')), modeOf(f)], [{ uid: 23458 }, 0o600]);
+            fs.writeFileSync(reg, '{');                                 // unreadable, not removed
+            const x = await sockDaemon('restart', path.join(wroot, 'state'));
+            assert.deepStrictEqual([x.sockUid, chowns.slice(-1)[0], modeOf(x.opts.sock)], [23458, [x.opts.sock, 23458, 0], 0o600]);
+            fs.writeFileSync(f, JSON.stringify({ uid: 5 }));            // not an app uid: not trusted either
+            const y = await sockDaemon('restart2', path.join(wroot, 'state'));
+            assert.strictEqual(y.sockUid, null);
+        } finally { fs.chownSync = realChown; }
+    });
+
+    await t('WP3 socket: shared (0660) only while no app uid was ever known; once known, never shared again', async () => {
+        recordChown(false);
+        try {
+            try { fs.unlinkSync(reg); } catch (e) { /* none */ }
+            const x = await sockDaemon('fresh');
+            assert.deepStrictEqual([x.sockUid, modeOf(x.opts.sock), x.sockShared()], [null, 0o660, true]);
+            fs.writeFileSync(reg, JSON.stringify({ userId: 23460 }));
+            x.lockSocket();
+            assert.deepStrictEqual([x.sockUid, modeOf(x.opts.sock), x.sockShared()], [23460, 0o600, false]);
+            fs.unlinkSync(reg);                                          // removed once known: root only, not shared
+            x.lockSocket();
+            assert.deepStrictEqual([x.sockUid, modeOf(x.opts.sock), x.sockShared()], [0, 0o600, false]);
+        } finally { fs.chownSync = realChown; }
+    });
+
+    await t('WP3 socket: an owner change drops the connected client (made under the old mode); its reconnect stays', async () => {
+        recordChown(false);
+        try {
+            try { fs.unlinkSync(reg); } catch (e) { /* none */ }
+            const x = await sockDaemon('drop');
+            assert.strictEqual(x.sockUid, null);
+            fs.chmodSync(x.opts.sock, 0o600);   // (as the test's own user: connecting needs the owner bit, chown is stubbed)
+            const c1 = await client(x.opts.sock);
+            await waitUntil(() => x.client, 1000);
+            const gone = new Promise((r) => c1.on('close', r));
+            fs.writeFileSync(reg, JSON.stringify({ userId: 23461 }));
+            x.lockSocket();
+            assert.strictEqual(await Promise.race([gone.then(() => 'closed'), sleep(1000).then(() => 'open')]), 'closed');
+            assert.ok(wlogs.some((m) => /owner changed: the connected client is dropped/.test(m)));
+            const c2 = await client(x.opts.sock);
+            await waitUntil(() => x.client, 1000);
+            const closed = [];
+            c2.on('close', () => closed.push(1));
+            x.lockSocket(); x.lockSocket();
+            await sleep(100);
+            assert.deepStrictEqual([closed, x.sockUid], [[], 23461], 'same uid: kept');
+            c2.destroy();
+        } finally { fs.chownSync = realChown; }
+    });
+
+    await t('WP3 appUid: an integer or digits inside MainApp\'s ranges, never the fetch uid; ranges unknown: range not checked', async () => {
+        const x = wds[0], cases = [[true, null], [1, null], [19999, null], [30000, null], ['23462', 23462], [23462, 23462], [23462.5, null], ['2e4', null], [null, null], [0, null]];
+        cases.forEach((cv) => { fs.writeFileSync(reg, JSON.stringify({ userId: cv[0] })); assert.strictEqual(x.appUid(), cv[1], JSON.stringify(cv)); });
+        x.fetchUid = 23462;
+        assert.strictEqual(x.appUid(), null, 'the fetch uid');
+        x.fetchUid = null;
+        const y = new Daemon({ oapRoot: path.join(wroot, 'oap'), mgrUid: process.getuid(), mainapps: [], ytRequest: fakeYt, accountFile: path.join(wroot, 'account.json'), log: () => {} });
+        fs.writeFileSync(reg, JSON.stringify({ userId: 40000 }));
+        assert.strictEqual(y.appUid(), 40000);
+        y.account.close();
+    });
+
+    await t('WP3 SponsorBlock cache in root\'s cache/.sb: a sb.json symlink in the video folder is never read or written', async () => {
+        const id = 'SBSBSBSBSB1', vdir = path.join(wcache, id), victim = path.join(wroot, 'victim.json');
+        fs.mkdirSync(vdir);
+        const planted = '[{"s":1000,"e":9000,"cat":"sponsor"}]';
+        fs.writeFileSync(victim, planted);
+        fs.symlinkSync(victim, path.join(vdir, 'sb.json'));
+        yt.sb = () => ({ status: 200, body: JSON.stringify([{ videoID: id, segments: [{ category: 'sponsor', actionType: 'skip', segment: [10, 20] }] }]) });
+        yt.calls.length = 0;
+        const cur = { id: id, dir: vdir };
+        ds.cur = cur;
+        await ds.loadSegments(cur);
+        assert.strictEqual(yt.calls.filter((x) => /sponsor/.test(x.url)).length, 1, 'asked SponsorBlock: the planted file is not read');
+        assert.deepStrictEqual(cur.segs, [{ s: 10000, e: 20000, cat: 'sponsor' }]);
+        assert.strictEqual(fs.readFileSync(victim, 'utf8'), planted, 'the symlink target is unchanged');
+        assert.ok(fs.lstatSync(path.join(vdir, 'sb.json')).isSymbolicLink());
+        const f = path.join(wcache, '.sb', id + '.json');
+        assert.deepStrictEqual(JSON.parse(fs.readFileSync(f, 'utf8')), [{ s: 10000, e: 20000, cat: 'sponsor' }]);
+        assert.deepStrictEqual([modeOf(path.join(wcache, '.sb')), modeOf(f)], [0o700, 0o600]);
+        await ds.loadSegments(cur);
+        assert.strictEqual(yt.calls.filter((x) => /sponsor/.test(x.url)).length, 1, 'cached');
+        ds.cur = null;
+    });
+
+    await t('WP3 prefetch: root never makes, chowns or prunes info/ (a symlink there reaches nothing); chownFetch refuses deeper paths', async () => {
+        const c2 = path.join(wroot, 'cache2'), ytc = path.join(c2, 'ytdlp'), away = path.join(wroot, 'away');
+        mkdirp(ytc); fs.mkdirSync(away);
+        const old = path.join(away, 'old.json');
+        fs.writeFileSync(old, '{}'); fs.utimesSync(old, new Date(0), new Date(0));
+        fs.symlinkSync(away, path.join(ytc, 'info'));
+        const jobs = [];
+        const di = new Daemon({ someip: someip, srcGen: srcGen, cacheDir: c2, logDir: wroot, noSetuid: false, spare: true, ytRequest: fakeYt,
+            accountFile: path.join(wroot, 'account.json'), stateDir: path.join(wroot, 'state'), log: (m) => wlogs.push(m) });
+        di.fetchUid = 4242;
+        di.spawnJob = (args) => { jobs.push(args); return cp.spawn(process.execPath, ['-e', '']); };
+        recordChown(false);
+        try {
+            di.prefetch('INFOINFOIN1');
+            await di.extracting.done;
+            assert.deepStrictEqual(jobs, [['extract', '--cache-dir', ytc, '--', 'INFOINFOIN1', path.join(ytc, 'info', 'INFOINFOIN1.json')]]);
+            assert.ok(chowns.length > 0 && chowns.every((x) => x[0] === ytc && x[1] === 4242), JSON.stringify(chowns));
+            assert.ok(fs.existsSync(old), 'an old file behind the symlink is not pruned by root');
+            assert.ok(fs.lstatSync(path.join(ytc, 'info')).isSymbolicLink());
+            assert.throws(() => di.chownFetch(path.join(ytc, 'info')), /outside the cache/);
+            assert.throws(() => di.chownFetch(old), /outside the cache/);
+            assert.ok(chowns.every((x) => x[0] === ytc));
+        } finally { fs.chownSync = realChown; }
+        di.account.close();
+    });
+
+    await t('WP3 rmTree: a fetch-owned folder is emptied by its owner (rm -rf as that uid), then root rmdirs it; prune goes through it and skips .sb', async () => {
+        const runs = [], own = (p) => { if (root) cp.execSync('chown -hR 4242:4242 ' + p); };   // as root (Docker): a fetch uid's tree
+        cp.spawnSync = function (cmd, args, o) { runs.push([cmd, args, o]); return realSpawnSync.apply(cp, arguments); };
+        try {
+            const vid = path.join(wcache, 'RMRMRMRMRM1'), away = path.join(wroot, 'away2');
+            fs.mkdirSync(vid); fs.mkdirSync(away);
+            fs.writeFileSync(path.join(vid, 'audio.m4a'), 'a'); fs.writeFileSync(path.join(away, 'keep.txt'), 'k');
+            fs.symlinkSync(away, path.join(vid, 'link'));
+            own(vid);
+            ds.rmTree(vid);
+            assert.deepStrictEqual(runs.map((r) => [r[0], r[1]]), [['/bin/rm', ['-rf', '--', vid]]]);
+            assert.deepStrictEqual([runs[0][2].env, runs[0][2].cwd], [{}, '/']);
+            assert.ok(!fs.existsSync(vid) && fs.existsSync(path.join(away, 'keep.txt')));
+            // prune: every id folder through it; .sb/<id>.json goes with its folder, a protected one stays; .sb itself untouched
+            runs.length = 0;
+            const sbd = path.join(wcache, '.sb');
+            ['PRPRPRPRPR1', 'PRPRPRPRPR2'].forEach((id) => { fs.mkdirSync(path.join(wcache, id)); fs.writeFileSync(path.join(sbd, id + '.json'), '[]'); });
+            fs.writeFileSync(path.join(sbd, 'KEEPKEEPKE1.json'), '[]');
+            ['PRPRPRPRPR1', 'PRPRPRPRPR2', 'SBSBSBSBSB1'].forEach((id) => own(path.join(wcache, id)));
+            ds.opts.keep = 0; ds.preparing = 'KEEPKEEPKE1';
+            const removed = ds.prune();
+            ds.preparing = null;
+            assert.deepStrictEqual(removed.sort(), ['PRPRPRPRPR1', 'PRPRPRPRPR2', 'SBSBSBSBSB1']);
+            assert.deepStrictEqual(runs.map((r) => r[1][2]).sort(), removed.map((id) => path.join(wcache, id)));
+            assert.deepStrictEqual(fs.readdirSync(sbd), ['KEEPKEEPKE1.json']);
+        } finally { cp.spawnSync = realSpawnSync; }
+        // as root: rm runs as the folder's owner (the fetch uid), never root
+        const vid3 = path.join(wroot, 'cache2', 'OWNEROWNER1');
+        fs.mkdirSync(vid3); own(vid3);
+        const st = fs.lstatSync(vid3), seen = [];
+        const di = new Daemon({ cacheDir: path.join(wroot, 'cache2'), noSetuid: false, ytRequest: fakeYt, accountFile: path.join(wroot, 'account.json'), log: () => {} });
+        cp.spawnSync = (cmd, args, o) => { seen.push(o); return { status: 1 }; };
+        try { di.rmTree(vid3); } finally { cp.spawnSync = realSpawnSync; }
+        assert.deepStrictEqual([seen[0].uid, seen[0].gid], [st.uid, st.uid], 'gid = uid, as every fetch spawn');
+        assert.ok(!fs.existsSync(vid3), 'root rmdirs the emptied folder');
+        di.account.close();
+    });
+
+    await t('WP3 pruneCache (the plain function): .sb is not a video, never listed or removed', async () => {
+        const lc = path.join(wroot, 'lc');
+        mkdirp(path.join(lc, '.sb'));
+        fs.writeFileSync(path.join(lc, '.sb', 'ZZZZZZZZZZ1.json'), '[]');
+        fs.mkdirSync(path.join(lc, 'ZZZZZZZZZZ1'));
+        assert.deepStrictEqual(listCache(lc).map((x) => x.id), ['ZZZZZZZZZZ1']);
+        assert.deepStrictEqual(pruneCache(lc, 0, [], () => {}), ['ZZZZZZZZZZ1']);
+        assert.deepStrictEqual([fs.existsSync(path.join(lc, '.sb')), fs.readdirSync(path.join(lc, '.sb'))], [true, []]);
+    });
+
+    await t('WP3 rmTree: a folder owned by one of MainApp\'s app uids is refused (thrown, left), rm never runs', async () => {
+        const vid = path.join(wcache, 'APPUIDAPPU1'), runs = [], realLstat = fs.lstatSync;
+        fs.mkdirSync(vid);
+        fs.lstatSync = function (p) { const st = realLstat.apply(fs, arguments); if (p === vid) st.uid = 20500; return st; };
+        cp.spawnSync = function () { runs.push(arguments); return realSpawnSync.apply(cp, arguments); };
+        try {
+            assert.throws(() => wds[0].rmTree(vid), /owned by app uid 20500/);
+        } finally { fs.lstatSync = realLstat; cp.spawnSync = realSpawnSync; }
+        assert.deepStrictEqual([runs.length, fs.existsSync(vid)], [0, true]);
+        fs.rmdirSync(vid);
+    });
+
+    await t('WP3 root reads in a video folder: a FIFO meta.json does not hang, symlinks and wrong sizes are missing', async () => {
+        const fifo = path.join(wroot, 'fifo'), fv = path.join(fifo, 'FIFOFIFOFI1');
+        mkdirp(fv);
+        cp.execSync('mkfifo ' + path.join(fv, 'meta.json'));
+        const r = cp.spawnSync(process.execPath, ['-e', 'console.log(JSON.stringify(require(process.argv[1]).listCache(process.argv[2])))',
+            path.join(__dirname, '..', 'ytd.js'), fifo], { timeout: 3000, encoding: 'utf8' });
+        assert.ok(!r.error && r.status === 0, 'listCache returned: ' + (r.error && r.error.message));
+        assert.strictEqual(JSON.parse(r.stdout)[0].title, 'FIFOFIFOFI1');
+        const away = path.join(wroot, 'away3');
+        fs.mkdirSync(away);
+        fs.writeFileSync(path.join(away, 'meta.json'), JSON.stringify({ title: 'Planted' }));
+        fs.writeFileSync(path.join(away, 'thumb.rgba'), Buffer.alloc(57600, 3));
+        const lc = path.join(wroot, 'reads'), big = path.join(lc, 'BIGBIGBIGB1'), sym = path.join(lc, 'SYMSYMSYMS1');
+        mkdirp(big); fs.mkdirSync(sym);
+        fs.writeFileSync(path.join(big, 'meta.json'), JSON.stringify({ title: 'Big', pad: 'x'.repeat(70 << 10) }));
+        fs.symlinkSync(path.join(away, 'meta.json'), path.join(sym, 'meta.json'));
+        assert.deepStrictEqual(listCache(lc).map((x) => x.title).sort(), ['BIGBIGBIGB1', 'SYMSYMSYMS1'], 'over 64 KiB / a symlink: no meta');
+        fs.writeFileSync(path.join(big, 'meta.json'), JSON.stringify({ title: 'Small' }));
+        assert.ok(listCache(lc).some((x) => x.title === 'Small'), 'a plain meta.json is read');
+        // thumbs: a symlinked thumb.rgba and an odd size are missing (the helper is asked instead)
+        const asked = [], evs = [], x = wds[0];
+        x.opts.cacheDir = lc;
+        x.thumbFetch = (id) => { asked.push(id); return Promise.reject(new Error('offline')); };
+        x.emit = (o) => evs.push(o);
+        fs.symlinkSync(path.join(away, 'thumb.rgba'), path.join(sym, 'thumb.rgba'));
+        fs.writeFileSync(path.join(big, 'thumb.rgba'), Buffer.alloc(1234, 1));
+        await x.thumb('SYMSYMSYMS1'); await x.thumb('BIGBIGBIGB1');
+        assert.deepStrictEqual([evs, asked], [[], ['SYMSYMSYMS1', 'BIGBIGBIGB1']]);
+        fs.writeFileSync(path.join(big, 'thumb.rgba'), Buffer.alloc(57600, 1));
+        await x.thumb('BIGBIGBIGB1');
+        assert.deepStrictEqual(evs.map((e) => [e.id, e.w, e.h]), [['BIGBIGBIGB1', 160, 90]]);
+        x.opts.cacheDir = wcache;
+    });
+
+    await t('WP3 cache dir at start: a symlink or a foreign owner refuses to start; group/other writable is fixed to 0711 and logged', async () => {
+        const real = path.join(wroot, 'cdreal'), link = path.join(wroot, 'cdlink'), realLstat = fs.lstatSync;
+        fs.mkdirSync(real); fs.chmodSync(real, 0o777);
+        fs.symlinkSync(real, link);
+        const x = wds[0];
+        x.opts.cacheDir = link;
+        const r = await Promise.race([x.start().then(() => 'started', (e) => e), sleep(1000).then(() => 'still running')]);
+        assert.ok(r instanceof Error && r.refuse && /is not a folder/.test(r.message), String(r));
+        x.opts.cacheDir = real;
+        fs.lstatSync = function (p) { const st = realLstat.apply(fs, arguments); if (p === real) st.uid = process.getuid() + 1; return st; };
+        try { assert.throws(() => x.checkCacheDir(), /owned by uid/); } finally { fs.lstatSync = realLstat; }
+        x.checkCacheDir();
+        assert.strictEqual(modeOf(real), 0o711);
+        assert.ok(wlogs.some((m) => /^SECURITY: cache dir .* was 777/.test(m)), wlogs.join('\n'));
+        x.opts.cacheDir = wcache;
+    });
+    wds.forEach((x) => { x.server.close(); x.account.close(); });
+
+    // ---- WP2 recovery ----
+    // every test here ends stopped with no audio connection of ours (the same leftover check as above)
+    const idle = async () => { await stopIdle(); c.clear(); assert.strictEqual(ours().length, 0, 'an audio connection left open'); };
+    // a BMW proxy's callMethod through f(m, a, real): delays and refusals without touching the harness; returns the undo
+    const hook = (o, f) => { const real = o.callMethod; o.callMethod = (m, a, ms) => f(m, a, () => real.call(o, m, a, ms)); return () => { o.callMethod = real; }; };
+    const underrun = () => subs.playbackErrorEvent({ event: 'ITEM_BUFFER_UNDERRUN' });
+    const cached = async (id) => {
+        if (!fs.existsSync(path.join(cache, id))) mkVideo(id);
+        fs.writeFileSync(ytlog, ''); setMode('ok');
+        c.clear(); c.send({ cmd: 'play', id: id, rect: '1280x720' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'playing' && x.id === id);
+        subs.playerState('PLAYER_STATE_PLAY');
+        tick(5000); await sleep(50);
+        calls.length = 0; c.clear();
+    };
+    // one recovery to its end: the replayed file's first tick lets its setTime go
+    const recovered = async (n) => {
+        await waitUntil(() => called('playFile').length === n, 4000);
+        tick(0);
+        await waitUntil(() => !d.recovering && called('setTime').length === n, 4000);
+    };
+    d.opts.underrunWaitMs = 60; d.opts.audioRetryMs = 60;
+
+    await t('WP2 underrun on the full file: after the wait the player again at the clock (new connection), state stays playing; other events stay errors', async () => {
+        await cached('WP2UNDRUN01');
+        underrun();
+        await sleep(20);
+        assert.strictEqual(called('connect').length, 0, 'not before the wait');
+        await recovered(1);
+        assert.deepStrictEqual(calls.map((x) => x.m).filter((m) => m !== 'sendButtonEvent'), ['disconnect', 'connect', 'playFile', 'setTime']);
+        assert.deepStrictEqual(called('setTime')[0].a, { newTimeElapsed: 5000 });
+        assert.ok(!c.evs.some((x) => x.ev === 'error' || x.ev === 'state'), 'no error, no state change: ' + JSON.stringify(c.evs));
+        assert.strictEqual(ours().length, 1);
+        assert.strictEqual(ytdecIns().slice(-3).join(), 'in pause,in seek 5000,in resume');
+        subs.playbackErrorEvent({ event: 'SOMETHING_ELSE' });
+        await c.waitFor((x) => x.ev === 'error' && x.msg === 'playback error {"event":"SOMETHING_ELSE"}');
+        assert.strictEqual(ours().length, 0);
+        await idle();
+    });
+
+    await t('WP2 underrun burst (4 at once): one recovery, no error; one after it counts again', async () => {
+        await cached('WP2UNDRUN02');
+        for (let k = 0; k < 4; k++) underrun();
+        await recovered(1);
+        underrun();
+        await recovered(2);
+        assert.strictEqual(called('connect').length, 2);
+        assert.ok(!c.evs.some((x) => x.ev === 'error'));
+        await idle();
+    });
+
+    await t('WP2 underrun: 3 recoveries in a rolling minute, the 4th is an error of its own (audio released)', async () => {
+        await cached('WP2UNDRUN03');
+        for (let n = 1; n <= 3; n++) { underrun(); await recovered(n); }
+        underrun();
+        await c.waitFor((x) => x.ev === 'error' && x.msg === 'audio underrun: 3 recoveries in a minute, stopped');
+        assert.strictEqual(d.state, 'error');
+        assert.strictEqual(ours().length, 0);
+        await idle();
+    });
+
+    await t('WP2 underrun on the head before audio.m4a: waits for it (buffering), no error; audio_ready plays on', async () => {
+        await headPlay('WP2UNDRUNH1', 'hold');
+        c.clear();
+        underrun();
+        await c.waitFor((x) => x.ev === 'state' && x.buffering === true);
+        assert.ok(d.headWait);
+        fs.writeFileSync(ctl, 'done');
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'playing' && x.buffering === false, 4000);
+        assert.ok(!c.evs.some((x) => x.ev === 'error' || x.state === 'error'));
+        assert.strictEqual(ours().length, 1);
+        await idle();
+    });
+
+    await t('WP2 underrun during the head -> full switch: ignored, the switch completes on the same connection', async () => {
+        await headPlay('WP2UNDRUNH2', 'hold');
+        tick(10000);
+        slowPlayFile = 300;
+        fs.writeFileSync(ctl, 'full');
+        await waitUntil(() => called('playFile').length === 2);
+        c.clear();
+        underrun();
+        slowPlayFile = 0;
+        await waitUntil(() => called('setTime').length === 1);
+        await sleep(150);
+        assert.ok(!c.evs.some((x) => x.ev === 'error' || x.state === 'error'), JSON.stringify(c.evs));
+        assert.strictEqual(called('disconnect').length, 0, 'audio connection kept');
+        assert.strictEqual(called('connect').length, 1);
+        await idle();
+    });
+
+    for (const off of [20, 140]) await t('WP2 a fatal error ' + off + ' ms into an underrun recovery (BMW answers in 80 ms): the error stands, nothing reopens the audio', async () => {
+        await cached('WP2UNDRUN04');
+        d.opts.underrunWaitMs = 100;
+        const undo = hook(d.audio.cc, async (m, a, real) => { await sleep(80); return real(); });
+        try {
+            underrun();
+            await sleep(off);
+            subs.playbackErrorEvent({ event: 'FATAL' });
+            const e = await c.waitFor((x) => x.ev === 'error', 4000);
+            assert.ok(/FATAL/.test(e.msg), e.msg);
+            await sleep(600);
+            assert.strictEqual(d.state, 'error');
+            assert.strictEqual(ours().length, 0, 'no audio connection of ours left');
+        } finally { undo(); d.opts.underrunWaitMs = 60; }
+        await idle();
+    });
+
+    await t('WP2 audio start: a refused connect is tried once more and plays; refused twice -> error, nothing left connected', async () => {
+        if (!fs.existsSync(path.join(cache, 'WP2AUDIO001'))) mkVideo('WP2AUDIO001');
+        let refuse = 1, asked = 0;
+        const undo = hook(d.audio.cc, (m, a, real) => { if (m !== 'connect') return real(); asked++; return refuse-- > 0 ? Promise.resolve({ amError: 'E_NOT_POSSIBLE' }) : real(); });
+        try {
+            c.clear(); calls.length = 0;
+            c.send({ cmd: 'play', id: 'WP2AUDIO001', rect: '1280x720' });
+            await c.waitFor((x) => x.ev === 'state' && x.state === 'playing');
+            assert.strictEqual(asked, 2);
+            assert.ok(!c.evs.some((x) => x.ev === 'error'));
+            assert.strictEqual(ours().length, 1);
+            await idle();
+            refuse = 2; asked = 0;
+            c.send({ cmd: 'play', id: 'WP2AUDIO001', rect: '1280x720' });
+            await c.waitFor((x) => x.ev === 'error' && x.msg === 'audio connect: E_NOT_POSSIBLE');
+            assert.strictEqual(asked, 2, 'once more, not more');
+            assert.strictEqual(d.state, 'error');
+            assert.strictEqual(ours().length, 0);
+        } finally { undo(); }
+        await idle();
+    });
+
+    await t('WP2 fetcher dies mid-play: fetched again into the same folder (no --info) after the wait, the sound untouched, ytdec again; it completes', async () => {
+        fs.writeFileSync(ctl, 'spill'); setMode('ok'); fs.writeFileSync(ytlog, '');   // a whole fetch (a stream: restreamLater, WP8)
+        d.opts.fetchRetryMs = [300, 300];
+        const id = 'WP2FETCH001', dir = path.join(cache, id);
+        try {
+            await fetchPlay(id);
+            calls.length = 0; c.clear();
+            await waitUntil(() => ytdecLines().some((x) => / argv /.test(x)));
+            const argv = ytdecLines().filter((x) => / argv /.test(x)).length;
+            fs.writeFileSync(ctl, 'error');
+            await waitUntil(() => logs.some((l) => l === 'fetch ' + id + ': HTTP 403 - fetched again in 300 ms (1 of 2)'));
+            fs.writeFileSync(ctl, 'done');
+            await waitUntil(() => d.fetchedMs === Infinity, 4000);
+            assert.deepStrictEqual(fetchLog().argv.slice(1), ['fetch', '--cache-dir', path.join(cache, 'ytdlp'), '--height', '720', '--', id, dir]);
+            await waitUntil(() => ytdecLines().filter((x) => / argv /.test(x)).length === argv + 1);
+            assert.deepStrictEqual(calls.map((x) => x.m), [], 'no connect, disconnect or button');
+            assert.ok(!c.evs.some((x) => x.ev === 'error' || (x.ev === 'state' && x.state !== 'playing')), JSON.stringify(c.evs));
+            assert.ok(isPlayable(dir));
+        } finally { d.opts.fetchRetryMs = []; }
+        await idle();
+    });
+
+    await t('WP2 fetcher dies mid-play three times: fetched again twice, then "video incomplete" as before, the sound plays on', async () => {
+        fs.writeFileSync(ctl, 'spill');
+        const id = 'WP2FETCH002';
+        await fetchPlay(id);
+        calls.length = 0; c.clear();
+        fs.writeFileSync(ctl, 'error');
+        await c.waitFor((x) => x.ev === 'error' && x.msg === 'video incomplete: HTTP 403', 4000);
+        assert.deepStrictEqual(logs.filter((l) => l.indexOf('fetch ' + id + ': HTTP 403 - fetched again') === 0).map((l) => l.slice(-8)), ['(1 of 2)', '(2 of 2)']);
+        assert.deepStrictEqual(calls.map((x) => x.m), []);
+        assert.strictEqual(d.state, 'playing');
+        assert.strictEqual(ours().length, 1);
+        // a refusal (the video gone) or a full disk is not fetched again
+        assert.strictEqual(d.resumeFetch(id, path.join(cache, id), 'Video unavailable'), false);
+        assert.strictEqual(d.resumeFetch(id, path.join(cache, id), 'head unit storage almost full (200 MiB free): video stopped'), false);
+        await idle();
+    });
+
+    await t('WP2 play retry: no --info, and root never unlinks info/<id>.json (info/ swapped for a symlink reaches nothing)', async () => {
+        const info = path.join(cache, 'ytdlp', 'info'), away = path.join(tmp, 'wp2away'), id = 'WP2INFO0001';
+        const kept = fs.existsSync(info) ? info + '.wp2' : null;
+        if (kept) fs.renameSync(info, kept);
+        mkdirp(away);
+        fs.writeFileSync(path.join(away, id + '.json'), JSON.stringify({ id: id }));
+        fs.symlinkSync(away, info);
+        d.opts.fetchRetryMs = [200];
+        try {
+            fs.writeFileSync(ctl, 'fail'); c.clear();
+            c.send({ cmd: 'play', id: id, rect: '1280x720' });
+            await c.waitFor((x) => x.ev === 'retry', 4000);
+            fs.writeFileSync(ctl, '');
+            await c.waitFor((x) => x.ev === 'state' && x.state === 'playing' && x.id === id, 4000);
+            assert.ok(fs.existsSync(path.join(away, id + '.json')), 'the file behind the symlink is still there');
+            assert.ok(fetchLog().argv.indexOf('--info') < 0, 'the retry extracts again: ' + fetchLog().argv.join(' '));
+        } finally {
+            d.opts.fetchRetryMs = [];
+            fs.unlinkSync(info);
+            if (kept) fs.renameSync(kept, info);
+        }
+        await idle();
+    });
+
+    await t('WP2 quality while playing: back to where it was even under 10 s; paused stays paused (no sound until resume, then there)', async () => {
+        fs.writeFileSync(ctl, ''); setMode('ok');
+        await fetchPlay('WP2QUALIT01');
+        tick(5000); await sleep(100);
+        c.clear(); calls.length = 0;
+        c.send({ cmd: 'quality', quality: '480' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'playing', 4000);
+        await sleep(100); tick(0);
+        await waitUntil(() => called('setTime').length > 0);
+        assert.deepStrictEqual(called('setTime').map((x) => x.a.newTimeElapsed), [5000], 'the 5 s it was at, not 0');
+        c.send({ cmd: 'pause' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'paused');
+        c.clear(); calls.length = 0;
+        c.send({ cmd: 'quality', quality: '360' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'paused', 4000);
+        await sleep(200);
+        assert.ok(!c.evs.some((x) => x.ev === 'state' && x.state === 'playing'), 'paused all along: ' + c.evs.map((x) => x.state).join());
+        assert.strictEqual(called('connect').length, 0, 'no sound while paused');
+        assert.strictEqual(d.cur.height, 360);
+        // resume: the file at the place it was paused
+        c.send({ cmd: 'resume' });
+        await waitUntil(() => called('playFile').length === 1);
+        tick(0);
+        await waitUntil(() => called('setTime').length === 1);
+        assert.deepStrictEqual(called('setTime')[0].a, { newTimeElapsed: 5000 });
+        await idle();
+    });
+
+    await t('VP9: ytdec exit 4 -> fetched again with --avc1 where it was, once; the next video straight to --avc1; again: audio only', async () => {
+        fs.writeFileSync(ctl, ''); setMode('ok');
+        const id = 'VP9CODEC001';
+        await fetchPlay(id);
+        assert.ok(fetchLog().argv.indexOf('--avc1') < 0);
+        tick(5000); await sleep(100);
+        c.clear(); calls.length = 0;
+        const pid = fetchLog().pid;
+        setMode('codec');
+        d.child.kill('SIGKILL');                                 // death 1: the new ytdec reads the (VP9) index: exit 4
+        await waitUntil(() => fetchLog().pid !== pid, 4000);
+        assert.deepStrictEqual(fetchLog().argv.slice(1, 7), ['fetch', '--cache-dir', path.join(cache, 'ytdlp'), '--height', '720', '--avc1']);
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'playing', 4000);
+        await sleep(100); tick(0);
+        await waitUntil(() => called('setTime').length > 0);
+        assert.deepStrictEqual(called('setTime').map((x) => x.a.newTimeElapsed), [5000], 'where it was, not 0');
+        assert.strictEqual(logs.filter((l) => /cannot decode VP9CODEC001 here \(VP9\), H\.264 from now on/.test(l)).length, 1);
+        const cf = path.join(stateDir, 'codec.json');
+        assert.deepStrictEqual(JSON.parse(fs.readFileSync(cf, 'utf8')), { avc1: true }, 'kept for the next start');
+        assert.strictEqual(new Daemon({ stateDir: stateDir, log: () => {} }).avc1Only, true, 'a restart: H.264 at once');
+        assert.ok(!c.evs.some((x) => x.ev === 'error'));
+        // the same video failing again: no third fetch, audio only
+        const pid2 = fetchLog().pid;
+        setMode('codec');
+        d.child.kill('SIGKILL');
+        await c.waitFor((x) => x.ev === 'error' && x.msg === 'video failed, audio only', 4000);
+        await sleep(300);
+        assert.strictEqual(fetchLog().pid, pid2, 'no third fetch');
+        assert.strictEqual(d.state, 'playing', 'the sound plays on');
+        await idle();
+        await fetchPlay('VP9CODEC002');                          // the next video: H.264 from the start
+        assert.ok(fetchLog().argv.indexOf('--avc1') > 0, fetchLog().argv.join(' '));
+        await idle();
+        noAvc1(d); d.codecRetry = null;
+    });
+
+    await t('VP9: exit 4 before the first tick (a refused plugin): fetched again as H.264 at the place the play was resuming to', async () => {
+        fs.writeFileSync(ctl, ''); setMode('codec');
+        d.opts.resume = true;
+        try {
+            c.clear(); calls.length = 0;
+            c.send({ cmd: 'play', id: 'VP9CODEC003', rect: '1280x720', at: 30000 });
+            await c.waitFor((x) => x.ev === 'state' && x.state === 'playing', 4000);
+            await waitUntil(() => fetchLog().argv.indexOf('--avc1') > 0, 4000);   // no tick yet: still the start's place
+            await c.waitFor((x) => x.ev === 'state' && x.state === 'playing' && c.evs.filter((y) => y.state === 'playing').length === 2, 4000);
+            await sleep(100); tick(0);
+            await waitUntil(() => called('setTime').length > 0);
+            assert.deepStrictEqual(called('setTime').map((x) => x.a.newTimeElapsed), [30000]);
+        } finally {
+            d.opts.resume = false;
+            noAvc1(d); d.codecRetry = null;
+        }
+        await idle();
+    });
+
+    await t('VP9: a stream ytfetch cannot read ("vp9: ...") -> fetched again at once with --avc1, no retry wait, H.264 from then on', async () => {
+        fs.writeFileSync(ctl, 'vp9'); setMode('ok');
+        d.opts.fetchRetryMs = [60000];
+        try {
+            await fetchPlay('VP9STREAM01');
+            assert.ok(fetchLog().argv.indexOf('--avc1') > 0);
+            assert.ok(!c.evs.some((x) => x.ev === 'retry' || x.ev === 'error'));
+            assert.strictEqual(d.avc1Only, true);
+            assert.strictEqual(logs.filter((l) => /fetch: vp9: laced block - H\.264 only from now on/.test(l)).length, 1);
+        } finally {
+            d.opts.fetchRetryMs = [];
+            fs.writeFileSync(ctl, '');
+            noAvc1(d);
+        }
+        await idle();
+    });
+
+    await t('WP2 quality then stop at once: the video stays stopped (the restart is cancelled)', async () => {
+        fs.writeFileSync(ctl, ''); setMode('ok');
+        await fetchPlay('WP2QUALIT02');
+        c.clear();
+        c.send({ cmd: 'quality', quality: '480' });
+        c.send({ cmd: 'stop' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'idle');
+        await sleep(800);
+        const st = c.evs.filter((x) => x.ev === 'state').map((x) => x.state);
+        assert.deepStrictEqual(st.slice(st.indexOf('idle')), ['idle'], 'nothing after idle: ' + st.join());
+        assert.strictEqual(ours().length, 0);
+        c.clear();
+    });
+
+    await t('WP2 a play resumed at its place: no `time` at the old place before the seek lands (the app\'s "Resumed at" reads the first one)', async () => {
+        mkVideo('WP2RESUME01');
+        d.opts.resume = true;
+        try {
+            c.clear(); calls.length = 0;
+            c.send({ cmd: 'play', id: 'WP2RESUME01', rect: '1280x720', at: 30000 });
+            await c.waitFor((x) => x.ev === 'state' && x.state === 'playing');
+            subs.playerState('PLAYER_STATE_PLAY');
+            tick(0);                       // the first tick: the seek there
+            await waitUntil(() => called('setTime').length === 1);
+            assert.deepStrictEqual(called('setTime')[0].a, { newTimeElapsed: 30000 });
+            await sleep(300); tick(250);   // the player's next time, from before the setTime landed
+            await sleep(300); tick(30250);
+            await c.waitFor((x) => x.ev === 'time');
+            assert.deepStrictEqual(c.evs.filter((x) => x.ev === 'time').map((x) => x.elapsed), [30250]);
+        } finally { d.opts.resume = false; }
+        await idle();
+    });
+
+    await t('paused before the first tick (the 12 V guard at the start): one `time` with the total and the resume point; resume plays there', async () => {
+        mkVideo('PAUSEFIRST1');
+        d.opts.resume = true;
+        try {
+            c.clear(); calls.length = 0;
+            c.send({ cmd: 'play', id: 'PAUSEFIRST1', rect: '1280x720', at: 30000 });
+            await c.waitFor((x) => x.ev === 'state' && x.state === 'playing');
+            d.cur.durationMs = 0;   // no length in meta: the first tick after our STOP gives it
+            c.send({ cmd: 'pause' });
+            await c.waitFor((x) => x.ev === 'state' && x.state === 'paused');
+            assert.strictEqual(d.stoppedAt, 30000, 'the resume point, not 0');
+            tick(0);
+            await c.waitFor((x) => x.ev === 'time');
+            assert.deepStrictEqual(c.evs.filter((x) => x.ev === 'time').map((x) => [x.elapsed, x.total]), [[30000, 60000]]);
+            tick(250);
+            assert.strictEqual(c.evs.filter((x) => x.ev === 'time').length, 1, 'one only');
+            calls.length = 0;
+            c.send({ cmd: 'resume' });
+            await waitUntil(() => called('playFile').length > 0);
+            tick(0);
+            await waitUntil(() => called('setTime').length > 0);
+            assert.deepStrictEqual(called('setTime')[0].a, { newTimeElapsed: 30000 });
+        } finally { d.opts.resume = false; }
+        c.send({ cmd: 'stop' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'idle');
+    });
+
+    await t('paused before the first tick and no tick ever comes (the player obeys STOP at once): `time` from the length, resume at the place', async () => {
+        mkVideo('PAUSENOTICK');
+        d.opts.resume = true;
+        try {
+            c.clear(); calls.length = 0;
+            c.send({ cmd: 'play', id: 'PAUSENOTICK', rect: '1280x720', at: 30000 });
+            await c.waitFor((x) => x.ev === 'state' && x.state === 'playing');
+            d.cur.durationMs = 900000;
+            c.send({ cmd: 'pause' });
+            await c.waitFor((x) => x.ev === 'time');
+            assert.deepStrictEqual(c.evs.filter((x) => x.ev === 'time').map((x) => [x.elapsed, x.total]), [[30000, 900000]]);
+            assert.strictEqual(d.restart, null);
+            calls.length = 0;
+            c.send({ cmd: 'resume' });
+            await waitUntil(() => called('playFile').length > 0);
+            tick(0);
+            await waitUntil(() => called('setTime').length > 0);
+            assert.deepStrictEqual(called('setTime')[0].a, { newTimeElapsed: 30000 });
+        } finally { d.opts.resume = false; }
+        c.send({ cmd: 'stop' });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'idle');
+    });
+
+    await t('WP2 play: a FIFO meta.json (the fetch uid\'s folder) does not hang it; chapters read without following a symlink', async () => {
+        const fc = path.join(tmp, 'wp2fifo'), fv = path.join(fc, 'FIFOPLAY001');
+        mkdirp(fv);
+        cp.execSync('mkfifo ' + path.join(fv, 'meta.json'));
+        const run = [
+            'const { Daemon } = require(process.argv[1]);',
+            'const d = new Daemon({ someip: { buildProxy: () => new Promise(() => {}) }, cacheDir: process.argv[2], logDir: process.argv[2], stateDir: process.argv[2],',
+            '    accountFile: process.argv[2] + "/a.json", noSetuid: true, fetchRetryMs: [], resume: false, ytRequest: async () => ({ status: 404, body: "" }), log: () => {} });',
+            'd.emit = () => {}; d.fetchVideo = () => Promise.reject(new Error("stub"));',
+            'd.play(process.argv[3], "1280x720").then(() => { console.log(JSON.stringify({ title: d.cur.title, chapters: d.cur.chapters || null })); process.exit(0); });'].join('\n');
+        const r = cp.spawnSync(process.execPath, ['-e', run, path.join(__dirname, '..', 'ytd.js'), fc, 'FIFOPLAY001'], { timeout: 4000, encoding: 'utf8' });
+        assert.ok(!r.error && r.status === 0, 'play returned: ' + (r.error && r.error.message) + ' ' + r.stderr);
+        assert.deepStrictEqual(JSON.parse(r.stdout), { title: 'FIFOPLAY001', chapters: null });
+        // a symlinked meta.json: its chapters are not read
+        const away = path.join(tmp, 'wp2meta.json'), sv = path.join(fc, 'SYMPLAY0001');
+        fs.writeFileSync(away, JSON.stringify({ title: 'Planted', chapters: [[0, 'Planted']] }));
+        fs.mkdirSync(sv); fs.symlinkSync(away, path.join(sv, 'meta.json'));
+        const r2 = cp.spawnSync(process.execPath, ['-e', run, path.join(__dirname, '..', 'ytd.js'), fc, 'SYMPLAY0001'], { timeout: 4000, encoding: 'utf8' });
+        assert.ok(!r2.error && r2.status === 0, r2.stderr);
+        assert.deepStrictEqual(JSON.parse(r2.stdout), { title: 'SYMPLAY0001', chapters: null });
+    });
+
+    await t('WP2 a play from the start whose first tick is in a skipped segment: its first `time` is that tick, not the segment\'s end', async () => {
+        if (!fs.existsSync(path.join(cache, 'WP2SKIP0001'))) mkVideo('WP2SKIP0001');
+        mkdirp(path.join(cache, '.sb'));
+        fs.writeFileSync(path.join(cache, '.sb', 'WP2SKIP0001.json'), JSON.stringify([{ s: 0, e: 30000, cat: 'sponsor' }]));   // the SponsorBlock cache
+        c.clear(); calls.length = 0;
+        c.send({ cmd: 'play', id: 'WP2SKIP0001', rect: '1280x720', skip: ['sponsor'] });
+        await c.waitFor((x) => x.ev === 'state' && x.state === 'playing');
+        await waitUntil(() => d.cur && d.cur.segs && d.cur.segs.length === 1);
+        subs.playerState('PLAYER_STATE_PLAY');
+        tick(200);
+        await c.waitFor((x) => x.ev === 'skipped');
+        await waitUntil(() => called('setTime').length === 1);
+        assert.deepStrictEqual(called('setTime')[0].a, { newTimeElapsed: 30000 });
+        assert.deepStrictEqual(c.evs.filter((x) => x.ev === 'time').map((x) => x.elapsed), [200]);
+        await idle();
+    });
+
+    // ---- WP4 health ----
+    {
+        const H = require('../health.js');
+        const hdir = path.join(tmp, 'health'), hcache = path.join(hdir, 'cache'), hctl = path.join(hdir, 'check.ctl');
+        [hdir, hcache].forEach((x) => fs.mkdirSync(x));
+        const sh = (name, body) => { const f = path.join(hdir, name); fs.writeFileSync(f, '#!/bin/sh\n' + body + '\n', { mode: 0o755 }); return f; };
+        // mgu-python: --version, else the fake check (node); jap-node22: --version only
+        const py = sh('python3', 'if [ "$1" = --version ]; then echo "Python 3.12.7"; exit 0; fi\nexec "' + process.execPath + '" "$@"');
+        const node22 = sh('node22', 'echo v22.23.4');
+        const lease = path.join(hdir, 'lease.json');
+        fs.writeFileSync(lease, JSON.stringify({ dns: ['192.168.77.1', '8.8.8.8'], ip: '192.168.77.20' }));
+        const kdir = path.join(hcache, 'KnownVid001');
+        fs.mkdirSync(kdir);
+        fs.writeFileSync(path.join(kdir, 'meta.json'), JSON.stringify({ id: 'KnownVid001', title: 'My Secret Holiday Video', channel: 'Private Channel Name', duration_s: 60 }));
+        const hd = (o) => {
+            const x = new Daemon(Object.assign({ someip: someip, srcGen: srcGen, cacheDir: hcache, logDir: hdir, stateDir: path.join(hdir, 'state'), etcDir: hdir,
+                accountFile: path.join(hdir, 'account.json'), noSetuid: true, leaseFile: lease, sock: path.join(hdir, 'none.sock'),
+                fetcher: [py, path.join(__dirname, 'fake_health.js'), hctl], thumbCmd: [node22, 'thumb.js'], log: () => {} }, o || {}));
+            x.fetchUid = me;
+            x.clockSaid = null;   // as after the app's hello
+            x.audio.cc = { isAvailable: async () => true };
+            return x;
+        };
+        const health = async (x) => { const evs = []; x.emit = (e) => evs.push(e); const t0 = Date.now(); await x.health(); evs.ms = Date.now() - t0; return evs; };
+        const byKey = (evs) => { const m = {}; evs.filter((e) => e.key).forEach((e) => { m[e.key] = e; }); return m; };
+        const NO = ['192.168.77', '8.8.8.8', '10.1.2.3', '81.82.83.84', 'aa:bb:cc', '2a02:1810', 'KnownVid001', 'My Secret Holiday', 'Private Channel'];
+        const clean = (evs) => evs.forEach((e) => NO.forEach((x) => assert.ok(JSON.stringify(e).indexOf(x) < 0, x + ' in ' + JSON.stringify(e))));
+
+        await t('health: every key once, as {ev, key, ok, text}, then done; check --json run as the fetch uid with the cache and the lease', async () => {
+            fs.writeFileSync(hctl, 'ok');
+            const x = hd();
+            const evs = await health(x);
+            assert.deepStrictEqual(evs[evs.length - 1], { ev: 'health', done: true });
+            assert.strictEqual(evs.filter((e) => e.done).length, 1);
+            const rows = evs.slice(0, -1);
+            assert.deepStrictEqual(rows.map((e) => e.key).sort(), H.KEYS.slice().sort(), 'each key once');
+            rows.forEach((e) => assert.deepStrictEqual([Object.keys(e), typeof e.ok, typeof e.text], [['ev', 'key', 'ok', 'text'], 'boolean', 'string'], JSON.stringify(e)));
+            const k = byKey(evs);
+            assert.deepStrictEqual(H.KEYS.filter((n) => !k[n].ok), ['socket'], 'all well but the socket (no lock info yet): ' + JSON.stringify(rows));
+            assert.strictEqual(k.service.text, 'jap-ridetube-d ' + VERSION);
+            assert.strictEqual(k.node.text, 'Node ' + process.version + ' runs the service');
+            assert.strictEqual(k.node22.text, 'jap-node22 v22.23.4');
+            assert.strictEqual(k.python.text, 'mgu-python: Python 3.12.7');
+            assert.strictEqual(k.ytdlp.text, 'yt-dlp 2026.10.26 (bundled)');
+            assert.strictEqual(k.uid.text, 'internet uid ' + me);
+            assert.strictEqual(k.lease.text, 'uplink lease, 2 DNS servers');
+            assert.strictEqual(k.dns.text, 'youtube.com resolves through the uplink DNS');
+            assert.strictEqual(k.tls.text, 'TLS to youtube.com works');
+            assert.ok(/^\d+ MiB free for videos \(a video needs 256 MiB left\)$/.test(k.free.text), k.free.text);
+            assert.strictEqual(k.audio.text, 'BMW audio service reachable');
+            assert.strictEqual(k.socket.text, 'control socket: lock state unknown');
+            const run = JSON.parse(fs.readFileSync(hctl + '.log', 'utf8'));
+            assert.deepStrictEqual(run.argv, ['check', '--json', '--cache-dir', hcache, '--lease', lease]);
+            clean(evs);
+            // the clock wrong: the check runs with --no-cert-time and the TLS row says the dates are skipped
+            const wx = hd({ now: () => Date.parse('2026-10-13T08:00:00Z') });
+            const tls = byKey(await health(wx)).tls;
+            assert.deepStrictEqual(tls, { ev: 'health', key: 'tls', ok: true, text: 'TLS to youtube.com works with the certificate date check skipped: wrong clock (2026-10-13)' });
+            assert.deepStrictEqual(JSON.parse(fs.readFileSync(hctl + '.log', 'utf8')).argv, ['check', '--json', '--cache-dir', hcache, '--lease', lease, '--no-cert-time']);
+            fs.writeFileSync(hctl, 'expired');   // a clock ahead (expired certificates): no skip, the clock named
+            assert.strictEqual(byKey(await health(hd())).tls.text, 'no TLS to youtube.com: wrong clock: 2030-01-01');
+            fs.writeFileSync(hctl, 'ok');
+            x.sockUid = 23457;
+            assert.deepStrictEqual(byKey(await health(x)).socket, { ev: 'health', key: 'socket', ok: true, text: 'control socket: the RideTube app only' });
+            x.sockUid = 0;
+            assert.deepStrictEqual(byKey(await health(x)).socket, { ev: 'health', key: 'socket', ok: true, text: 'control socket: root only' });
+            x.sockUid = null;
+            assert.deepStrictEqual(byKey(await health(x)).socket, { ev: 'health', key: 'socket', ok: false, text: 'control socket: shared with other apps' });
+        });
+
+        await t('health over the socket: {"cmd":"health"} streams the lines, then done; caps say health', async () => {
+            fs.writeFileSync(hctl, 'ok');
+            const keep = d.opts.fetcher;
+            d.opts.fetcher = [process.execPath, path.join(__dirname, 'fake_health.js'), hctl];
+            c.clear();
+            c.send({ cmd: 'hello', app: '0.4.0' });
+            assert.ok((await c.waitFor((e) => e.ev === 'hello')).caps.indexOf('health') >= 0);
+            c.send({ cmd: 'health' });
+            await c.waitFor((e) => e.ev === 'health' && e.done, 9000);
+            assert.deepStrictEqual(c.evs.filter((e) => e.ev === 'health' && e.key).map((e) => e.key).sort(), H.KEYS.slice().sort());
+            d.opts.fetcher = keep;
+            const k = byKey(c.evs);
+            assert.deepStrictEqual([k.audio.ok, k.dns.ok, k.tls.ok, k.ytdlp.ok], [true, true, true, true], 'the running daemon\'s SOME/IP proxy, the fetcher\'s keys');
+        });
+
+        await t('health offline: no lease, DNS fails, TLS skipped -> ok:false with a readable text; the rest still answer', async () => {
+            fs.writeFileSync(hctl, 'offline');
+            const k = byKey(await health(hd({ leaseFile: path.join(hdir, 'no-lease.json') })));
+            assert.deepStrictEqual([k.lease.ok, k.lease.text], [false, 'no uplink lease: the uplink is down or not installed']);
+            assert.deepStrictEqual([k.dns.ok, k.dns.text], [false, 'DNS for youtube.com: name not resolved']);
+            assert.deepStrictEqual([k.tls.ok, k.tls.text], [false, 'no TLS to youtube.com: skipped: no DNS']);
+            assert.ok(k.ytdlp.ok && k.service.ok && k.audio.ok && k.node22.ok);
+        });
+
+        await t('health: no internet uid -> uid and the three fetcher keys say so; nothing missing (python, node22) never throws', async () => {
+            const x = hd({ noSetuid: false, mainapps: [], fetcher: [path.join(hdir, 'no-python'), 'ytfetch.py'], thumbCmd: [path.join(hdir, 'no-node22')] });
+            x.fetchUid = null;
+            x.audio.cc = null;
+            const evs = await health(x), k = byKey(evs);
+            assert.strictEqual(evs.filter((e) => e.key).length, H.KEYS.length);
+            assert.deepStrictEqual([k.uid.ok, k.uid.text], [false, 'no internet uid on the car (see the log)']);
+            ['ytdlp', 'dns', 'tls'].forEach((n) => assert.deepStrictEqual([k[n].ok, k[n].text], [false, 'not checked: no internet uid on the car (see the log)'], n));
+            assert.deepStrictEqual([k.python.text, k.node22.text, k.audio.text], ['mgu-python not installed', 'jap-node22 not installed', 'BMW audio service not connected yet']);
+            x.opts.noSetuid = true; x.fetchUid = me;   // a spawn that fails (ENOENT) rather than throws
+            assert.strictEqual(byKey(await health(x)).dns.text, 'not checked: mgu-python is not installed');
+        });
+
+        await t('health: a hanging check and a hanging audio service time out without holding the others; the child is killed', async () => {
+            fs.writeFileSync(hctl, 'hang');
+            const x = hd({ healthMs: 700 });
+            x.audio.cc = { isAvailable: () => new Promise(() => {}) };
+            const evs = await health(x), k = byKey(evs);
+            assert.ok(evs.ms < 700 + 600, 'done in ' + evs.ms + ' ms');
+            assert.strictEqual(evs.filter((e) => e.key).length, H.KEYS.length);
+            assert.deepStrictEqual([k.ytdlp.ok, k.ytdlp.text], [true, 'yt-dlp 2026.10.26 (bundled)'], 'what it said before it hung is kept');
+            assert.deepStrictEqual([k.dns.ok, k.dns.text, k.tls.text], [false, 'not checked: no answer in 0.7 s', 'not checked: no answer in 0.7 s']);
+            assert.deepStrictEqual([k.audio.ok, k.audio.text], [false, 'BMW audio service: no answer in 0.7 s']);
+            assert.ok(k.service.ok && k.node22.ok && k.python.ok && k.lease.ok && k.free.ok, 'the local keys answered');
+            const pid = JSON.parse(fs.readFileSync(hctl + '.log', 'utf8')).pid;
+            await waitUntil(() => { try { process.kill(pid, 0); return false; } catch (e) { return true; } }, 2000);
+        });
+
+        await t('health: what the fetch uid prints is not trusted: unknown names dropped, ok only when true, no address / id / title / newline, capped', async () => {
+            fs.writeFileSync(hctl, 'hostile');
+            const evs = await health(hd()), k = byKey(evs);
+            assert.ok(!evs.some((e) => e.key === 'evil'));
+            assert.deepStrictEqual([k.ytdlp.ok, k.ytdlp.text], [false, 'yt-dlp does not load: loaded'], 'a version that is not one');
+            assert.strictEqual(k.dns.ok, false, 'ok "yes" is not true');
+            assert.deepStrictEqual([k.dns.text, k.tls.text], ['DNS for youtube.com: failed', 'no TLS to youtube.com: failed'], 'only ytfetch\'s own phrases are shown');
+            assert.ok(evs.every((e) => !/[\n\r]/.test(e.text || '') && (e.text || '').length <= 120));
+            clean(evs);
+        });
+
+        await t('health: a check that dies without "done" -> its missing keys say it stopped; its stderr goes to the log, not the screen', async () => {
+            fs.writeFileSync(hctl, 'crash');
+            const lg = [], x = hd({ log: (m) => lg.push(m) });
+            const evs = await health(x), k = byKey(evs);
+            assert.deepStrictEqual([k.ytdlp.ok, k.dns.text, k.tls.text], [true, 'not checked: ytfetch.py check stopped (exit 1)', 'not checked: ytfetch.py check stopped (exit 1)']);
+            assert.ok(lg.indexOf('health: ytfetch.py check: OSError: [ip] KnownVid001 gone') >= 0, lg.join('\n'));
+            clean(evs);
+        });
+
+        await t('health in send_logs: the block ends the report\'s log, every key, through redactLog; no health event reaches the app', async () => {
+            fs.writeFileSync(hctl, 'hostile');
+            let body = null;
+            const x = hd({ ytRequest: async (m, u, h, b) => { body = b; return { status: 200, body: JSON.stringify({ id: 'ABC123' }) }; } });
+            const evs = [];
+            x.emit = (e) => evs.push(e);
+            x.log('ytfetch: fetch KnownVid001 done');
+            await x.sendLogs('0.4.0');
+            assert.deepStrictEqual(evs, [{ ev: 'logs_sent', id: 'ABC123' }]);
+            const ls = body.log.split('\n'), at = ls.indexOf('--- health');
+            assert.ok(at > 0, 'a health block');
+            assert.deepStrictEqual(ls.slice(at + 1).map((l) => l.split(' ')[1]), H.KEYS, 'each key, in order, last in the log');
+            assert.ok(ls[at + 1] === 'health service ok jap-ridetube-d ' + VERSION, ls[at + 1]);
+            assert.strictEqual(ls[at + 8], 'health dns FAIL DNS for youtube.com: failed');
+            NO.forEach((s) => assert.ok(body.log.indexOf(s) < 0, s + ' in the report'));
+            const b = x.report('0.4.0', [{ key: 'tls', ok: false, text: 'via 81.82.83.84 to KnownVid001' }]);
+            assert.ok(/--- health\nhealth tls FAIL via \[ip\] to v#[0-9a-f]{4}$/.test(b.log), b.log.slice(-80));
+            assert.ok(!/--- health/.test(x.report('0.4.0').log), 'no block without lines');
+        });
+
+        await t('health.clean: one short printable line, addresses masked, versions and words kept', async () => {
+            assert.strictEqual(H.clean('a\n\tb  192.168.1.1 fe80::1:2 AA-BB-CC-DD-EE-FF v22.23.4 2026.10.26 12:34:56 é'), 'a b [ip] [ip] [mac] v22.23.4 2026.10.26 12:34:56');
+            assert.strictEqual(H.clean('x'.repeat(300)).length, 120);
+        });
+    }
+
+    // ---- 2021 firmware: where the two SOME/IP descriptions come from (Audio.descriptions) ----
+    {
+        const H = require('../health.js');
+        const sdir = path.join(tmp, 'someip'), mainapp = path.join(sdir, 'oap-mainapp'), sg = path.join(mainapp, 'src-gen');
+        mkdirp(sg);
+        fs.writeFileSync(path.join(mainapp, 'package.json'), JSON.stringify({ name: 'oap-mainapp', version: '8.3.2-pr-847.1' }));
+        fs.writeFileSync(path.join(sdir, 'os-release'), 'NAME="BMW MGU"\nVERSION="I_21w12.2-1-4"\nID="mgu"\n');
+        const CC = 'org.genivi.am.commandinterface.CommandControl', MP = 'de.bmw.infotainment.entertainment.mediaplayer.MediaPlayer';
+        const names = (l) => l.reduce((o, n) => { o[n] = {}; return o; }, {});
+        // a synthetic catalog (names and ids only); mp: MediaPlayer's instances, or no MediaPlayer at all
+        const catalog = (name, mp) => {
+            const c = { version: '0.1.0', interfaces: {}, instanceIDs: {} };
+            c.interfaces[CC] = { name: 'CommandControl', serviceId: 45088, version: { major: 1, minor: 1 },
+                methods: names(['connect', 'disconnect', 'setSinkMuteState']), fields: names(['listOfMainConnections']), events: {} };
+            c.instanceIDs[CC] = { 1: 1 };
+            if (mp) {
+                c.interfaces[MP] = { name: 'MediaPlayer', serviceId: 45122, version: { major: 2, minor: 0 },
+                    methods: names(['sendButtonEvent', 'playFile', 'setTime']), fields: names(['playerState', 'currentItemTime']), events: names(['playbackErrorEvent']) };
+                c.instanceIDs[MP] = mp;
+            }
+            const f = path.join(sdir, name + '.json');
+            fs.writeFileSync(f, JSON.stringify(c));
+            return f;
+        };
+        // a stub of the firmware's generator in a bundle shaped like AppManagement.js (gen.js loads IFConfigGenerator out of
+        // it): each proxy of the manifest -> the catalog's members, and the proxy it was asked for (stub)
+        const bundle = path.join(sdir, 'AppManagement.js');
+        fs.writeFileSync(bundle, '(function (mods) { var cache = {}; function req(id) { if (!cache[id]) { var m = cache[id] = { exports: {} };' +
+            ' mods[id][0](function (n) { return req(mods[id][1][n]); }, m, m.exports); } return cache[id].exports; } return req; })({' +
+            '1: [function (require, module) { module.exports = require("someip-interfaces-generator/IFConfigGenerator"); }, {"someip-interfaces-generator/IFConfigGenerator":2}],' +
+            '2: [function (require, module) { module.exports = { generate: function (db, manifest) { var out = {}; Object.keys(manifest.proxies).forEach(function (n) {' +
+            ' var i = db.interfaces[n]; out[n] = { name: i.name, serviceId: i.serviceId, version: i.version, instances: db.instanceIDs[n], methods: i.methods,' +
+            ' fields: i.fields, events: i.events, eventGroups: {}, stub: manifest.proxies[n] }; }); return out; } }; }, {}]},{},[1])\n');
+        let built = [];
+        const rec = { buildProxy: async (cfg, inst) => { built.push([cfg, inst]); return { init: async () => {}, subscribe: () => {}, isAvailable: async () => true, getValue: async () => [] }; } };
+        let n = 0;
+        const audio = (o) => {
+            const logs = [];
+            const a = new Audio(Object.assign({ someip: rec, srcGen: sg, catalog: path.join(sdir, 'none.json'), appMgmt: bundle,
+                oapgen: path.join(__dirname, '..', '..', '..', 'kit', 'tools', 'oapgen', 'gen.js'), someipGenCmd: [process.execPath, path.join(__dirname, '..', 'ytd.js'), '--someip-gen'],
+                stateDir: path.join(sdir, 'state' + (++n)), etcDir: sdir, log: (m) => logs.push(m) }, o || {}), {});
+            a.logs = logs;
+            built = [];
+            return a;
+        };
+        const ccFile = path.join(sg, CC.replace(/\./g, '_') + '.json'), mpFile = path.join(sg, MP.replace(/\./g, '_') + '.json');
+
+        await t('someip: MainApp\'s src-gen there -> used as is, the catalog not read (no generator run)', async () => {
+            fs.writeFileSync(ccFile, JSON.stringify({ name: 'CommandControl', mine: 1 }));
+            fs.writeFileSync(mpFile, JSON.stringify({ name: 'MediaPlayer', mine: 2 }));
+            const a = audio({ catalog: catalog('full', { OapGenericMedia: 40 }) });
+            await a.init();
+            assert.deepStrictEqual(built.map((b) => [b[0].mine, b[1]]), [[1, '1'], [2, 'OapGenericMedia']]);
+            assert.deepStrictEqual(a.from, { CommandControl: 'MainApp', MediaPlayer: 'MainApp' });
+            assert.deepStrictEqual(a.logs, ['someip: CommandControl from MainApp', 'someip: MediaPlayer from MainApp', 'someip: MainApp v8.3.2-pr-847.1, catalog present, not needed',
+                'someip: in use CommandControl ? v? 1=none, lacks instance 1 connect disconnect listOfMainConnections',
+                'someip: in use MediaPlayer ? v? OapGenericMedia=none, lacks instance OapGenericMedia sendButtonEvent playFile setTime playerState currentItemTime playbackErrorEvent'],
+                'a src-gen file is used unchecked; the report says what it lacks');
+            assert.ok(!fs.existsSync(path.join(a.opts.stateDir, 'someip.json')), 'no generator run');
+            [ccFile, mpFile].forEach((f) => fs.unlinkSync(f));
+        });
+        await t('someip: no src-gen, a catalog -> made by the generator from it (manifest: our members, MediaPlayer *), once, root-only', async () => {
+            const a = audio({ catalog: catalog('full', { OapGenericMedia: 40, BrowserMedia: 60 }) });
+            await a.init();
+            await a.descriptions();
+            assert.deepStrictEqual(built.map((b) => [b[0].serviceId, b[0].stub, b[1]]), [
+                [45088, { instances: '1', attributes: { listOfMainConnections: 'rs' }, methods: ['connect', 'disconnect'] }, '1'], [45122, '*', 'OapGenericMedia']]);
+            assert.deepStrictEqual(a.from, { CommandControl: 'catalog', MediaPlayer: 'catalog' });
+            assert.deepStrictEqual(a.logs, ['someip: CommandControl from catalog', 'someip: MediaPlayer from catalog', 'someip: MainApp v8.3.2-pr-847.1, catalog db v0.1.0',
+                'someip: catalog CommandControl 0xB020 v1.1 instances 1=1', 'someip: catalog MediaPlayer 0xB042 v2.0 instances OapGenericMedia=40 BrowserMedia=60',
+                'someip: in use CommandControl 0xB020 v1.1 1=1', 'someip: in use MediaPlayer 0xB042 v2.0 OapGenericMedia=40']);
+            assert.strictEqual(fs.statSync(path.join(a.opts.stateDir, 'someip.json')).mode & 0o777, 0o600);
+            assert.strictEqual(fs.statSync(a.opts.stateDir).mode & 0o777, 0o700);
+            assert.strictEqual(a.sources(), 'CommandControl from catalog, MediaPlayer from catalog; MainApp v8.3.2-pr-847.1');
+        });
+        await t('someip: the catalog lacks a service or our instance -> that one built-in, said in the diagnostics', async () => {
+            const a = audio({ catalog: catalog('noinst', { BrowserMedia: 60 }) });
+            await a.init();
+            assert.deepStrictEqual(a.from, { CommandControl: 'catalog', MediaPlayer: 'built-in' });
+            assert.strictEqual(built[1][0].instances.OapGenericMedia, 40);
+            assert.strictEqual(a.logs[4], 'someip: catalog MediaPlayer 0xB042 v2.0 instances BrowserMedia=60');
+            const b = audio({ catalog: catalog('nomp', null) });
+            await b.descriptions();
+            assert.deepStrictEqual(b.from, { CommandControl: 'catalog', MediaPlayer: 'built-in' });
+            assert.strictEqual(b.logs[4], 'someip: catalog MediaPlayer none with service id 0xB042');
+            const c = audio({ catalog: catalog('full', { OapGenericMedia: 40 }), appMgmt: path.join(sdir, 'no-bundle.js') });
+            await c.descriptions();
+            assert.deepStrictEqual(c.from, { CommandControl: 'built-in', MediaPlayer: 'built-in' }, 'the generator failing');
+            assert.ok(/^someip: MainApp v8\.3\.2-pr-847\.1, catalog db v0\.1\.0, ENOENT/.test(c.logs[2]), c.logs[2]);
+        });
+        await t('someip: neither src-gen nor catalog -> both built-in (our unit\'s ids and versions)', async () => {
+            const a = audio();
+            await a.init();
+            assert.deepStrictEqual(a.from, { CommandControl: 'built-in', MediaPlayer: 'built-in' });
+            const [cc, mp] = built.map((b) => b[0]);
+            assert.deepStrictEqual([cc.serviceId, cc.version, cc.instances, cc.methods.connect.id, cc.methods.disconnect.id, cc.fields.listOfMainConnections.getter.id],
+                [0xB020, { major: 1, minor: 1 }, { 1: 1 }, 1, 2, 22]);
+            assert.deepStrictEqual([mp.serviceId, mp.version, mp.instances, mp.methods.playFile.id, mp.fields.currentItemTime.event.id, mp.events.playbackErrorEvent.groups],
+                [0xB042, { major: 2, minor: 0 }, { OapGenericMedia: 40 }, 258, 32783, [101]]);
+            assert.strictEqual(cc.methods.connect.retSchema.e[1].e.E_ALREADY_EXISTS, 5);
+            assert.strictEqual(a.logs[2], 'someip: MainApp v8.3.2-pr-847.1, catalog missing');
+        });
+        await t('someip: all three fail -> "this car\'s software ... does not offer" logged once over retries, in health and the report; ready when it comes', async () => {
+            let up = false;
+            const off = { buildProxy: async () => ({ init: async () => {}, subscribe: () => {}, isAvailable: async () => up, getValue: async () => [] }) };
+            const logs = [], xdir = path.join(sdir, 'd1');
+            mkdirp(path.join(xdir, 'cache'));
+            const x = new Daemon({ someip: off, srcGen: sg, catalog: path.join(sdir, 'none.json'), etcDir: sdir, availWaitMs: 30, someipRetryMs: 10,
+                cacheDir: path.join(xdir, 'cache'), logDir: xdir, stateDir: path.join(xdir, 'state'), accountFile: path.join(xdir, 'account.json'),
+                sock: path.join(tmp, 'someip.sock'), noSetuid: true, spare: false, ytRequest: fakeYt, healthMs: 1500, log: (m) => logs.push(m) });
+            x.start();
+            const SAY = 'This car\'s software (I_21w12.2-1-4) does not offer the audio connection RideTube uses';
+            await waitUntil(() => x.audio.unsupported === SAY, 2000);
+            await sleep(400);   // ~10 more tries
+            assert.deepStrictEqual(logs.filter((l) => /someip not ready/.test(l)), ['someip not ready: ' + SAY + ' (CommandControl not available)']);
+            const k = {};
+            (await H.run(x, VERSION)).forEach((h) => { k[h.key] = h; });
+            assert.deepStrictEqual([k.audio.ok, k.audio.text], [false, SAY]);
+            assert.ok(/--- someip\nsomeip: CommandControl from built-in\nsomeip: MediaPlayer from built-in\nsomeip: MainApp v8\.3\.2-pr-847\.1, catalog missing\n(someip: in use .*\n){2}--- health/.test(x.report('0.4.0', [{ key: 'audio', ok: false, text: SAY }]).log));
+            up = true;
+            await waitUntil(() => logs.indexOf('someip ready') >= 0, 2000);
+            assert.strictEqual(x.audio.unsupported, null);
+            await x.close();
+        });
+        await t('someip: the report carries the diagnostics block whole through redactLog; the health audio row says the sources', async () => {
+            const logs = [], xdir = path.join(sdir, 'd2');
+            mkdirp(path.join(xdir, 'cache'));
+            const x = new Daemon({ someip: rec, srcGen: sg, catalog: catalog('noinst', { BrowserMedia: 60, 'ExternalDeviceUsbFrontAInstanceRearL': 11 }), appMgmt: bundle,
+                oapgen: path.join(__dirname, '..', '..', '..', 'kit', 'tools', 'oapgen', 'gen.js'), etcDir: sdir,
+                cacheDir: path.join(xdir, 'cache'), logDir: xdir, stateDir: path.join(xdir, 'state'), accountFile: path.join(xdir, 'account.json'),
+                sock: path.join(tmp, 'someip2.sock'), noSetuid: true, spare: false, ytRequest: fakeYt, healthMs: 1500, log: (m) => logs.push(m) });
+            await x.audio.init();
+            const block = ['--- someip', 'someip: CommandControl from catalog', 'someip: MediaPlayer from built-in', 'someip: MainApp v8.3.2-pr-847.1, catalog db v0.1.0',
+                'someip: catalog CommandControl 0xB020 v1.1 instances 1=1', 'someip: catalog MediaPlayer 0xB042 v2.0 instances BrowserMedia=60 ExternalDeviceUsbFrontAInstanceRearL=11',
+                'someip: in use CommandControl 0xB020 v1.1 1=1', 'someip: in use MediaPlayer 0xB042 v2.0 OapGenericMedia=40'];
+            const ls = x.report('0.4.0').log.split('\n'), at = ls.indexOf('--- someip');
+            assert.deepStrictEqual(ls.slice(at, at + block.length), block);
+            assert.strictEqual(ls.length, at + block.length, 'last without a health block');
+            const k = {};
+            (await H.run(x, VERSION)).forEach((h) => { k[h.key] = h; });
+            assert.deepStrictEqual([k.audio.ok, k.audio.text], [true, 'BMW audio service reachable; CommandControl from catalog, MediaPlayer from built-in; MainApp v8.3.2-pr-847.1']);
+            await x.close();
+        });
+    }
+
+    // ======== WP9 phone remote (remote.js): the token, the lockout, the body cap, the three commands, the firewall rule
+    {
+        const { parseLink, cleanQuery, TAG } = require('../remote.js');
+        const http = require('http');
+        const rroot = path.join(tmp, 'wp9'), rcache = path.join(rroot, 'cache');
+        mkdirs(rcache);
+        const nftState = path.join(rroot, 'nft'), rsock = path.join(rroot, 'remote.sock');
+        const nftCalls = () => (fs.existsSync(nftState + '.log') ? fs.readFileSync(nftState + '.log', 'utf8').split('\n').filter(Boolean) : []);
+        const rules = () => { try { return JSON.parse(fs.readFileSync(nftState + '.json', 'utf8')).rules.map((r) => r.text); } catch (e) { return []; } };
+        const port = await new Promise((r) => { const s = net.createServer(); s.listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => r(p)); }); });
+        const RULE = 'iifname "wlan_bridge" tcp dport ' + port + ' accept comment "' + TAG + '"';
+        // the hotspot interface: 127.0.0.1 here, so the phone's requests can reach it
+        let ifs = { wlan_bridge: [{ family: 'IPv4', address: '127.0.0.1', internal: false }] };
+        const rlogs = [];
+        const realChown9 = fs.chownSync, chowns9 = [];
+        fs.chownSync = (p, u, g) => { chowns9.push([p, u, g]); };   // (not root: record what root would do)
+        const dr = new Daemon({ someip: { buildProxy: () => new Promise(() => {}) }, srcGen: srcGen, cacheDir: rcache, logDir: rroot,
+            sock: path.join(rroot, 'ctl.sock'), stateDir: path.join(rroot, 'state'), accountFile: path.join(rroot, 'account.json'),
+            noSetuid: true, spare: false, ytRequest: fakeYt, keep: 20, remoteSock: rsock, remotePort: port, remotePollMs: 50, remoteActMs: 0, remoteRetryMs: 100,
+            nft: [process.execPath, path.join(__dirname, 'fake_nft.js'), nftState], interfaces: () => ifs, log: (m) => rlogs.push(m) });
+        let shared = false;
+        dr.sockShared = () => shared;   // (ctl.sock's lock has its own tests, WP3)
+        const req = (method, p, o) => new Promise((resolve, reject) => {
+            o = o || {};
+            const headers = Object.assign({}, o.token ? { Authorization: 'Bearer ' + o.token } : {}, o.headers || {});
+            let body = o.body;
+            if (body !== undefined && typeof body !== 'string') { body = JSON.stringify(body); headers['Content-Type'] = headers['Content-Type'] || 'application/json'; }
+            if (body !== undefined) headers['Content-Length'] = Buffer.byteLength(body);
+            const r = http.request({ host: '127.0.0.1', port: port, method: method, path: p, headers: headers, agent: false }, (res) => {
+                let text = '';
+                res.setEncoding('utf8');
+                res.on('data', (x) => { text += x; });
+                res.on('end', () => { let j = null; try { j = JSON.parse(text); } catch (e) { /* html */ } resolve({ status: res.statusCode, headers: res.headers, text: text, json: j }); });
+            });
+            r.on('error', reject);
+            if (body !== undefined) r.write(body);
+            r.end();
+        });
+        const refused = () => req('GET', '/').then(() => false, (e) => e.code === 'ECONNREFUSED');
+        let app = null, token = null;
+        const turnOn = async (lang) => {
+            app.clear();
+            app.send({ cmd: 'remote', on: true, lang: lang });
+            const e = await app.waitFor((x) => x.ev === 'remote' && x.on && x.url, 4000);
+            await waitUntil(() => rules().length === 1, 3000);
+            return /#([0-9a-f]{32})$/.exec(e.url)[1];
+        };
+        const turnOff = async (how) => {
+            app.clear();
+            if (how) await how(); else app.send({ cmd: 'remote', on: false });
+            await waitUntil(() => rules().length === 0 && !fs.existsSync(rsock), 3000);
+        };
+
+        await t('WP9 links and searches: a YouTube video link -> its id; another link -> null; words -> a search, capped', async () => {
+            const ID = 'dQw4w9WgXcQ';
+            ['https://www.youtube.com/watch?v=' + ID, 'https://youtu.be/' + ID + '?si=abc', 'youtube.com/watch?v=' + ID + '&t=42', 'https://m.youtube.com/shorts/' + ID,
+                'https://music.youtube.com/watch?v=' + ID + '&list=RD', 'https://www.youtube.com/live/' + ID, 'Look at this: https://youtu.be/' + ID, 'https://www.youtube-nocookie.com/embed/' + ID]
+                .forEach((s) => assert.strictEqual(parseLink(s), ID, s));
+            ['https://example.com/watch?v=' + ID, 'https://youtube.com.evil.example/watch?v=' + ID, 'https://www.youtube.com/watch?v=short', 'https://www.youtube.com/@channel',
+                'https://youtu.be/' + ID + 'x', 'http://evil.example/?u=https://youtu.be/' + ID].forEach((s) => assert.strictEqual(parseLink(s), null, s));
+            ['cats', 'javascript:alert(1)', 'Note: car videos', ID].forEach((s) => assert.strictEqual(parseLink(s), undefined, s));
+            assert.strictEqual(cleanQuery('  two\n\tlines  '), 'two lines');
+            // what would reach the HMI's recent-search labels: C1 controls, zero-width and direction marks, BOM
+            assert.strictEqual(cleanQuery('a\u0085b\u009fc\u200bd\u200fe\u202af\u202eg\u2066h\u2069i\ufeffj\u007fk'), 'a b c d e f g h i j k');
+            assert.strictEqual(cleanQuery('\u202e\u200b'), null, 'only marks: nothing');
+            assert.strictEqual(cleanQuery('Café 東京 музыка'), 'Café 東京 музыка', 'letters of every script kept');
+            assert.deepStrictEqual([cleanQuery(''), cleanQuery('   '), cleanQuery('x'.repeat(201)), cleanQuery(42), cleanQuery('x'.repeat(200)).length], [null, null, null, null, 200]);
+        });
+
+        await t('WP9 off by default: nothing listens, no remote.sock; a rule an earlier run left is removed at start, others kept', async () => {
+            fs.writeFileSync(nftState + '.json', JSON.stringify({ next: 10, rules: [{ h: 5, text: RULE }, { h: 6, text: 'iifname "usb0" accept' }] }));
+            dr.start();
+            await waitUntil(() => rules().length === 1, 3000);
+            assert.deepStrictEqual(rules(), ['iifname "usb0" accept'], 'ours gone, the other rule kept');
+            assert.deepStrictEqual(nftCalls(), ['-a list chain ip filter input', 'delete rule ip filter input handle 5']);
+            app = await client(dr.opts.sock);
+            assert.ok(await refused(), 'nothing on the port');
+            assert.ok(!fs.existsSync(rsock), 'no remote.sock');
+            app.send({ cmd: 'remote' });
+            assert.deepStrictEqual(await app.waitFor((x) => x.ev === 'remote'), { ev: 'remote', on: false, url: null, expires: 0 }, 'no on: only the state');
+            fs.writeFileSync(nftState + '.json', JSON.stringify({ next: 10, rules: [] }));
+        });
+
+        await t('WP9 on: refused while ctl.sock is open to every app (any app could open the port)', async () => {
+            shared = true;
+            app.clear();
+            app.send({ cmd: 'remote', on: true });
+            assert.deepStrictEqual(await app.waitFor((x) => x.ev === 'remote'), { ev: 'remote', on: false, url: null, expires: 0, error: 'the control socket is open to every app' });
+            await sleep(100);
+            assert.ok(await refused() && !fs.existsSync(rsock) && rules().length === 0, 'nothing opened');
+            shared = false;
+        });
+
+        await t('WP9 on: a 128-bit token in the URL fragment, one tagged rule, remote.sock 0600 handed to the web uid, 1 hour', async () => {
+            chowns9.length = 0;
+            const n0 = nftCalls().length;
+            token = await turnOn();
+            const e = app.evs.filter((x) => x.ev === 'remote' && x.url).slice(-1)[0];
+            assert.ok(new RegExp('^http://127\\.0\\.0\\.1:' + port + '/#[0-9a-f]{32}$').test(e.url) && e.url.length <= 62, e.url + ' (a QR code holds 62 bytes)');
+            assert.ok(e.expires > 3590 && e.expires <= 3600, 'expires ' + e.expires);
+            assert.deepStrictEqual(rules(), [RULE]);
+            const calls = nftCalls().slice(n0);
+            assert.deepStrictEqual(calls.filter((x) => x !== '-a list chain ip filter input'), ['insert rule ip filter input ' + RULE], 'listed, then one insert: ' + calls.join(' / '));
+            assert.strictEqual(fs.statSync(rsock).mode & 0o777, 0o600);
+            assert.deepStrictEqual(chowns9, [[rsock, process.getuid() || 1, 0]]);
+            const page = await req('GET', '/');
+            assert.strictEqual(page.status, 200);
+            assert.ok(/RideTube remote/.test(page.text) && !/(src|href)="?https?:/.test(page.text), 'the page, no external assets');
+            assert.ok(/script-src 'sha256-[A-Za-z0-9+/=]+'/.test(page.headers['content-security-policy']) && page.headers['cache-control'] === 'no-store', 'CSP with the script hash, no-store');
+            assert.ok(page.text.indexOf(token) < 0, 'the page itself carries no token');
+        });
+
+        await t('WP9 token: missing -> 401, wrong -> 401; the right one -> the status (what is playing)', async () => {
+            assert.strictEqual((await req('GET', '/api/status')).status, 401);
+            assert.strictEqual((await req('GET', '/api/status', { token: 'f'.repeat(32) })).status, 401);
+            assert.strictEqual((await req('GET', '/api/status', { headers: { Authorization: 'Bearer ' + token + 'x' } })).status, 401);
+            assert.strictEqual((await req('POST', '/api/send', { body: { text: 'cats' } })).status, 401, 'nothing sent without the token');
+            dr.state = 'playing'; dr.cur = { id: 'DemoVideo01', title: 'A <b>title</b>' }; dr.elapsed = 5000; dr.total = 60000;
+            const s = await req('GET', '/api/status', { token: token });
+            assert.deepStrictEqual([s.status, s.json], [200, { state: 'playing', id: 'DemoVideo01', title: 'A <b>title</b>', elapsed: 5000, total: 60000 }]);
+            dr.state = 'idle'; dr.cur = null; dr.elapsed = dr.total = 0;
+        });
+
+        await t('WP9 send: a link -> remote_do play, words -> remote_do search; other links, bad bodies, not JSON, past 16 KiB: refused', async () => {
+            app.clear();
+            const a = await req('POST', '/api/send', { token: token, body: { text: 'https://youtu.be/dQw4w9WgXcQ?si=x' } });
+            assert.deepStrictEqual([a.status, a.json], [200, { ok: true, did: 'play' }]);
+            assert.deepStrictEqual(await app.waitFor((x) => x.ev === 'remote_do'), { ev: 'remote_do', do: 'play', id: 'dQw4w9WgXcQ' });
+            app.clear();
+            const b = await req('POST', '/api/send', { token: token, body: { text: '  lofi\nbeats  ' } });
+            assert.deepStrictEqual([b.status, b.json], [200, { ok: true, did: 'search' }]);
+            assert.deepStrictEqual(await app.waitFor((x) => x.ev === 'remote_do'), { ev: 'remote_do', do: 'search', q: 'lofi beats' });
+            app.clear();
+            const bad = [
+                [{ token: token, body: { text: 'https://example.com/x' } }, 400], [{ token: token, body: { text: 'x'.repeat(201) } }, 400],
+                [{ token: token, body: { q: 'cats' } }, 400], [{ token: token, body: '{bad json', headers: { 'Content-Type': 'application/json' } }, 400],
+                [{ token: token, body: 'text=cats', headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }, 415],
+                [{ token: token, body: JSON.stringify({ text: 'cats', pad: 'x'.repeat(17 * 1024) }), headers: { 'Content-Type': 'application/json' } }, 413]];
+            for (const [o, code] of bad) assert.strictEqual((await req('POST', '/api/send', o)).status, code, JSON.stringify(o).slice(0, 80));
+            assert.strictEqual((await req('GET', '/api/send', { token: token })).status, 405);
+            assert.strictEqual((await req('GET', '/api/state', { token: token })).status, 404, 'no other path');
+            await sleep(100);
+            assert.deepStrictEqual(app.evs.filter((x) => x.ev === 'remote_do'), [], 'nothing reached the app');
+        });
+
+        await t('WP9 remote.sock: only search, play and status pass; root checks the id and the query again', async () => {
+            const n0 = app.evs.length;
+            const ph = await client(rsock);   // (as the child: it is remote.sock's one client)
+            const ask = async (o) => { ph.clear(); ph.send(o); return ph.waitFor((x) => x.rid === o.rid); };
+            for (const [i, cmd] of ['auth', 'sign_out', 'feed', 'positions', 'send_logs', 'stop', 'pause', 'remote', 'hello', 'thumb', 'playlists'].entries()) {
+                assert.deepStrictEqual(await ask({ rid: i, cmd: cmd, which: 'home', on: false, id: 'DemoVideo01' }), { rid: i, error: 'Not allowed' }, cmd);
+            }
+            assert.deepStrictEqual(await ask({ rid: 20, cmd: 'play', id: 'nope' }), { rid: 20, error: 'That link is not a YouTube video' });
+            assert.deepStrictEqual(await ask({ rid: 21, cmd: 'play', id: { a: 1 } }), { rid: 21, error: 'That link is not a YouTube video' });
+            assert.deepStrictEqual(await ask({ rid: 22, cmd: 'search', q: 'x'.repeat(201) }), { rid: 22, error: 'Type a search (at most 200 characters)' });
+            assert.deepStrictEqual(await ask({ rid: 23, cmd: 'search', q: ['cats'] }), { rid: 23, error: 'Type a search (at most 200 characters)' });
+            ph.clear(); ph.write('not json\n');
+            assert.deepStrictEqual(await ph.waitFor((x) => x.error), { rid: null, error: 'Not allowed' });
+            assert.deepStrictEqual((await ask({ rid: 24, cmd: 'status' })).status.state, 'idle');
+            await sleep(100);
+            assert.deepStrictEqual(app.evs.slice(n0).filter((x) => x.ev !== 'remote'), [], 'the app got nothing: no auth, feed, positions or stop');
+            assert.ok(dr.account && !fs.existsSync(dr.opts.accountFile), 'no sign-in started');
+            // many short lines in one write: fine (the 4 KiB cap is per line)
+            ph.clear(); ph.write(Array.from({ length: 200 }, (x, i) => JSON.stringify({ rid: 100 + i, cmd: 'status' })).join('\n') + '\n');
+            await waitUntil(() => ph.evs.filter((x) => x.status).length === 200, 3000);
+            ph.clear(); ph.write('x'.repeat(5000));
+            await waitUntil(() => ph.destroyed, 2000);
+            assert.ok(rlogs.indexOf('remote: remote.sock line too long') >= 0);
+            await sleep(1300);   // the child connects again
+            assert.strictEqual((await req('GET', '/api/status', { token: token })).status, 200, 'the child is back');
+        });
+
+        await t('WP9 lockout: 10 wrong tokens from an address -> 429 for wrong ones and none; the right token always passes', async () => {
+            // (2 wrong ones in the token test above: 8 more make 10)
+            for (let i = 0; i < 8; i++) assert.strictEqual((await req('GET', '/api/status', { token: i.toString(16).repeat(32) })).status, 401, 'try ' + (i + 3));
+            assert.strictEqual((await req('GET', '/api/status', { token: 'e'.repeat(32) })).status, 429);
+            assert.strictEqual((await req('GET', '/api/status')).status, 429);
+            assert.strictEqual((await req('GET', '/api/status', { token: token })).status, 200, 'the passenger is never locked out');
+            assert.strictEqual((await req('POST', '/api/send', { token: token, body: { text: 'cats' } })).status, 200);
+        });
+
+        await t('WP9 phone actions: at most one a second (each search costs a fetch); status is not one', async () => {
+            dr.rc.o.remoteActMs = 1000;
+            await sleep(1000);
+            app.clear();
+            const a = await req('POST', '/api/send', { token: token, body: { text: 'cats' } });
+            const b = await req('POST', '/api/send', { token: token, body: { text: 'dogs' } });
+            assert.deepStrictEqual([a.status, b.status, b.json], [200, 422, { error: 'Too fast: wait a moment' }]);
+            assert.strictEqual((await req('GET', '/api/status', { token: token })).status, 200);
+            await sleep(100);
+            assert.deepStrictEqual(app.evs.filter((x) => x.ev === 'remote_do').map((x) => x.q), ['cats'], 'the second never reached the app');
+            await sleep(1000);
+            assert.strictEqual((await req('POST', '/api/send', { token: token, body: { text: 'dogs' } })).status, 200, 'a second later: fine');
+            dr.rc.o.remoteActMs = 0;
+        });
+
+        await t('WP9 the page in the app\'s language: every word in every language, html lang, the CSP hash of the script as served', async () => {
+            const { LANGS } = require('../remote.js');
+            const html = fs.readFileSync(path.join(__dirname, '..', 'remote.html'), 'utf8'), src = fs.readFileSync(path.join(__dirname, '..', 'remote.js'), 'utf8');
+            const un = (x) => x.replace(/\\'/g, "'");
+            const keys = {};
+            [[html, /data-t="([^"]+)"/g], [html, /T\('((?:[^'\\]|\\.)*)'\)/g], [src, /error: '((?:[^'\\]|\\.)*)'/g], [src, /new Error\('([A-Z](?:[^'\\]|\\.)*)'\)/g], [html, /new Error\('([A-Z](?:[^'\\]|\\.)*)'\)/g], [html, /\|\| '((?:[^'\\]|\\.)*)'\)/g]]
+                .forEach(([text, re]) => { let m; while ((m = re.exec(text))) keys[un(m[1])] = true; });
+            const want = Object.keys(keys).sort();
+            assert.ok(want.length > 25 && want.indexOf('Too fast: wait a moment') >= 0 && want.indexOf('Send to the car') >= 0, want.join('|'));
+            const strings = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'remote-strings.json'), 'utf8'));
+            assert.deepStrictEqual(Object.keys(strings).sort(), LANGS.filter((l) => l !== 'en').sort(), 'every RideTube language but English (the keys)');
+            LANGS.filter((l) => l !== 'en').forEach((l) => {
+                assert.deepStrictEqual(Object.keys(strings[l]).sort(), want, l + ': every phone word, no stale one');
+                Object.keys(strings[l]).forEach((k) => assert.ok(strings[l][k].trim() && strings[l][k] !== k, l + ': ' + k));
+                assert.ok(strings[l]['Type a search (at most 200 characters)'].indexOf('200') >= 0, l + ': the number kept');
+            });
+            const hashOf = (page) => require('crypto').createHash('sha256').update(/<script>([\s\S]*?)<\/script>/.exec(page)[1]).digest('base64');
+            for (const [lang, served, word] of [['fr', 'fr', 'Envoyer à la voiture'], ['zh-CN', 'zh-CN', '发送到汽车'], ['xx"><script>', 'en', null], [undefined, 'en', null]]) {
+                await turnOff();
+                token = await turnOn(lang);
+                const page = await req('GET', '/');
+                assert.ok(page.text.indexOf('<html lang="' + served + '">') >= 0, lang + ': html lang ' + served);
+                const words = JSON.parse(/<script type="application\/json" id="words">([\s\S]*?)<\/script>/.exec(page.text)[1]);
+                assert.strictEqual(word ? words['Send to the car'] : JSON.stringify(words), word || '{}', String(lang));
+                assert.strictEqual((page.text.match(/<script>/g) || []).length, 1, 'one script that runs');
+                assert.ok(page.headers['content-security-policy'].indexOf("script-src 'sha256-" + hashOf(page.text) + "'") >= 0, lang + ': the CSP hash matches the script');
+            }
+            const { buildPage } = require('../remote.js');
+            const evil = buildPage(html, { fr: { 'Send to the car': '</script><script>alert(1)</script>', 'Too long': "$' $& $$" } }, 'fr').page;
+            assert.strictEqual((evil.match(/<\/script>/g) || []).length, 2, 'a word cannot close its block');
+            assert.strictEqual(JSON.parse(/<script type="application\/json" id="words">([\s\S]*?)<\/script>/.exec(evil)[1])['Too long'], "$' $& $$", 'a $ in a word stays as written');
+        });
+
+        await t('WP9 off: the rule removed, nothing listens, remote.sock gone; on again: a new token, the old one refused', async () => {
+            await turnOff();
+            assert.deepStrictEqual(app.evs.filter((x) => x.ev === 'remote').slice(-1)[0], { ev: 'remote', on: false, url: null, expires: 0 });
+            assert.ok(await refused(), 'nothing on the port');
+            const old = token;
+            token = await turnOn();
+            assert.notStrictEqual(token, old);
+            assert.strictEqual((await req('GET', '/api/status', { token: old })).status, 401, 'replayed after off: refused');
+            assert.strictEqual((await req('GET', '/api/status', { token: token })).status, 200, 'the lockout went with the old run');
+        });
+
+        await t('WP9 the hotspot: no address -> on, url null; one comes -> the url', async () => {
+            await turnOff();
+            ifs = {};
+            app.clear();
+            app.send({ cmd: 'remote', on: true });
+            const e = await app.waitFor((x) => x.ev === 'remote' && x.on);
+            assert.strictEqual(e.url, null);
+            await sleep(300);
+            assert.ok(!app.evs.some((x) => x.ev === 'remote' && x.url), 'no url without the hotspot');
+            assert.deepStrictEqual(rules(), [], 'no address: the port stays shut');
+            ifs = { wlan_bridge: [{ family: 4, address: '127.0.0.1', internal: false }] };   // (Node 18.0: a number)
+            await app.waitFor((x) => x.ev === 'remote' && x.url, 3000);
+            await waitUntil(() => rules().length === 1, 3000);
+            ifs = {};
+            await app.waitFor((x) => x.ev === 'remote' && x.on && !x.url, 3000);
+            await waitUntil(() => rules().length === 0, 3000);
+            ifs = { wlan_bridge: [{ family: 'IPv4', address: '127.0.0.1', internal: false }] };
+            await waitUntil(() => rules().length === 1, 3000);
+        });
+
+        await t('WP9 the port held by another program: no rule, no url; freed: ours, then the rule', async () => {
+            await turnOff();
+            const blocker = net.createServer();
+            await new Promise((r) => blocker.listen(port, '127.0.0.1', r));
+            app.clear();
+            app.send({ cmd: 'remote', on: true });
+            await app.waitFor((x) => x.ev === 'remote' && x.on);
+            await sleep(600);
+            assert.deepStrictEqual([rules(), app.evs.some((x) => x.ev === 'remote' && x.url)], [[], false], 'not ours: shut');
+            assert.ok(rlogs.some((l) => /cannot listen on 127\.0\.0\.1:\d+: EADDRINUSE/.test(l)), 'logged');
+            await new Promise((r) => blocker.close(r));
+            await app.waitFor((x) => x.ev === 'remote' && x.url, 8000);
+            await waitUntil(() => rules().length === 1, 3000);
+        });
+
+        await t('WP9 a rule removal that fails (nft busy) is tried again until the rule is gone', async () => {
+            assert.deepStrictEqual(rules(), [RULE]);
+            fs.writeFileSync(nftState + '.busy', '2');
+            app.clear();
+            app.send({ cmd: 'remote', on: false });
+            await app.waitFor((x) => x.ev === 'remote' && !x.on);
+            await sleep(30);
+            assert.deepStrictEqual(rules(), [RULE], 'still there after the first try');
+            await waitUntil(() => rules().length === 0, 3000);
+            assert.ok(rlogs.some((l) => /^remote: rule not removed, tried again: nft -a list .*busy/.test(l)), 'logged');
+            const r2 = new (require('../remote.js').Remote)({ nft: [process.execPath, path.join(__dirname, 'fake_nft.js'), nftState] }, { log: () => {} });
+            fs.writeFileSync(nftState + '.busy', '1');
+            await r2.handles().then(() => assert.fail('resolved'), (err) => assert.ok(/busy/.test(err.message), 'busy is not "no firewall"'));
+            fs.unlinkSync(nftState + '.busy');
+        });
+
+        await t('WP9 off by itself: the time runs out; the app going away; the server dying; at exit (close) the rule goes', async () => {
+            await turnOff();
+            dr.rc.o.remoteMs = 300;
+            await turnOn();
+            await turnOff(() => sleep(10));
+            assert.ok(rlogs.indexOf('remote: off (time is up)') >= 0);
+            dr.rc.o.remoteMs = 60 * 60000;
+            await turnOn();
+            await turnOff(async () => { dr.rc.run.child.kill('SIGKILL'); });
+            assert.deepStrictEqual(app.evs.filter((x) => x.ev === 'remote').slice(-1)[0], { ev: 'remote', on: false, url: null, expires: 0, error: 'the server stopped' });
+            await turnOn();
+            await turnOff(async () => { app.destroy(); });
+            assert.ok(rlogs.indexOf('remote: off (the app went away)') >= 0);
+            app = await client(dr.opts.sock);
+            await turnOn();
+            await dr.close();
+            assert.deepStrictEqual([rules(), fs.existsSync(rsock), await refused()], [[], false, true], 'exit: no rule, nothing listens');
+        });
+
+        await t('WP9 no unit firewall (the chain cannot be listed): no rule, logged, the remote still on', async () => {
+            fs.writeFileSync(nftState + '.fail', 'x');
+            const r2 = new (require('../remote.js').Remote)({ nft: [process.execPath, path.join(__dirname, 'fake_nft.js'), nftState] }, { log: (m) => rlogs.push(m) });
+            assert.strictEqual(await r2.handles(), null);
+            await r2.ensureRule('wlan_bridge', 8471);
+            assert.deepStrictEqual(rules(), []);
+            assert.ok(rlogs.some((l) => /^remote: nft -a list chain ip filter input: Error: No such file/.test(l)), rlogs.slice(-3).join('\n'));
+            fs.unlinkSync(nftState + '.fail');
+        });
+
+        await t('WP9 web uid: its own, picked from the top down, never the fetch uid, never given the internet', async () => {
+            const wo = Object.assign({}, uo, { stateDir: path.join(rroot, 'uid-state') });
+            assert.strictEqual(pickFetchUid(wo), 30000);
+            assert.strictEqual(pickUid(wo, 'web'), 60000);
+            const rd = (f) => fs.readFileSync(path.join(wo.stateDir, f), 'utf8');
+            assert.deepStrictEqual(JSON.parse(rd('uids.json')), { fetch: 30000, web: 60000 });
+            assert.strictEqual(rd('internet-uids'), '30000\n', 'the uplink lets out the fetch uid only');
+            assert.strictEqual(pickFetchUid(wo), 30000, 'kept');
+            assert.deepStrictEqual(JSON.parse(rd('uids.json')), { fetch: 30000, web: 60000 }, 'the fetch pick keeps the web uid');
+            fs.appendFileSync(path.join(fsRoot, 'etc/passwd'), 'late:x:60000:60000::/:/bin/false\n');
+            assert.strictEqual(pickUid(wo, 'web'), 59999, 'taken since: the next one down');
+            fs.writeFileSync(path.join(wo.stateDir, 'uids.json'), JSON.stringify({ fetch: 59999, web: 59999 }));
+            assert.strictEqual(pickUid(wo, 'web'), 59998, 'never the fetch uid');
+            assert.strictEqual(fs.readFileSync(path.join(fsRoot, 'var/opt/mgu-uplink/uids.d/jap-ridetube-d'), 'utf8').trim() !== '59998', true);
+            fs.writeFileSync(path.join(wo.stateDir, 'uids.json'), JSON.stringify({ fetch: 61000, web: 59998 }));
+            assert.strictEqual(pickFetchUid(wo), 61000, 'a fetch uid kept from before 0.5.0 above the web range: kept (no re-pick)');
+            fs.writeFileSync(path.join(wo.stateDir, 'uids.json'), JSON.stringify({ fetch: 30000, web: 61000 }));
+            assert.strictEqual(pickUid(wo, 'web'), 59999, 'a web uid above the range: picked again (the top free one)');
+        });
+        fs.chownSync = realChown9;
+    }
+
+    // ======== 0.5.0 downloads: the queue, the space floor, remove, the cleanup never deleting one, a reboot, offline
+    // play, auto-downloads. Their own daemon and cache, keep 0 as on the car
+    {
+        const droot = path.join(tmp, 'dl'), dcache = path.join(droot, 'cache'), dctl = path.join(droot, 'fetch.ctl'), dstate = path.join(droot, 'state');
+        const lease = path.join(droot, 'lease.json'), tlog = path.join(droot, 'thumb.log'), dlogs = [];
+        mkdirp(dcache);
+        fs.writeFileSync(lease, JSON.stringify({ interface: 'wlan0' }));   // online (offline: no download starts)
+        let free = 8000;
+        const mk = () => new Daemon({ someip: someip, srcGen: srcGen, ytdec: fakeYtdec, cacheDir: dcache, logDir: droot, sock: path.join(droot, 'ctl.sock'),
+            watchdogMs: 800, tickMs: 100, keep: 0, stateDir: dstate, noSetuid: true, spare: false, resume: false, fetchRetryMs: [],
+            fetcher: [process.execPath, path.join(__dirname, 'fake_ytfetch.js'), dctl], thumbCmd: [process.execPath, path.join(__dirname, 'fake_thumb.js'), tlog],
+            leaseFile: lease, freeMb: () => free, accountFile: path.join(dstate, 'account.json'), ytRequest: fakeYt, log: (m) => dlogs.push(m) });
+        let dd = mk();
+        await dd.start();
+        let dc = await client(dd.opts.sock);
+        const vdir = (id) => path.join(dcache, id);
+        const item = (id) => dd.libraryItems().find((x) => x.id === id);
+        const lib = async (pred, ms) => (await dc.waitFor((x) => x.ev === 'library' && pred(x.items), ms || 5000)).items;
+        const ready = (id) => lib((it) => it.some((x) => x.id === id && x.ready));
+        const marker = (id) => JSON.parse(fs.readFileSync(path.join(dcache, 'saved', id), 'utf8'));
+        const send = (m) => { dc.clear(); dc.send(m); };   // a wait sees only what came after
+        const has = (re) => dlogs.filter((l) => re.test(l)).length;
+
+        await t('downloads: one at a time as a play fetches (fetch uid, the quality\'s height), its progress, ready once every file is there; the thumb kept', async () => {
+            fs.writeFileSync(dctl, '');   // the fake fetch runs until told "done"
+            send({ cmd: 'download', id: 'DLVIDEO0001', meta: { title: 'One', channel: 'Chan', duration_s: 600 }, quality: '480' });
+            await sleep(20);   // (newest first by the marker's ms: two asked in the same ms would tie)
+            send({ cmd: 'download', id: 'DLVIDEO0002', meta: { title: 'Two' } });
+            let it = await lib((x) => x.some((y) => y.id === 'DLVIDEO0001' && y.pct === 20));
+            assert.deepStrictEqual(it.map((x) => [x.id, x.ready]), [['DLVIDEO0002', false], ['DLVIDEO0001', false]], 'newest asked first');
+            assert.deepStrictEqual(it[1], { id: 'DLVIDEO0001', title: 'One', channel: 'Chan', duration_s: 600, ready: false, pct: 20 });
+            assert.strictEqual(it[0].pct, undefined, 'queued: one download at a time');
+            const argv = JSON.parse(fs.readFileSync(dctl + '.log', 'utf8')).argv;
+            assert.deepStrictEqual(argv.slice(1, 5).concat(argv.slice(-3)), ['fetch', '--cache-dir', path.join(dcache, 'ytdlp'), '--height', '--', 'DLVIDEO0001', vdir('DLVIDEO0001')]);
+            assert.strictEqual(argv[5], '480', 'the height asked');
+            assert.strictEqual(fs.statSync(vdir('DLVIDEO0001')).mode & 0o777, 0o711, 'the folder as a play makes it');
+            assert.strictEqual(fs.statSync(path.join(dcache, 'saved')).mode & 0o777, 0o700, 'the markers: root only');
+            fs.writeFileSync(dctl, 'done');
+            await ready('DLVIDEO0001');
+            it = await lib((x) => x.every((y) => y.ready));
+            assert.deepStrictEqual(it.map((x) => x.title), ['Fetched DLVIDEO0002', 'Fetched DLVIDEO0001'], 'named from the fetch\'s meta.json once there');
+            assert.ok(isPlayable(vdir('DLVIDEO0002')));
+            await waitUntil(() => fs.existsSync(path.join(dcache, 'thumbs', 'DLVIDEO0001.rgba')) && fs.existsSync(path.join(dcache, 'thumbs', 'DLVIDEO0002.rgba')));
+        });
+
+        await t('downloads: none starts under 4 GB free (nor when the free space cannot be read); the item says so', async () => {
+            assert.strictEqual(dd.opts.minFreeMb, 4096, 'the default floor');
+            free = 4095;
+            send({ cmd: 'download', id: 'DLVIDEO0003', meta: { title: 'Three' } });
+            await lib((x) => x.some((y) => y.id === 'DLVIDEO0003' && y.error === 'not enough space'));
+            await sleep(300);
+            assert.ok(!dd.dl && !fs.existsSync(vdir('DLVIDEO0003')), 'not started');
+            free = null; dd.dlFull = false;
+            await sleep(300);
+            assert.ok(!dd.dl && item('DLVIDEO0003').error === 'not enough space', 'unreadable: not started either');
+            free = 4096; dd.dlFullAt = 0;
+            await ready('DLVIDEO0003');
+        });
+
+        await t('downloads: one under way stops under 1 GB free, its cut files go at once; the item says not enough space', async () => {
+            assert.strictEqual(dd.opts.dlStopFreeMb, 1024, 'the default');
+            fs.writeFileSync(dctl, '');
+            send({ cmd: 'download', id: 'DISKVIDEO01' });
+            await waitUntil(() => dd.dl && dd.dl.id === 'DISKVIDEO01' && fs.existsSync(path.join(vdir('DISKVIDEO01'), 'index.bin')));
+            free = 900;
+            await lib((x) => x.some((y) => y.id === 'DISKVIDEO01' && y.error === 'not enough space'));
+            assert.ok(has(/^download DISKVIDEO01: 900 MB free, under 1024 - stopped$/) === 1 && !dd.dl);
+            await waitUntil(() => !fs.existsSync(vdir('DISKVIDEO01')));   // not kept while it waits for space
+            free = 8000; dd.dlFullAt = 0;
+            fs.writeFileSync(dctl, 'done');
+            await ready('DISKVIDEO01');
+            send({ cmd: 'remove', id: 'DISKVIDEO01' });
+            await lib((x) => !x.some((y) => y.id === 'DISKVIDEO01'));
+        });
+
+        await t('downloads: none starts (nor clears its folder) while a stopped one\'s fetcher still exits', async () => {
+            fs.writeFileSync(dctl, '');
+            send({ cmd: 'download', id: 'STOPVIDEO01' });
+            await waitUntil(() => dd.dl && dd.dl.id === 'STOPVIDEO01' && fs.existsSync(path.join(vdir('STOPVIDEO01'), 'index.bin')));
+            const n = has(/^download STOPVIDEO01: started$/), stopped = dd.stopDownload();
+            dd.pumpDownload();   // the same tick: the fetcher is not gone yet
+            assert.ok(!dd.dl && fs.existsSync(path.join(vdir('STOPVIDEO01'), 'index.bin')), 'left alone under its fetcher');
+            await stopped;
+            await waitUntil(() => has(/^download STOPVIDEO01: started$/) === n + 1);   // once it is gone: from scratch
+            fs.writeFileSync(dctl, 'done');
+            await ready('STOPVIDEO01');
+            send({ cmd: 'remove', id: 'STOPVIDEO01' });
+            await lib((x) => !x.some((y) => y.id === 'STOPVIDEO01'));
+        });
+
+        await t('downloads: never while a play starts, plays or is paused; a play stops one, which starts again from scratch after', async () => {
+            fs.writeFileSync(dctl, '');
+            send({ cmd: 'download', id: 'DLVIDEO0004' });
+            await waitUntil(() => dd.dl && dd.dl.id === 'DLVIDEO0004' && fs.existsSync(path.join(vdir('DLVIDEO0004'), 'index.bin')));
+            const started = has(/^download DLVIDEO0004: started$/);
+                        send({ cmd: 'play', id: 'DLVIDEO0001', rect: '1280x720' });
+            await dc.waitFor((x) => x.ev === 'state' && x.state === 'playing');
+            assert.ok(!dd.dl && has(/^download DLVIDEO0004: stopped$/) === 1, 'stopped for the play');
+            send({ cmd: 'pause' });
+            await dc.waitFor((x) => x.ev === 'state' && x.state === 'paused');
+            await sleep(400);
+            assert.ok(!dd.dl, 'not while playing or paused');
+            send({ cmd: 'stop' });
+            await dc.waitFor((x) => x.ev === 'state' && x.state === 'idle');
+            await waitUntil(() => has(/^download DLVIDEO0004: started$/) === started + 1);
+            assert.strictEqual(item('DLVIDEO0004').ready, false, 'the cut one never counts');
+            fs.writeFileSync(dctl, 'done');
+            await ready('DLVIDEO0004');
+        });
+
+        await t('downloads: the cleanup after a play, the LRU and the thumbs\' cap never delete one; remove deletes its files, thumb and marker', async () => {
+            mkdirp(vdir('PLAYEDVID01'));
+            ['meta.json', 'audio.m4a', 'index.bin', 'video.h264'].forEach((f) => fs.writeFileSync(path.join(vdir('PLAYEDVID01'), f), '{}'));
+                        send({ cmd: 'play', id: 'PLAYEDVID01', rect: '1280x720' });
+            await dc.waitFor((x) => x.ev === 'state' && x.state === 'playing');
+            send({ cmd: 'stop' });
+            await dc.waitFor((x) => x.ev === 'state' && x.state === 'idle');
+            assert.ok(!fs.existsSync(vdir('PLAYEDVID01')), 'a played video goes once stopped');
+            dd.prune();
+            assert.ok(['DLVIDEO0001', 'DLVIDEO0002', 'DLVIDEO0003', 'DLVIDEO0004'].every((id) => isPlayable(vdir(id))), 'the downloads stay');
+            assert.deepStrictEqual(pruneCache(dcache, 0, [], () => {}, undefined, ['DLVIDEO0001', 'DLVIDEO0002', 'DLVIDEO0003', 'DLVIDEO0004']), [], 'pruneCache skips the saved ones');
+            const tdir = path.join(dcache, 'thumbs'), old = new Date(Date.now() - 86400000);
+            fs.utimesSync(path.join(tdir, 'DLVIDEO0001.rgba'), old, old);   // the oldest of all
+            for (let i = 0; i < 160; i++) fs.writeFileSync(path.join(tdir, 'X' + i + '.rgba'), '');
+            dd.pruneThumbs(tdir);
+            assert.ok(fs.existsSync(path.join(tdir, 'DLVIDEO0001.rgba')), 'a download\'s thumb outlives the cap');
+            assert.strictEqual(fs.readdirSync(tdir).filter((n) => /^X/.test(n)).length, 150, 'the others capped at 150, the downloads\' besides');
+                        send({ cmd: 'remove', id: 'DLVIDEO0002' });
+            const it = await lib((x) => !x.some((y) => y.id === 'DLVIDEO0002'));
+            assert.deepStrictEqual(it.map((x) => x.id), ['DLVIDEO0004', 'DLVIDEO0003', 'DLVIDEO0001']);
+            assert.ok(!fs.existsSync(vdir('DLVIDEO0002')) && !fs.existsSync(path.join(tdir, 'DLVIDEO0002.rgba')) && !fs.existsSync(path.join(dcache, 'saved', 'DLVIDEO0002')));
+            // removed while being fetched: the fetch stops, its folder goes
+            fs.writeFileSync(dctl, '');
+            send({ cmd: 'download', id: 'DLVIDEO0005' });
+            await waitUntil(() => dd.dl && dd.dl.id === 'DLVIDEO0005' && fs.existsSync(vdir('DLVIDEO0005')));
+            send({ cmd: 'remove', id: 'DLVIDEO0005' });
+            await lib((x) => !x.some((y) => y.id === 'DLVIDEO0005'));
+            assert.ok(!dd.dl && !fs.existsSync(vdir('DLVIDEO0005')));
+        });
+
+        await t('downloads: a failing one is tried 3 times (a refused video once), then kept as failed with no files; asked again, tried again', async () => {
+            fs.writeFileSync(dctl, 'fail');
+            send({ cmd: 'download', id: 'DLVIDEO0006' });
+            await lib((x) => x.some((y) => y.id === 'DLVIDEO0006' && y.error === 'download failed'));
+            assert.strictEqual(has(/^download DLVIDEO0006: boom \(\d\/3\)/), 3);
+            assert.ok(!fs.existsSync(vdir('DLVIDEO0006')), 'no half files left');
+            assert.strictEqual(marker('DLVIDEO0006').failed, true, 'kept as failed: a reboot does not retry it');
+            fs.writeFileSync(dctl, 'gone');
+            send({ cmd: 'download', id: 'DLVIDEO0007' });
+            await lib((x) => x.some((y) => y.id === 'DLVIDEO0007' && y.error === 'download failed'));
+            assert.ok(has(/^download DLVIDEO0007: Video unavailable \(1\/3\), given up$/) === 1, 'refused: given up at once');
+            fs.writeFileSync(dctl, 'done');
+            send({ cmd: 'download', id: 'DLVIDEO0006' });
+            await ready('DLVIDEO0006');
+            assert.strictEqual(marker('DLVIDEO0006').failed, undefined);
+            send({ cmd: 'remove', id: 'DLVIDEO0007' });
+            await lib((x) => !x.some((y) => y.id === 'DLVIDEO0007'));
+        });
+
+        await t('downloads: offline none starts; one failing for the network is not counted and waits a minute; "webpage" is no age check', async () => {
+            fs.unlinkSync(lease);
+            fs.writeFileSync(dctl, 'done');
+            send({ cmd: 'download', id: 'NETVIDEO001' });
+            await sleep(400);
+            assert.ok(!dd.dl && has(/^download NETVIDEO001: started$/) === 0, 'no lease: not started');
+            fs.writeFileSync(dctl, 'err:ERROR: [youtube] NETVIDEO001: Unable to download API page: <urlopen error [Errno -3] Temporary failure in name resolution>');
+            fs.writeFileSync(lease, JSON.stringify({ interface: 'wlan0' }));
+            await waitUntil(() => has(/^download NETVIDEO001: .*name resolution> - the network, again in 60 s$/) === 1);
+            await sleep(400);
+            assert.strictEqual(has(/^download NETVIDEO001: started$/), 1, 'waits before trying again');
+            assert.ok(!item('NETVIDEO001').error && !marker('NETVIDEO001').failed && !dd.dlFails.NETVIDEO001, 'not counted');
+            fs.writeFileSync(dctl, 'err:ERROR: [youtube] NETVIDEO001: Unable to download webpage: HTTP Error 429: Too Many Requests');
+            dd.dlNetAt = 0;
+            await lib((x) => x.some((y) => y.id === 'NETVIDEO001' && y.error === 'download failed'));
+            assert.strictEqual(has(/^download NETVIDEO001: .*HTTP Error 429: Too Many Requests \(1\/3\)$/), 1, 'counted, tried 3 times: not given up as an age check');
+            send({ cmd: 'remove', id: 'NETVIDEO001' });
+            await lib((x) => !x.some((y) => y.id === 'NETVIDEO001'));
+        });
+
+        await t('downloads: after a reboot a cut one (.part files) is fetched again from scratch; done ones stay ready', async () => {
+            dc.destroy();
+            await dd.close();
+            dd.writeSaved('DLVIDEO0008', { title: 'Eight', at: Date.now() });
+            mkdirp(vdir('DLVIDEO0008'));
+            ['audio.m4a', 'index.bin', 'video.h264.part'].forEach((f) => fs.writeFileSync(path.join(vdir('DLVIDEO0008'), f), 'x'));
+            assert.ok(!isPlayable(vdir('DLVIDEO0008')));
+            fs.writeFileSync(dctl, 'done');
+            const n = has(/^download DLVIDEO0008: started$/);
+            dd = mk();
+            await dd.start();
+            dc = await client(dd.opts.sock);
+            send({ cmd: 'library' });
+            await ready('DLVIDEO0008');
+            assert.strictEqual(has(/^download DLVIDEO0008: started$/), n + 1, 'once: the closed daemon starts none');
+            assert.ok(['DLVIDEO0001', 'DLVIDEO0003', 'DLVIDEO0004', 'DLVIDEO0006'].every((id) => item(id).ready));
+        });
+
+        await t('downloads: a marker that cannot be read is still a download: kept by a quality change, its failures counted', async () => {
+            const mf = path.join(dcache, 'saved', 'DLVIDEO0001'), keep = fs.readFileSync(mf);
+            fs.writeFileSync(mf, '{"title":');   // cut short
+            send({ cmd: 'play', id: 'DLVIDEO0001', rect: '1280x720' });
+            await dc.waitFor((x) => x.ev === 'state' && x.state === 'playing');
+            try { fs.unlinkSync(dctl + '.log'); } catch (e) { /* none */ }
+            send({ cmd: 'quality', quality: '360' });
+            await sleep(400);
+            assert.ok(!fs.existsSync(dctl + '.log') && dd.state === 'playing' && isPlayable(vdir('DLVIDEO0001')), 'no refetch of a download');
+            send({ cmd: 'stop' });
+            await dc.waitFor((x) => x.ev === 'state' && x.state === 'idle');
+            assert.ok(isPlayable(vdir('DLVIDEO0001')), 'kept after its play');
+            fs.writeFileSync(mf, keep);
+            fs.writeFileSync(dctl, 'fail');
+            dd.writeSaved('BADMARKER01', { at: Date.now() });
+            fs.writeFileSync(path.join(dcache, 'saved', 'BADMARKER01'), '{"at":');
+            await waitUntil(() => has(/^download BADMARKER01: boom \(3\/3\), given up$/) === 1, 5000);
+            await sleep(300);
+            assert.strictEqual(has(/^download BADMARKER01: started$/), 3, 'tried 3 times, not in a loop');
+            send({ cmd: 'remove', id: 'BADMARKER01' });
+            await lib((x) => !x.some((y) => y.id === 'BADMARKER01'));
+        });
+
+        await t('downloads: saved/ unreadable: the cleanup deletes nothing', async () => {
+            const c2 = path.join(droot, 'cache-bad'), x = new Daemon({ cacheDir: c2, keep: 0, noSetuid: true, log: () => {} });
+            mkdirp(path.join(c2, 'SOMEVIDEO01'));
+            fs.writeFileSync(path.join(c2, 'SOMEVIDEO01', 'audio.m4a'), 'x');
+            fs.writeFileSync(path.join(c2, 'saved'), 'not a folder');   // readdir: ENOTDIR
+            assert.deepStrictEqual(x.prune(), []);
+            assert.ok(fs.existsSync(path.join(c2, 'SOMEVIDEO01', 'audio.m4a')), 'kept');
+            fs.unlinkSync(path.join(c2, 'saved'));   // none at all (ENOENT): no downloads, the LRU as before
+            assert.deepStrictEqual(x.prune(), ['SOMEVIDEO01']);
+        });
+
+        await t('offline: a download plays from its files with no network and no fetch; a failed play says offline', async () => {
+            const opts = { ytRequest: dd.opts.ytRequest, fetcher: dd.opts.fetcher }, nf = path.join(droot, 'nofetch.ctl');
+            try { fs.unlinkSync(lease); } catch (e) { /* none */ }
+            dd.opts.ytRequest = () => Promise.reject(new Error('getaddrinfo EAI_AGAIN www.youtube.com'));
+            dd.opts.fetcher = [process.execPath, path.join(__dirname, 'fake_ytfetch.js'), nf];
+            fs.writeFileSync(nf, 'fail');
+                        send({ cmd: 'play', id: 'DLVIDEO0003', rect: '1280x720' });
+            await dc.waitFor((x) => x.ev === 'state' && x.state === 'playing');
+            assert.ok(!fs.existsSync(nf + '.log'), 'no fetcher: no yt-dlp');
+            send({ cmd: 'stop' });
+            await dc.waitFor((x) => x.ev === 'state' && x.state === 'idle');
+            assert.ok(isPlayable(vdir('DLVIDEO0003')), 'still there after its play');
+            send({ cmd: 'play', id: 'NOTONCAR001', rect: '1280x720' });
+            const e = await dc.waitFor((x) => x.ev === 'error' && /boom/.test(x.msg));
+            assert.strictEqual(e.offline, true, 'no lease: offline');
+            await dc.waitFor((x) => x.ev === 'state' && x.state === 'error');
+            fs.writeFileSync(lease, JSON.stringify({ interface: 'wlan0' }));
+            fs.writeFileSync(nf, 'gone');
+                        send({ cmd: 'play', id: 'NOTONCAR001', rect: '1280x720' });
+            const e2 = await dc.waitFor((x) => x.ev === 'error' && /unavailable/.test(x.msg));
+            assert.strictEqual(e2.offline, undefined, 'online, a refused video: not offline');
+            Object.assign(dd.opts, opts);
+            send({ cmd: 'stop' });
+            await dc.waitFor((x) => x.ev === 'state' && x.state === 'idle');
+        });
+
+        await t('VP9 + downloads: offline, a download that ytdec cannot decode stays (audio only, no refetch); H.264 only: downloads fetch --avc1', async () => {
+            fs.writeFileSync(dctl, 'done'); setMode('ok');
+            fs.unlinkSync(lease);
+            send({ cmd: 'play', id: 'DLVIDEO0003', rect: '1280x720' });
+            await dc.waitFor((x) => x.ev === 'state' && x.state === 'playing');
+            await waitUntil(() => dd.child);
+            try { fs.unlinkSync(dctl + '.log'); } catch (e) { /* none */ }
+            setMode('codec');
+            dd.child.kill('SIGKILL');                       // the next ytdec: exit 4
+            await dc.waitFor((x) => x.ev === 'error' && x.msg === 'video failed, audio only', 4000);
+            assert.ok(isPlayable(vdir('DLVIDEO0003')) && !fs.existsSync(dctl + '.log'), 'the download kept, no fetch');
+            assert.ok(dd.avc1Only);
+            setMode('ok');
+            send({ cmd: 'stop' });
+            await dc.waitFor((x) => x.ev === 'state' && x.state === 'idle');
+            fs.writeFileSync(lease, JSON.stringify({ interface: 'wlan0' }));
+            send({ cmd: 'download', id: 'DLVIDEO0009', meta: { title: 'Nine' } });
+            await ready('DLVIDEO0009');
+            assert.ok(JSON.parse(fs.readFileSync(dctl + '.log', 'utf8')).argv.indexOf('--avc1') > 0, 'H.264 only from then on');
+            send({ cmd: 'remove', id: 'DLVIDEO0009' });
+            await lib((it) => !it.some((x) => x.id === 'DLVIDEO0009'));
+            noAvc1(dd); dd.codecRetry = null;
+        });
+
+        await t('VP9 + downloads: online, a download that ytdec cannot decode is fetched again as H.264 and stays a download', async () => {
+            fs.writeFileSync(dctl, 'done'); setMode('ok');
+            send({ cmd: 'play', id: 'DLVIDEO0004', rect: '1280x720' });
+            await dc.waitFor((x) => x.ev === 'state' && x.state === 'playing');
+            await waitUntil(() => dd.child);
+            try { fs.unlinkSync(dctl + '.log'); } catch (e) { /* none */ }
+            setMode('codec');
+            dd.child.kill('SIGKILL');
+            await waitUntil(() => fs.existsSync(dctl + '.log'), 4000);
+            setMode('ok');
+            assert.ok(JSON.parse(fs.readFileSync(dctl + '.log', 'utf8')).argv.indexOf('--avc1') > 0, 'fetched again as H.264');
+            await waitUntil(() => isPlayable(vdir('DLVIDEO0004')) && dd.state === 'playing', 4000);
+            send({ cmd: 'stop' });
+            await dc.waitFor((x) => x.ev === 'state' && x.state === 'idle');
+            assert.ok(isPlayable(vdir('DLVIDEO0004')) && fs.existsSync(path.join(dcache, 'saved', 'DLVIDEO0004')), 'still a download');
+            assert.strictEqual(item('DLVIDEO0004').ready, true);
+            noAvc1(dd); dd.codecRetry = null;
+        });
+
+        await t('downloads: Download on the video streaming: not ready while it plays (a window, not the file), downloaded whole once it stops', async () => {
+            fs.writeFileSync(dctl, 'done');
+            send({ cmd: 'play', id: 'PLAYNSAVE01', rect: '1280x720' });
+            await dc.waitFor((x) => x.ev === 'state' && x.state === 'playing');
+            send({ cmd: 'download', id: 'PLAYNSAVE01', meta: { title: 'Now' } });
+            await waitUntil(() => dd.fetcher === null && fs.existsSync(path.join(vdir('PLAYNSAVE01'), 'win', 'video.h264')));
+            await sleep(300);
+            assert.strictEqual(item('PLAYNSAVE01').ready, false);
+            assert.strictEqual(has(/^download PLAYNSAVE01: started$/), 0, 'playing wins');
+            send({ cmd: 'stop' });
+            await ready('PLAYNSAVE01');
+            assert.ok(isPlayable(vdir('PLAYNSAVE01')) && has(/^download PLAYNSAVE01: started$/) === 1);
+            assert.ok(JSON.parse(fs.readFileSync(dctl + '.log', 'utf8')).argv.indexOf('--stream') < 0, 'a download fetches whole');
+        });
+
+        await t('downloads: the one downloading played: the download stops, the play fetches it from scratch, and that makes it ready', async () => {
+            fs.writeFileSync(dctl, '');
+            send({ cmd: 'download', id: 'PLAYDLING01' });
+            await waitUntil(() => dd.dl && dd.dl.id === 'PLAYDLING01' && fs.existsSync(path.join(vdir('PLAYDLING01'), 'index.bin')));
+            send({ cmd: 'play', id: 'PLAYDLING01', rect: '1280x720' });
+            await waitUntil(() => has(/^download PLAYDLING01: stopped$/) === 1);
+            fs.writeFileSync(dctl, 'done');
+            await dc.waitFor((x) => x.ev === 'state' && x.state === 'playing');
+            await ready('PLAYDLING01');
+            send({ cmd: 'stop' });
+            await dc.waitFor((x) => x.ev === 'state' && x.state === 'idle');
+            await sleep(300);
+            assert.ok(isPlayable(vdir('PLAYDLING01')) && has(/^download PLAYDLING01: started$/) === 1, 'ready from the play, not started again');
+            assert.ok(JSON.parse(fs.readFileSync(dctl + '.log', 'utf8')).argv.indexOf('--stream') < 0, 'a download plays whole, never streams');
+        });
+
+        await t('auto-downloads: off by default; on, the N newest Subscriptions videos on Wi-Fi while signed in; never on phone data or offline', async () => {
+            assert.strictEqual(dd.autoMax(), 0, 'off by default (no state file)');
+            const SUBS = { contents: { tvBrowseRenderer: { content: { tvSurfaceContentRenderer: { content: { sectionListRenderer: { contents: [
+                { shelfRenderer: { content: { horizontalListRenderer: { items: [
+                    tile('SHORTVIDEO1', 'TILE_CONTENT_TYPE_SHORTS', 'A short', 'A', null),
+                    tile('WATCHEDVID1', 'TILE_CONTENT_TYPE_VIDEO', 'Seen', 'A', '10:00'),
+                    tile('LIVEVIDEO01', 'TILE_CONTENT_TYPE_VIDEO', 'Live', 'A', 'LIVE'),
+                    tile('LONGVIDEO01', 'TILE_CONTENT_TYPE_VIDEO', 'Long', 'A', '1:30:00'),
+                    tile('AUTOVIDEO01', 'TILE_CONTENT_TYPE_VIDEO', 'New 1', 'A', '10:00'),
+                    tile('AUTOVIDEO02', 'TILE_CONTENT_TYPE_VIDEO', 'New 2', 'B', '5:00'),
+                    tile('AUTOVIDEO03', 'TILE_CONTENT_TYPE_VIDEO', 'New 3', 'C', '5:00')] } } } }] } } } } } } };
+            let browsed = 0;
+            dd.account.status = () => ({ state: 'signed_in' });
+            dd.account.token = async () => 'TOKEN';
+            dd.account.browse = async (id) => { browsed++; assert.strictEqual(id, 'FEsubscriptions'); return { status: 200, j: SUBS }; };
+            dd.positions().WATCHEDVID1 = { ms: 600000, total: 600000, done: true, at: Date.now() };
+            fs.writeFileSync(dctl, 'done');
+            await sleep(300);
+            assert.strictEqual(browsed, 0, 'off: Subscriptions never read');
+            fs.writeFileSync(lease, JSON.stringify({ interface: 'usb0' }));   // the phone's data
+                        send({ cmd: 'auto_download', max: 2 });
+            assert.deepStrictEqual(await dc.waitFor((x) => x.ev === 'auto_download'), { ev: 'auto_download', max: 2 });
+            assert.deepStrictEqual(JSON.parse(fs.readFileSync(path.join(dstate, 'autodl.json'), 'utf8')), { max: 2 }, 'kept for the next start');
+            await sleep(300);
+            assert.strictEqual(browsed, 0, 'phone data: never');
+            fs.unlinkSync(lease);
+            await sleep(300);
+            assert.strictEqual(browsed, 0, 'no lease: never');
+            dd.account.status = () => ({ state: 'signed_out' });
+            fs.writeFileSync(lease, JSON.stringify({ interface: 'wlan0' }));
+            await sleep(300);
+            assert.strictEqual(browsed, 0, 'signed out: never');
+            dd.account.status = () => ({ state: 'signed_in' });
+            await ready('AUTOVIDEO02');
+            assert.strictEqual(browsed, 1);
+            let it = await lib((x) => x.filter((y) => y.auto && y.ready).length === 2);
+            assert.deepStrictEqual(it.filter((x) => x.auto).map((x) => x.id), ['AUTOVIDEO01', 'AUTOVIDEO02'], 'the 2 newest that qualify, newest first');
+            await sleep(300);
+            assert.strictEqual(browsed, 1, 'looked for again only after autoEveryMs');
+            dd.positions().AUTOVIDEO01 = { ms: 600000, total: 600000, done: true, at: Date.now() };
+            it = await lib((x) => !x.some((y) => y.id === 'AUTOVIDEO01'));
+            assert.ok(!fs.existsSync(vdir('AUTOVIDEO01')), 'watched: it goes');
+            send({ cmd: 'auto_download', max: 0 });
+            it = await lib((x) => !x.some((y) => y.auto));
+            assert.ok(!fs.existsSync(vdir('AUTOVIDEO02')) && isPlayable(vdir('DLVIDEO0001')), 'off: the auto ones go, the ones asked by hand stay');
+            dd.account.status = () => ({ state: 'signed_out' });
+        });
+
+        await t('auto-downloads: on phone data a queued auto one waits (Wi-Fi only), one asked by hand does not', async () => {
+            dd.autoN = 2;   // (signed out: no Subscriptions look)
+            fs.writeFileSync(lease, JSON.stringify({ interface: 'usb0' }));
+            fs.writeFileSync(dctl, 'done');
+            dd.writeSaved('AUTOVIDEO09', { title: 'Auto', at: Date.now() - 1000, auto: true });   // the older: first in the queue
+            send({ cmd: 'download', id: 'HANDVIDEO01' });
+            await ready('HANDVIDEO01');
+            await sleep(300);
+            assert.strictEqual(has(/^download AUTOVIDEO09: started$/), 0, 'phone data: the auto one waits');
+            fs.writeFileSync(lease, JSON.stringify({ interface: 'wlan0' }));
+            await ready('AUTOVIDEO09');
+            dd.autoN = 0;
+            send({ cmd: 'remove', id: 'HANDVIDEO01' });
+            await lib((x) => !x.some((y) => y.id === 'HANDVIDEO01' || y.id === 'AUTOVIDEO09'));
+        });
+
+        await t('auto-downloads: an empty Subscriptions answer drops none; one removed by hand is not brought back', async () => {
+            const feed = (items) => ({ contents: { tvBrowseRenderer: { content: { tvSurfaceContentRenderer: { content: { sectionListRenderer: { contents: [
+                { shelfRenderer: { content: { horizontalListRenderer: { items: items } } } }] } } } } } } });
+            let ans = feed([]), browsed = 0;
+            dd.account.status = () => ({ state: 'signed_in' });
+            dd.account.browse = async () => { browsed++; return { status: 200, j: ans }; };
+            fs.writeFileSync(dctl, 'done');
+            dd.autoN = 2;
+            dd.writeSaved('AUTOVIDEO10', { title: 'Ten', at: Date.now(), auto: true });
+            dd.autoAt = 0;
+            await waitUntil(() => browsed === 1);
+            await sleep(200);
+            assert.ok(fs.existsSync(path.join(dcache, 'saved', 'AUTOVIDEO10')), 'kept: an empty list is no answer');
+            await ready('AUTOVIDEO10');
+            send({ cmd: 'remove', id: 'AUTOVIDEO10' });
+            await lib((x) => !x.some((y) => y.id === 'AUTOVIDEO10'));
+            ans = feed([tile('AUTOVIDEO10', 'TILE_CONTENT_TYPE_VIDEO', 'Ten', 'A', '5:00')]);
+            dd.autoAt = 0;
+            await waitUntil(() => browsed === 2);
+            await sleep(200);
+            assert.ok(!fs.existsSync(path.join(dcache, 'saved', 'AUTOVIDEO10')), 'removed by hand: stays removed');
+            dd.autoN = 0;
+            dd.account.status = () => ({ state: 'signed_out' });
+        });
+
+        await t('downloads: an id that is not a string is refused (an array of one would pass the pattern)', async () => {
+            for (const cmd of ['download', 'remove', 'play', 'thumb']) {
+                send({ cmd: cmd, id: ['ARRAYVIDEO1'], rect: '1280x720' });
+                await dc.waitFor((x) => x.ev === 'error' && x.msg === 'bad id');
+            }
+            assert.ok(!fs.existsSync(path.join(dcache, 'saved', 'ARRAYVIDEO1')) && dd.state !== 'error');
+        });
+
+        await t('positions: on the head file (audio.m4a came, paused) with no length known, no position is kept', async () => {
+            const x = new Daemon({ cacheDir: path.join(droot, 'cache-pos'), noSetuid: true, log: () => {} });
+            x.cur = { id: 'HEADFILE001', dir: path.join(droot, 'cache-pos', 'HEADFILE001'), title: 'T' };
+            x.total = 60000; x.elapsed = 5000; x.head = null; x.headFile = true;
+            x.savePos(true);
+            assert.strictEqual(x.positions().HEADFILE001, undefined, 'the head\'s 60 s is no length');
+            x.headFile = false;
+            x.savePos(true);
+            assert.strictEqual(x.positions().HEADFILE001.ms, 5000);
+        });
+
+        await t('auto-downloads: one going while it downloads: never pruned under its fetcher, its folder goes once the fetch is gone', async () => {
+            fs.writeFileSync(dctl, '');
+            dd.autoN = 1;
+            dd.writeSaved('AUTOVIDEO11', { title: 'Eleven', at: Date.now(), auto: true });
+            await waitUntil(() => dd.dl && dd.dl.id === 'AUTOVIDEO11' && fs.existsSync(path.join(vdir('AUTOVIDEO11'), 'index.bin')));
+            let exitAt = -1;
+            dd.dl.child.on('exit', () => { exitAt = dlogs.length; });
+            dd.autoN = 0;   // the next tick: over the count, the marker goes, the download stops
+            await waitUntil(() => !fs.existsSync(vdir('AUTOVIDEO11')));
+            const at = dlogs.findIndex((l) => /^lru removed .*AUTOVIDEO11/.test(l));
+            assert.ok(exitAt >= 0 && at >= exitAt, 'pruned after the fetcher exited (' + at + ' vs ' + exitAt + ')');
+            await lib((x) => !x.some((y) => y.id === 'AUTOVIDEO11'));
+        });
+
+        await t('downloads: a log report leaves out the downloads\' ids and titles', async () => {
+            const k = dd.known();
+            assert.ok(k.ids.DLVIDEO0008 === 'v' && k.titles.indexOf('Fetched DLVIDEO0008') >= 0);
+        });
+        dc.destroy();
+        await dd.close();
+    }
+
+    c.destroy();
+    await d.close();
+    console.log(results.join('\n'));
+    const failed = results.filter((r) => r.indexOf('FAIL') === 0).length;
+    process.exit(failed ? 1 : 0);
+}
+main().catch((e) => { console.error(e); process.exit(1); });

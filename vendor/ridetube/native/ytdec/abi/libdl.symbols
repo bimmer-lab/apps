@@ -1,0 +1,11 @@
+# Exported functions of the head unit's /lib/libdl-2.27.so (libdl.so.2, glibc 2.27)
+# sha256 d68442db7bf5b78048ded6605bcd7257e0b98b9b3033148a516f8522b44e8214 (nm -D --defined-only on the rootfs copy)
+dladdr FUNC 0  # GLIBC_2.2.5
+dladdr1 FUNC 0  # GLIBC_2.3.3
+dlclose FUNC 0  # GLIBC_2.2.5
+dlerror FUNC 0  # GLIBC_2.2.5
+dlinfo FUNC 0  # GLIBC_2.3.3
+dlmopen FUNC 0  # GLIBC_2.3.4
+dlopen FUNC 0  # GLIBC_2.2.5
+dlsym FUNC 0  # GLIBC_2.2.5
+dlvsym FUNC 0  # GLIBC_2.2.5

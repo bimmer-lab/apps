@@ -1,0 +1,3786 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 Robert Nisipeanu */
+#include "compositor.h"
+
+#include <time.h>
+
+#include <algorithm>
+#include <cstdio>
+#include <cstring>
+#include <iterator>
+#include <set>
+
+#include "block_pack.h"
+#include "log.h"
+#include "yuv_atlas.h"
+
+namespace crs {
+
+/* A quad placed in the target in pixels by u_mvp; v_uv runs from the quad's
+ * top-left. GLSL ES 1.00, like the HMI's own effects. */
+const char *const kQuadVertexShader = R"(#version 100
+attribute vec2 a_position;
+uniform mat4 u_mvp;
+varying vec2 v_uv;
+void main() {
+    v_uv = vec2(a_position.x, 1.0 - a_position.y);
+    gl_Position = u_mvp * vec4(a_position, 0.0, 1.0);
+})";
+
+std::vector<int> plan_passes(const std::vector<bool> &views)
+{
+    std::vector<int> pass(views.size());
+    int p = 0;
+    bool after_view = false;
+    for (size_t i = 0; i < views.size(); i++) {
+        if (views[i] || after_view)
+            p++;
+        after_view = views[i];
+        pass[i] = p;
+    }
+    return pass;
+}
+
+namespace {
+
+/* An image layer's pixels, straight alpha, at u_opacity. */
+const char *const kImageFragmentShader = R"(#version 100
+precision mediump float;
+uniform sampler2D u_image;
+uniform float u_opacity;
+varying vec2 v_uv;
+void main() {
+    vec4 c = texture2D(u_image, v_uv);
+    gl_FragColor = vec4(c.rgb, c.a * u_opacity);
+})";
+
+/* A layer's draw order at its place in the stack; an overlay or alert
+ * layer's in the over band on a target whose graph has one (Graph::band). */
+int32_t draw_order(bool over, const Layer &l, size_t pos)
+{
+    return (int32_t)pos * 4 + (over && l.params.klass >= Klass::Overlay ? kOverBand : 0);
+}
+
+}  // namespace
+
+const char *layer_state_name(LayerState s)
+{
+    switch (s) {
+    case LayerState::Hidden: return "hidden";
+    case LayerState::Stalled: return "stalled";
+    case LayerState::Shown: return "shown";
+    case LayerState::Suspended: return "suspended";
+    case LayerState::Error: return "error";
+    default: return "waiting";
+    }
+}
+
+namespace {
+
+/* Drawn by a composite: unturned, at its frame's size, at even x and y, so
+ * its planes line up with the canvas's. */
+bool composable(const LayerParams &p, const VideoParams &vp)
+{
+    return p.rotate == 0 && p.sx == 1 && p.sy == 1 && p.rect.w == vp.w && p.rect.h == vp.h && !(p.rect.x & 1) &&
+           !(p.rect.y & 1);
+}
+
+int64_t steady_us()
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+}  // namespace
+
+Compositor::Compositor(Gpu *gpu, SlotManager *slots, const GovernorConfig &budget, int upload_burst_ms,
+                       const CompositorLimits &limits)
+    : gpu_(gpu), slots_(slots), limits_(limits), governor_(budget), pacer_(budget.max_bps, upload_burst_ms),
+      clock_us_(steady_us)
+{
+    share_.share_of(&pacer_);
+}
+
+Compositor::~Compositor()
+{
+    for (auto &kv : layers_) {
+        kv.second.layer->detach(false);
+        drop_effects(kv.second);
+    }
+    for (auto &kv : assets_)
+        kv.second.asset->detach(false);
+    for (Target &t : targets_) {
+        if (t.composite)
+            t.composite->detach(false);
+        t.file.reset();    /* before a graph that borrows its scene */
+        t.graph.reset();
+    }
+    if (atlas_view_fx_) gpu_->drop_effect(atlas_view_fx_);
+    if (block_view_fx_) gpu_->drop_effect(block_view_fx_);
+    if (atlas_fx_) gpu_->drop_effect(atlas_fx_);
+    if (block_fx_) gpu_->drop_effect(block_fx_);
+    if (image_fx_) gpu_->drop_effect(image_fx_);
+    if (text_fx_) gpu_->drop_effect(text_fx_);
+    if (sdf_fx_) gpu_->drop_effect(sdf_fx_);
+    for (int fx : edge_fx_)
+        if (fx) gpu_->drop_effect(fx);
+}
+
+bool Compositor::init(std::string *err)
+{
+    targets_.resize(slots_->targets().size());
+    atlas_fx_ = gpu_->effect(kQuadVertexShader, crk::kAtlasFragmentShader, err);
+    if (atlas_fx_)
+        block_fx_ = gpu_->effect(kQuadVertexShader, crk::kBlockFragmentShader, err);
+    if (block_fx_)
+        image_fx_ = gpu_->effect(kQuadVertexShader, kImageFragmentShader, err);
+    return image_fx_ != 0;
+}
+
+bool Compositor::texts()
+{
+    if (!text_tried_) {
+        text_tried_ = true;
+        std::string why;
+        if (!(text_fx_ = compile(kTextVertexShader, kTextFragmentShader, &why)))
+            log_warn("compositor: no text layers: %s", why.c_str());
+    }
+    return text_fx_ != 0;
+}
+
+bool Compositor::sdf_effect()
+{
+    if (!sdf_tried_) {
+        sdf_tried_ = true;
+        std::string why;
+        if (!(sdf_fx_ = compile(kTextVertexShader300, kTextSdfFragmentShader300, &why)))
+            log_warn("compositor: distance fonts' edges from u_sdf: %s", why.c_str());
+    }
+    return sdf_fx_ != 0;
+}
+
+/* Compiled at the first edge a host asks for; refused, the service draws
+ * none (and runs as without them). */
+bool Compositor::edge_effects()
+{
+    if (!edge_tried_) {
+        edge_tried_ = true;
+        std::string why;
+        if (!(edge_fx_[0] = gpu_->effect(kQuadVertexShader, kEdgeAtlasFragmentShader, &why)))
+            log_warn("compositor: no edges for hosts: %s", why.c_str());
+        else if (!(edge_fx_[1] = gpu_->effect(kQuadVertexShader, kEdgeBlockFragmentShader, &why)))
+            log_warn("compositor: no edges for hosts' packed videos: %s", why.c_str());
+    }
+    return edge_fx_[0] != 0;
+}
+
+uint32_t Compositor::admit(uint64_t owner, int target, int64_t pixel_bytes, std::string *err)
+{
+    if (target < 0 || target >= (int)targets_.size()) {
+        *err = "unknown target";
+        return 0;
+    }
+    uint32_t mine = 0, all = (uint32_t)layers_.size();
+    for (const auto &kv : layers_)
+        mine += kv.second.owner == owner;
+    for (const auto &ck : canvases_) {
+        all += (uint32_t)ck.second.layers.size();
+        for (const auto &kv : ck.second.layers)
+            mine += kv.second.owner == owner;
+    }
+    if (all >= limits_.layers || mine >= limits_.per_client) {
+        *err = "too many layers";
+        return 0;
+    }
+    if ((int64_t)memory() + pixel_bytes > (int64_t)limits_.pixel_bytes) {
+        *err = "the service's pixel memory is full";
+        return 0;
+    }
+    return next_id_++;
+}
+
+uint64_t Compositor::memory() const
+{
+    uint64_t bytes = 0;
+    for (const auto &kv : layers_)
+        bytes += kv.second.pixel_bytes;
+    for (const auto &kv : assets_)
+        bytes += kv.second.asset->memory();
+    for (const auto &ck : canvases_) {
+        bytes += ck.second.canvas->memory();
+        for (const auto &kv : ck.second.layers)
+            bytes += kv.second.pixel_bytes;
+    }
+    for (const auto &kv : fonts_)
+        bytes += kv.second.font->bytes();
+    for (const Target &t : targets_)
+        bytes += t.composite_bytes;
+    return bytes;
+}
+
+int Compositor::compile(const std::string &vs, const std::string &fs, std::string *err)
+{
+    const int fx = gpu_->effect(vs.c_str(), fs.c_str(), err);
+    std::vector<EffectInput> in;
+    if (fx && gpu_->inputs(fx, &in)) {
+        std::map<std::string, EffectInput> &known = inputs_[fx];
+        for (const EffectInput &e : in)
+            known[e.name] = e;
+    }
+    return fx;
+}
+
+void Compositor::drop_effect(int fx)
+{
+    inputs_.erase(fx);
+    gpu_->drop_effect(fx);
+}
+
+void Compositor::drop_effects(Entry &e)
+{
+    if (e.effect)
+        drop_effect(e.effect);
+    if (std::string(e.layer->kind()) == "mesh")
+        for (int fx : static_cast<MeshLayer *>(e.layer.get())->effects())
+            drop_effect(fx);
+}
+
+bool Compositor::assets_have(const Entry &e) const
+{
+    for (const auto &kv : e.binds) {
+        auto a = assets_.find(kv.second);
+        if (a == assets_.end() ? !canvases_.count(kv.second) : !a->second.asset->have())
+            return false;
+    }
+    return true;
+}
+
+uint32_t Compositor::asset_refused(const Entry &e) const
+{
+    for (const auto &kv : e.binds) {
+        auto a = assets_.find(kv.second);
+        auto c = canvases_.find(kv.second);
+        if ((a != assets_.end() && !a->second.asset->refused().empty()) ||
+            (c != canvases_.end() && !c->second.canvas->refused().empty()))
+            return kv.second;
+    }
+    return 0;
+}
+
+bool Compositor::assets_clean(const Entry &e) const
+{
+    for (const auto &kv : e.binds) {
+        auto a = assets_.find(kv.second);
+        auto c = canvases_.find(kv.second);
+        if (a == assets_.end() ? c == canvases_.end() || !c->second.canvas->attached() : !a->second.asset->clean())
+            return false;
+    }
+    return true;
+}
+
+void Compositor::apply_binds(Entry &e)
+{
+    Target &t = targets_[e.layer->target()];
+    if (!t.graph || !e.layer->attached())
+        return;
+    for (const auto &kv : e.binds) {
+        const int d = e.layer->drawable(kv.first.first);
+        auto a = assets_.find(kv.second);
+        const int buf = bound_buffer(kv.second);
+        if (!buf && a != assets_.end() && a->second.asset->immutable())
+            continue;   /* bound once its texture is made */
+        if (!d || !buf) {
+            log_warn("layer %u: %s not bound to asset %u", e.layer->id(), kv.first.second.c_str(), kv.second);
+        } else if (!t.graph->texture(d, kv.first.second.c_str(), buf)) {
+            /* where the effect's samplers were not known at bind(): never
+             * shown with a sampler left unbound */
+            e.error = "the renderer did not bind asset " + std::to_string(kv.second) + " to " + kv.first.second;
+            log_error("layer %u: %s", e.layer->id(), e.error.c_str());
+        }
+    }
+    for (const auto &kv : e.links) {
+        const int d = e.layer->drawable(kv.first.first);
+        auto v = values_.find(kv.second);
+        if (!d || v == values_.end() || !v->second.handle ||
+            !t.graph->link(d, kv.first.second.c_str(), v->second.handle))
+            log_warn("layer %u: %s not linked to value %u", e.layer->id(), kv.first.second.c_str(), kv.second);
+    }
+    t.dirty = true;
+}
+
+void Compositor::attach(Entry &e, Target &t)
+{
+    std::string err;
+    e.drawn = false;
+    e.order = -1;   /* arranged again: shown and ordered in the same flush */
+    e.flushed = Look();
+    if (e.held) {
+        e.held = false;
+        t.held_n--;
+        e.layer->hold_scene(nullptr);
+    }
+    mark(e, e.layer->id(), t);
+    if (!e.layer->attach(t.graph.get(), now_ms_, &err)) {
+        e.error = err;
+        log_error("layer %u (%s): %s", e.layer->id(), e.layer->kind(), err.c_str());
+    } else {
+        e.error.clear();
+    }
+    t.dirty = true;
+}
+
+uint32_t Compositor::add_video(uint64_t owner, int target, const LayerParams &lp, const VideoParams &vp,
+                               int64_t now_ms, std::string *err)
+{
+    if (const char *e = VideoLayer::size_error(vp.w, vp.h)) {
+        *err = e;
+        return 0;
+    }
+    if (target < 0 || target >= (int)targets_.size()) {
+        *err = "unknown target";
+        return 0;
+    }
+    uint32_t videos = 0;
+    for (const auto &kv : layers_)
+        videos += std::string(kv.second.layer->kind()) == "video";
+    if (videos >= limits_.client_videos) {
+        *err = "too many video layers";
+        return 0;
+    }
+    std::vector<VideoSpec> specs = video_specs(), real = video_specs(true);
+    VideoSpec mine;
+    mine.target = target;
+    mine.params = lp;
+    mine.vp = vp;
+    mine.composable = composable(lp, vp);
+    specs.push_back(mine);
+    real.push_back(mine);
+    uint64_t composites = 0;
+    if (!videos_fit_both(specs, real, &composites, err))
+        return 0;
+    uint64_t now_composites = 0;
+    for (const Target &t : targets_)
+        now_composites += t.composite_bytes;
+    const size_t atlas = (size_t)vp.w * crk::atlas_height(vp.h);
+    const size_t bytes = atlas * 4 + (vp.pan_blocks ? crk::block_bytes(vp.w, vp.h) : 0);
+    const uint32_t id = admit(owner, target, (int64_t)bytes + (int64_t)composites - (int64_t)now_composites, err);
+    if (!id)
+        return 0;
+    Entry &e = layers_[id];
+    e.layer.reset(new VideoLayer(id, target, ++seq_, pacer_for(target), atlas_fx_, block_fx_, vp, now_ms));
+    e.layer->params = lp;
+    e.owner = owner;
+    e.pixel_bytes = bytes;
+    reconcile();
+    return id;
+}
+
+uint32_t Compositor::add_image(uint64_t owner, int target, const LayerParams &lp, uint32_t w, uint32_t h,
+                               uint32_t fps, Sampling s, int64_t now_ms, std::string *err)
+{
+    if (const char *e = ImageLayer::size_error(w, h)) {
+        *err = e;
+        return 0;
+    }
+    const size_t bytes = (size_t)w * h * 4 * 2;
+    const uint32_t id = admit(owner, target, bytes, err);
+    if (!id)
+        return 0;
+    Entry &e = layers_[id];
+    e.layer.reset(new ImageLayer(id, target, ++seq_, pacer_for(target), image_fx_, w, h, fps, s, now_ms));
+    e.layer->params = lp;
+    e.owner = owner;
+    e.pixel_bytes = bytes;
+    if (targets_[target].graph)
+        attach(e, targets_[target]);
+    return id;
+}
+
+uint32_t Compositor::add_effect(uint64_t owner, int target, const LayerParams &lp, const std::string &vs,
+                                const std::string &fs, uint32_t time_fps, int64_t now_ms, std::string *err)
+{
+    if (target < 0 || target >= (int)targets_.size()) {
+        *err = "unknown target";
+        return 0;
+    }
+    if (vs.size() > kMaxShader || fs.size() > kMaxShader) {
+        *err = "a shader is at most " + std::to_string(kMaxShader) + " bytes";
+        return 0;
+    }
+    CanvasEntry *in = nullptr;
+    if (lp.canvas && !(in = canvas_for(owner, target, lp.canvas, err)))
+        return 0;
+    const int fx = compile(vs.empty() ? kQuadVertexShader : vs, fs, err);
+    if (!fx)
+        return 0;
+    const uint32_t id = admit(owner, target, 0, err);
+    if (!id) {
+        drop_effect(fx);
+        return 0;
+    }
+    Entry &e = in ? in->layers[id] : layers_[id];
+    e.layer.reset(new EffectLayer(id, target, ++seq_, pacer_for(target), fx, time_fps, now_ms));
+    e.layer->params = lp;
+    e.owner = owner;
+    e.effect = fx;
+    if (in)
+        attach_in(e, *in);
+    else if (targets_[target].graph)
+        attach(e, targets_[target]);
+    return id;
+}
+
+uint32_t Compositor::add_font(uint64_t owner, uint32_t asset, Font &&f, std::string *err)
+{
+    Asset *a = this->asset(owner, asset);
+    if (!a) {
+        *err = "no such asset";
+        return 0;
+    }
+    if (a->params().format != TexFormat::R8 || a->params().cube) {
+        *err = "a font's atlas is an r8 asset";
+        return 0;
+    }
+    uint32_t mine = 0;
+    for (const auto &kv : fonts_)
+        mine += kv.second.owner == owner;
+    if (mine >= kClientFonts) {
+        *err = "at most " + std::to_string(kClientFonts) + " fonts a client";
+        return 0;
+    }
+    if (memory() + f.bytes() > limits_.pixel_bytes) {
+        *err = "the service's pixel memory is full";
+        return 0;
+    }
+    const uint32_t id = next_id_++;
+    FontEntry &e = fonts_[id];
+    e.owner = owner;
+    e.asset = asset;
+    e.font = std::make_shared<const Font>(std::move(f));
+    return id;
+}
+
+uint32_t Compositor::add_text(uint64_t owner, int target, const LayerParams &lp, uint32_t font, uint32_t capacity,
+                              int64_t now_ms, std::string *err)
+{
+    auto f = fonts_.find(font);
+    if (f == fonts_.end() || f->second.owner != owner) {
+        *err = "no such font";
+        return 0;
+    }
+    if (!texts()) {
+        *err = "text is off: the renderer refused its shaders";
+        return 0;
+    }
+    if (!capacity || capacity > TextLayer::kMaxGlyphs) {
+        *err = "a text layer holds 1 to " + std::to_string(TextLayer::kMaxGlyphs) + " glyphs";
+        return 0;
+    }
+    Asset *a = this->asset(owner, f->second.asset);
+    if (!a || a->target() != target) {
+        *err = "the font's atlas is on another target";
+        return 0;
+    }
+    const size_t bytes = (size_t)capacity * (TextLayer::kVertexBytes + TextLayer::kIndexBytes) * 2;
+    const uint32_t id = admit(owner, target, (int64_t)bytes, err);
+    if (!id)
+        return 0;
+    /* A distance font's edge from screen-space derivatives where the
+     * cluster draws GLSL ES 3.00 (instancing_: the conf's instancing and
+     * id8_instancing say it draws 3.00 and instanced draws), else from
+     * u_sdf. */
+    const bool derivatives = f->second.font->sdf && instancing_ && sdf_effect();
+    Entry &e = layers_[id];
+    e.layer.reset(new TextLayer(id, target, ++seq_, pacer_for(target), derivatives ? sdf_fx_ : text_fx_,
+                                f->second.font, capacity, derivatives, now_ms));
+    e.layer->params = lp;
+    e.owner = owner;
+    e.pixel_bytes = bytes;
+    e.font = font;
+    e.binds[std::make_pair(0u, std::string("u_atlas"))] = f->second.asset;
+    if (targets_[target].graph) {
+        attach(e, targets_[target]);
+        apply_binds(e);   /* the client sends no bind: the atlas is the font's */
+    }
+    return id;
+}
+
+uint32_t Compositor::add_mesh(uint64_t owner, int target, const LayerParams &lp, const MeshParams &mp, int64_t,
+                              std::string *err)
+{
+    CanvasEntry *in = nullptr;
+    if (lp.canvas && !(in = canvas_for(owner, target, lp.canvas, err)))
+        return 0;
+    const uint32_t id = admit(owner, target, 0, err);
+    if (!id)
+        return 0;
+    Entry &e = in ? in->layers[id] : layers_[id];
+    e.layer.reset(new MeshLayer(id, target, ++seq_, pacer_for(target), mp));
+    e.layer->params = lp;
+    e.owner = owner;
+    if (in)
+        attach_in(e, *in);
+    else if (targets_[target].graph)
+        attach(e, targets_[target]);
+    return id;
+}
+
+bool Compositor::add_part(uint64_t owner, uint32_t layer, uint32_t part, const std::string &vs,
+                          const std::string &fs, const PartLook &look, uint32_t parent, std::string *err)
+{
+    CanvasEntry *in = nullptr;
+    Entry *en = find(layer, &in);
+    if (!en || en->owner != owner) {
+        *err = "no such layer";
+        return false;
+    }
+    if (std::string(en->layer->kind()) != "mesh") {
+        *err = "parts are for mesh layers";
+        return false;
+    }
+    MeshLayer *m = static_cast<MeshLayer *>(en->layer.get());
+    if (m->has_part(part)) {
+        *err = "part " + std::to_string(part) + " exists";
+        return false;
+    }
+    if (vs.size() > kMaxShader || fs.size() > kMaxShader) {
+        *err = "a shader is at most " + std::to_string(kMaxShader) + " bytes";
+        return false;
+    }
+    int fx = 0;
+    unsigned attrs = 0;
+    if (look.instances > 1 && !instancing_) {
+        *err = "instances are off on this cluster (cluster-render.conf)";
+        return false;
+    }
+    if (!vs.empty() || !fs.empty()) {   /* else a pivot */
+        if (!(fx = compile(vs, fs, err)))
+            return false;
+        attrs = gpu_->attributes(fx);
+        if (!(attrs & kAttrPosition)) {
+            drop_effect(fx);
+            *err = "a part's vertex shader reads a vec3 a_position (attribute, or in with #version 300 es)";
+            return false;
+        }
+    }
+    if (!m->add_part(part, fx, attrs, look, parent, err)) {
+        if (fx)
+            drop_effect(fx);
+        return false;
+    }
+    touch(m);
+    return true;
+}
+
+bool Compositor::geometry(uint64_t owner, uint32_t layer, uint32_t part, MeshData &&data, int64_t now_ms,
+                          std::string *err)
+{
+    Entry *en = find(layer);
+    if (!en || en->owner != owner) {
+        *err = "no such layer";
+        return false;
+    }
+    Entry &e = *en;
+    if (std::string(e.layer->kind()) != "mesh") {
+        *err = "geometry is for mesh layers";
+        return false;
+    }
+    MeshLayer *m = static_cast<MeshLayer *>(e.layer.get());
+    /* what the target's other mesh layers draw, on screen or in a canvas */
+    uint64_t others = 0;
+    auto count = [&](const std::map<uint32_t, Entry> &in) {
+        for (const auto &kv : in)
+            if (kv.second.layer.get() != m && kv.second.layer->target() == m->target() &&
+                !std::strcmp(kv.second.layer->kind(), "mesh"))
+                others += static_cast<const MeshLayer *>(kv.second.layer.get())->drawn_indices();
+    };
+    count(layers_);
+    for (const auto &ck : canvases_)
+        count(ck.second.layers);
+    const size_t bytes = e.pixel_bytes - m->part_bytes(part) + data.bytes();
+    if (memory() - e.pixel_bytes + bytes > limits_.pixel_bytes) {
+        *err = "the service's pixel memory is full";
+        return false;
+    }
+    if (!m->set_geometry(part, std::move(data), now_ms, err, others < kMaxTargetIndices ? kMaxTargetIndices - others : 0))
+        return false;
+    e.pixel_bytes = bytes;
+    return true;
+}
+
+uint32_t Compositor::add_canvas(uint64_t owner, int target, const CanvasSpec &spec, std::string *err)
+{
+    if (target < 0 || target >= (int)targets_.size()) {
+        *err = "unknown target";
+        return 0;
+    }
+    if (const char *e = Canvas::spec_error(spec)) {
+        *err = e;
+        return 0;
+    }
+    uint32_t mine = 0;
+    uint64_t pixels = (uint64_t)spec.w * spec.h, own = Canvas::memory(spec);
+    for (const auto &kv : canvases_) {
+        mine += kv.second.owner == owner;
+        if (kv.second.owner == owner)
+            own += kv.second.canvas->memory();
+        if (kv.second.canvas->target() == target)
+            pixels += kv.second.canvas->pixels();
+    }
+    if (canvases_.size() >= kCanvases || mine >= kClientCanvases) {
+        *err = "too many canvases";
+        return 0;
+    }
+    if (pixels > Canvas::kMaxTargetPixels) {
+        *err = "the target's canvases together are at most 2048x2048 pixels";
+        return 0;
+    }
+    /* A share of it, so one client's canvases leave the rest room. */
+    if (own > limits_.pixel_bytes / 2) {
+        *err = "a client's canvases together are at most half the service's pixel memory (" +
+               std::to_string(limits_.pixel_bytes / 2 / 1024) + " KB)";
+        return 0;
+    }
+    if (memory() + Canvas::memory(spec) > limits_.pixel_bytes) {
+        *err = "the service's pixel memory is full";
+        return 0;
+    }
+    const uint32_t id = next_id_++;
+    CanvasEntry &ce = canvases_[id];
+    ce.canvas.reset(new Canvas(id, target, spec));
+    ce.owner = owner;
+    Target &t = targets_[target];
+    if (t.graph) {
+        ce.canvas->attach(t.graph.get());
+        t.dirty = true;
+    }
+    return id;
+}
+
+const Canvas *Compositor::canvas(uint32_t id) const
+{
+    auto it = canvases_.find(id);
+    return it == canvases_.end() ? nullptr : it->second.canvas.get();
+}
+
+std::vector<const Canvas *> Compositor::canvases() const
+{
+    std::vector<const Canvas *> out;
+    for (const auto &kv : canvases_)
+        out.push_back(kv.second.canvas.get());
+    return out;
+}
+
+Compositor::Entry *Compositor::find(uint32_t id, CanvasEntry **in)
+{
+    if (in)
+        *in = nullptr;
+    auto it = layers_.find(id);
+    if (it != layers_.end())
+        return &it->second;
+    for (auto &ck : canvases_) {
+        auto l = ck.second.layers.find(id);
+        if (l != ck.second.layers.end()) {
+            if (in)
+                *in = &ck.second;
+            return &l->second;
+        }
+    }
+    return nullptr;
+}
+
+const Compositor::Entry *Compositor::find(uint32_t id, const CanvasEntry **in) const
+{
+    CanvasEntry *c = nullptr;
+    const Entry *e = const_cast<Compositor *>(this)->find(id, &c);
+    if (in)
+        *in = c;
+    return e;
+}
+
+Compositor::CanvasEntry *Compositor::canvas_for(uint64_t owner, int target, uint32_t canvas, std::string *err)
+{
+    auto it = canvases_.find(canvas);
+    if (it == canvases_.end() || it->second.owner != owner) {
+        *err = "no such canvas";
+        return nullptr;
+    }
+    if (it->second.canvas->target() != target) {
+        *err = "the canvas is on another target";
+        return nullptr;
+    }
+    return &it->second;
+}
+
+void Compositor::attach_in(Entry &e, CanvasEntry &c)
+{
+    e.drawn = false;
+    e.order = -1;
+    Target &t = targets_[e.layer->target()];
+    if (!c.canvas->attached())
+        return;
+    std::string err;
+    if (!e.layer->attach(c.canvas->graph(), now_ms_, &err)) {
+        e.error = err;
+        log_error("layer %u (%s) in canvas %u: %s", e.layer->id(), e.layer->kind(), c.canvas->id(), err.c_str());
+    } else {
+        e.error.clear();
+        apply_binds(e);
+    }
+    c.canvas->touch();
+    t.dirty = true;
+}
+
+void Compositor::arrange_canvases(int ti)
+{
+    Target &t = targets_[ti];
+    for (auto &ck : canvases_) {
+        CanvasEntry &c = ck.second;
+        if (c.canvas->target() != ti || !c.canvas->attached())
+            continue;
+        std::vector<Entry *> order;
+        for (auto &kv : c.layers)
+            if (kv.second.layer->attached())
+                order.push_back(&kv.second);
+        std::sort(order.begin(), order.end(), [](const Entry *a, const Entry *b) {
+            const LayerParams &p = a->layer->params, &q = b->layer->params;
+            if (p.klass != q.klass)
+                return p.klass < q.klass;
+            if (p.z != q.z)
+                return p.z < q.z;
+            return a->layer->id() < b->layer->id();
+        });
+        for (size_t pos = 0; pos < order.size(); pos++) {
+            Entry &e = *order[pos];
+            /* As a layer on screen: visible and ready, nothing it samples
+             * refused, and drawn once all of that is in its buffers. */
+            const Layer &l = *e.layer;
+            const bool drawn = l.params.visible && e.error.empty() && l.refusal().empty() && !asset_refused(e) &&
+                               l.ready(now_ms_) && assets_have(e) && assets_clean(e);
+            const int32_t at = (int32_t)pos * 4;
+            if (drawn == e.drawn && at == e.order)
+                continue;
+            e.layer->arrange(drawn, at);
+            e.drawn = drawn;
+            e.order = at;
+            c.canvas->touch();
+            t.dirty = true;
+        }
+    }
+}
+
+uint32_t Compositor::add_value(uint64_t owner, int target, uint32_t width, const float *v, std::string *err)
+{
+    if (target < 0 || target >= (int)targets_.size()) {
+        *err = "unknown target";
+        return 0;
+    }
+    if (width < 1 || width > 4) {
+        *err = "a value is a float, vec2, vec3 or vec4";
+        return 0;
+    }
+    uint32_t mine = 0;
+    for (const auto &kv : values_)
+        mine += kv.second.owner == owner;
+    if (values_.size() >= kValues || mine >= kClientValues) {
+        *err = "too many values";
+        return 0;
+    }
+    const uint32_t id = next_id_++;
+    ValueEntry &ve = values_[id];
+    ve.owner = owner;
+    ve.target = target;
+    ve.width = width;
+    std::copy(v, v + width, ve.v);
+    Target &t = targets_[target];
+    if (t.graph)
+        make_value(t, ve);
+    return id;
+}
+
+void Compositor::make_value(Target &t, ValueEntry &ve)
+{
+    ve.handle = t.graph->value(ve.width);
+    if (!ve.handle || !t.graph->set_value(ve.handle, ve.v))
+        log_warn("compositor: a value refused by the renderer");
+    for (auto &kv : ve.anims)
+        kv.second.handle = ve.handle ? t.graph->animate(ve.handle, kv.second.a) : 0;
+    t.dirty = true;
+}
+
+const Compositor::ValueEntry *Compositor::value(uint64_t owner, uint32_t id) const
+{
+    auto it = values_.find(id);
+    return it == values_.end() || it->second.owner != owner ? nullptr : &it->second;
+}
+
+bool Compositor::set_value(uint64_t owner, uint32_t id, const float *v, std::string *err)
+{
+    auto it = values_.find(id);
+    if (it == values_.end() || it->second.owner != owner) {
+        *err = "no such value";
+        return false;
+    }
+    ValueEntry &ve = it->second;
+    std::copy(v, v + ve.width, ve.v);
+    Target &t = targets_[ve.target];
+    if (t.graph && ve.handle) {
+        t.graph->set_value(ve.handle, ve.v);
+        t.dirty = true;
+    }
+    touch_linked(id);
+    return true;
+}
+
+void Compositor::touch_linked(uint32_t value)
+{
+    for (auto &ck : canvases_)
+        for (const auto &kv : ck.second.layers)
+            for (const auto &l : kv.second.links)
+                if (l.second == value)
+                    ck.second.canvas->touch();
+}
+
+bool Compositor::animate_value(uint64_t owner, uint32_t id, uint32_t anim, const Animation &a, std::string *err)
+{
+    auto it = values_.find(id);
+    if (it == values_.end() || it->second.owner != owner) {
+        *err = "no such value";
+        return false;
+    }
+    ValueEntry &ve = it->second;
+    if (a.width != ve.width || ve.width == 2) {
+        *err = ve.width == 2 ? "a vec2 value is set, not animated"
+                             : "each key takes " + std::to_string(ve.width) + " values, as the value";
+        return false;
+    }
+    auto now = ve.anims.find(anim);
+    if (now == ve.anims.end() && ve.anims.size() >= Layer::kMaxAnimations) {
+        *err = "at most " + std::to_string(Layer::kMaxAnimations) + " animations a value";
+        return false;
+    }
+    Animation played = a;
+    played.property = Animated::Value;
+    played.owner = owner;   /* its turn among the target's clients (key_turns()) */
+    Target &t = targets_[ve.target];
+    int handle = 0;
+    if (t.graph && ve.handle) {
+        handle = now != ve.anims.end() && now->second.handle ? t.graph->replace(now->second.handle, ve.handle, played)
+                                                             : t.graph->animate(ve.handle, played);
+        if (!handle) {
+            ve.anims.erase(anim);
+            *err = "the renderer refused the animation";
+            return false;
+        }
+        t.dirty = true;
+    }
+    ValueEntry::Played &p = ve.anims[anim];
+    p.a = played;
+    p.handle = handle;
+    touch_linked(id);
+    return true;
+}
+
+bool Compositor::stop_value(uint64_t owner, uint32_t id, uint32_t anim)
+{
+    auto it = values_.find(id);
+    if (it == values_.end() || it->second.owner != owner)
+        return false;
+    auto p = it->second.anims.find(anim);
+    if (p == it->second.anims.end())
+        return false;
+    Target &t = targets_[it->second.target];
+    if (t.graph && p->second.handle) {
+        t.graph->stop(p->second.handle);
+        /* where the animation left it, the value goes back to what was set */
+        t.graph->set_value(it->second.handle, it->second.v);
+        t.dirty = true;
+    }
+    it->second.anims.erase(p);
+    touch_linked(id);
+    return true;
+}
+
+bool Compositor::link(uint64_t owner, uint32_t layer, uint32_t part, const std::string &name, uint32_t value,
+                      std::string *err)
+{
+    Entry *en = find(layer);
+    if (!en || en->owner != owner) {
+        *err = "no such layer";
+        return false;
+    }
+    Entry &e = *en;
+    const std::string kind = e.layer->kind();
+    if (kind != "effect" && kind != "mesh") {
+        *err = "links are for effect layers and mesh parts";
+        return false;
+    }
+    Uniforms *u = e.layer->uniforms_of(part);
+    if (!u) {
+        *err = kind == "effect" ? "effect layers have no parts" : "no such part";
+        return false;
+    }
+    auto v = values_.find(value);
+    if (value && (v == values_.end() || v->second.owner != owner)) {
+        *err = "no such value";
+        return false;
+    }
+    if (value && v->second.target != e.layer->target()) {
+        *err = "the value is on another target";
+        return false;
+    }
+    /* checked against the effect's uniforms as the library compiled it,
+     * scene or none: there, plain, of the value's type */
+    static const char *const kTypes[] = {"float", "vec2", "vec3", "vec4"};
+    static const EffectInput::Kind kKinds[] = {EffectInput::Float, EffectInput::Vec2, EffectInput::Vec3,
+                                               EffectInput::Vec4};
+    const int fx = kind == "effect" ? e.effect : static_cast<MeshLayer *>(e.layer.get())->part_effect(part);
+    if (value && !fx) {
+        *err = "a pivot has no uniforms";
+        return false;
+    }
+    auto compiled = inputs_.find(fx);
+    if (value && compiled == inputs_.end()) {
+        /* nothing to check it against: refused here, before anything is
+         * held back, so the uniform keeps its own value */
+        *err = "the display cannot describe this shader's uniforms: no link to it";
+        return false;
+    }
+    if (value) {
+        auto d = compiled->second.find(name);
+        if (d == compiled->second.end()) {
+            *err = "the shader has no uniform " + name;
+            return false;
+        }
+        if (d->second.elements != 1) {
+            *err = "the shader's " + name + " is an array: a value is linked to a plain uniform";
+            return false;
+        }
+        if (d->second.kind != kKinds[v->second.width - 1]) {
+            int w = 0;
+            while (w < 4 && kKinds[w] != d->second.kind)
+                w++;
+            *err = "the shader's " + name + (w < 4 ? std::string(" is a ") + kTypes[w] : std::string(" is no float or vector")) +
+                   ", the value a " + kTypes[v->second.width - 1];
+            return false;
+        }
+    }
+    if (value && e.layer->animating(part, name)) {
+        *err = "an animation plays the uniform: stop it first";
+        return false;
+    }
+    const std::pair<uint32_t, std::string> key(part, name);
+    if (value && !e.links.count(key) && e.links.size() >= kMaxLinks) {
+        *err = "at most " + std::to_string(kMaxLinks) + " links a layer";
+        return false;
+    }
+    Target &t = targets_[e.layer->target()];
+    const int d = e.layer->drawable(part);
+    if (t.graph && d && (value ? v->second.handle : e.links.count(key))) {
+        if (!t.graph->link(d, name.c_str(), value ? v->second.handle : 0)) {
+            *err = "the shader has no uniform " + name + " of the value's type";
+            return false;
+        }
+        t.dirty = true;
+    }
+    u->link(name, value != 0);
+    if (value)
+        e.links[key] = value;
+    else
+        e.links.erase(key);
+    touch(e.layer.get());
+    return true;
+}
+
+bool Compositor::linked(uint64_t owner, uint32_t layer, uint32_t part, const std::string &name) const
+{
+    const Entry *e = find(layer);
+    return e && e->owner == owner && e->links.count(std::make_pair(part, name));
+}
+
+bool Compositor::sampled(uint32_t id) const
+{
+    auto in = [id](const std::map<uint32_t, Entry> &m) {
+        for (const auto &kv : m)
+            for (const auto &b : kv.second.binds)
+                if (b.second == id)
+                    return true;
+        return false;
+    };
+    if (in(layers_))
+        return true;
+    for (const auto &ck : canvases_)
+        if (in(ck.second.layers))
+            return true;
+    return false;
+}
+
+void Compositor::rebind(uint32_t id)
+{
+    auto in = [this, id](std::map<uint32_t, Entry> &m) {
+        for (auto &kv : m)
+            for (const auto &b : kv.second.binds)
+                if (b.second == id) {
+                    apply_binds(kv.second);
+                    break;
+                }
+    };
+    in(layers_);
+    for (auto &ck : canvases_)
+        in(ck.second.layers);
+}
+
+void Compositor::enable_canvases(int ti, Target &t)
+{
+    /* Sampled by a drawn layer on screen, or by a drawn layer in a canvas
+     * that is; a layer in a canvas samples only canvases made before its
+     * own (bind()), so the newest first. */
+    std::set<uint32_t> wanted;
+    for (const auto &kv : layers_)
+        if (kv.second.drawn && kv.second.layer->target() == ti)
+            for (const auto &b : kv.second.binds)
+                wanted.insert(b.second);
+    for (auto ck = canvases_.rbegin(); ck != canvases_.rend(); ++ck) {
+        if (ck->second.canvas->target() != ti)
+            continue;
+        const bool on = wanted.count(ck->first) != 0;
+        if (on)
+            for (const auto &kv : ck->second.layers)
+                if (kv.second.drawn)
+                    for (const auto &b : kv.second.binds)
+                        wanted.insert(b.second);
+        if (ck->second.canvas->enable(on))
+            t.dirty = true;
+    }
+}
+
+int Compositor::bound_buffer(uint32_t id) const
+{
+    auto a = assets_.find(id);
+    if (a != assets_.end())
+        return a->second.asset->buffer();
+    auto c = canvases_.find(id);
+    return c == canvases_.end() ? 0 : c->second.canvas->buffer();
+}
+
+std::string Compositor::refused_reason(uint32_t id) const
+{
+    auto a = assets_.find(id);
+    if (a != assets_.end())
+        return "asset " + std::to_string(id) + ": " + a->second.asset->refused();
+    auto c = canvases_.find(id);
+    return "canvas " + std::to_string(id) + ": " + (c == canvases_.end() ? std::string("gone") : c->second.canvas->refused());
+}
+
+uint32_t Compositor::add_asset(uint64_t owner, int target, const AssetParams &ap, std::string *err)
+{
+    if (target < 0 || target >= (int)targets_.size()) {
+        *err = "unknown target";
+        return 0;
+    }
+    if (const char *e = Asset::size_error(ap)) {
+        *err = e;
+        return 0;
+    }
+    uint32_t mine = 0;
+    for (const auto &kv : assets_)
+        mine += kv.second.owner == owner;
+    if (assets_.size() >= limits_.assets || mine >= limits_.assets_per_client) {
+        *err = "too many assets";
+        return 0;
+    }
+    const uint64_t bytes = Asset::memory(ap);
+    if (memory() + bytes > limits_.pixel_bytes) {
+        *err = "the service's pixel memory is full";
+        return 0;
+    }
+    const uint32_t id = next_id_++;
+    AssetEntry &a = assets_[id];
+    a.asset.reset(new Asset(id, target, pacer_for(target), ap));
+    a.owner = owner;
+    Target &t = targets_[target];
+    if (t.graph) {
+        a.asset->attach(t.graph.get());
+        t.dirty = true;
+    }
+    return id;
+}
+
+Asset *Compositor::asset(uint64_t owner, uint32_t id)
+{
+    auto it = assets_.find(id);
+    return it == assets_.end() || it->second.owner != owner ? nullptr : it->second.asset.get();
+}
+
+bool Compositor::remove_asset(uint64_t owner, uint32_t id, std::string *err)
+{
+    auto val = values_.find(id);
+    if (val != values_.end() && val->second.owner == owner) {
+        /* its links go, each uniform back to its own value */
+        auto unlink = [&](std::map<uint32_t, Entry> &m) {
+            for (auto &kv : m)
+                for (auto l = kv.second.links.begin(); l != kv.second.links.end();) {
+                    if (l->second != id) {
+                        ++l;
+                        continue;
+                    }
+                    const auto key = l->first;
+                    ++l;
+                    link(kv.second.owner, kv.first, key.first, key.second, 0, err);
+                }
+        };
+        unlink(layers_);
+        for (auto &ck : canvases_)
+            unlink(ck.second.layers);
+        Target &t = targets_[val->second.target];
+        if (t.graph && val->second.handle) {
+            t.graph->drop_value(val->second.handle);   /* its animations with it */
+            t.dirty = true;
+        }
+        values_.erase(val);
+        err->clear();
+        return true;
+    }
+    auto cv = canvases_.find(id);
+    if (cv != canvases_.end() && cv->second.owner == owner) {
+        if (!cv->second.layers.empty() || sampled(id)) {
+            *err = cv->second.layers.empty() ? "canvas in use" : "canvas in use: its layers go first";
+            return false;
+        }
+        Target &t = targets_[cv->second.canvas->target()];
+        cv->second.canvas->detach(true);
+        if (t.graph)
+            t.dirty = true;
+        canvases_.erase(cv);
+        return true;
+    }
+    auto fo = fonts_.find(id);
+    if (fo != fonts_.end() && fo->second.owner == owner) {
+        bool used = false;
+        auto uses = [&](const std::map<uint32_t, Entry> &m) {
+            for (const auto &kv : m)
+                used = used || kv.second.font == id;
+        };
+        uses(layers_);
+        for (const auto &ck : canvases_)
+            uses(ck.second.layers);
+        if (used) {
+            *err = "font in use";
+            return false;
+        }
+        fonts_.erase(fo);
+        return true;
+    }
+    auto it = assets_.find(id);
+    if (it == assets_.end() || it->second.owner != owner) {
+        *err = "no such asset";
+        return false;
+    }
+    if (sampled(id)) {
+        *err = "asset in use";
+        return false;
+    }
+    for (const auto &kv : fonts_)
+        if (kv.second.asset == id) {
+            *err = "asset in use: a font draws from it";
+            return false;
+        }
+    Target &t = targets_[it->second.asset->target()];
+    it->second.asset->detach(true);
+    if (t.graph)
+        t.dirty = true;
+    assets_.erase(it);
+    return true;
+}
+
+bool Compositor::bind(uint64_t owner, uint32_t layer, uint32_t part, const std::string &sampler, uint32_t asset,
+                      std::string *err)
+{
+    CanvasEntry *in = nullptr;
+    Entry *en = find(layer, &in);
+    auto a = assets_.find(asset);
+    auto cv = canvases_.find(asset);
+    if (!en || en->owner != owner) {
+        *err = "no such layer";
+        return false;
+    }
+    if ((a == assets_.end() || a->second.owner != owner) && (cv == canvases_.end() || cv->second.owner != owner)) {
+        *err = "no such asset";
+        return false;
+    }
+    if (in && cv != canvases_.end() && in == &cv->second) {
+        *err = "a canvas's layers do not sample the canvas itself";
+        return false;
+    }
+    /* Its passes go before the sampling canvas's, so what it samples is
+     * drawn in the same frame (Graph::canvas). */
+    if (in && cv != canvases_.end() && cv->first > in->canvas->id()) {
+        *err = "a layer in a canvas samples only canvases made before its own";
+        return false;
+    }
+    Entry &e = *en;
+    const std::string kind = e.layer->kind();
+    if (kind == "effect" && part) {
+        *err = "effect layers have no parts";
+        return false;
+    }
+    if (kind == "mesh" && !static_cast<MeshLayer *>(e.layer.get())->has_part(part)) {
+        *err = "no such part";
+        return false;
+    }
+    if (kind != "effect" && kind != "mesh") {
+        *err = "binds are for effect layers and mesh parts";
+        return false;
+    }
+    /* a cube map to a samplerCube, any other to a sampler2D, as the
+     * library compiled the effect */
+    const int fx = kind == "effect" ? e.effect : static_cast<MeshLayer *>(e.layer.get())->part_effect(part);
+    auto compiled = inputs_.find(fx);
+    if (compiled != inputs_.end()) {
+        auto type = compiled->second.find(sampler);
+        if (type == compiled->second.end() ||
+            (type->second.kind != EffectInput::Sampler2D && type->second.kind != EffectInput::SamplerCube &&
+             type->second.kind != EffectInput::Sampler)) {
+            *err = "the shader has no sampler " + sampler;
+            return false;
+        }
+        const bool cube = a != assets_.end() && a->second.asset->params().cube;
+        if (type->second.kind != EffectInput::Sampler && cube != (type->second.kind == EffectInput::SamplerCube)) {
+            *err = "the shader's " + sampler + (cube ? " is a sampler2D: a cube map is bound to a samplerCube"
+                                                     : " is a samplerCube: only a cube map is bound to it");
+            return false;
+        }
+    }
+    if ((a != assets_.end() ? a->second.asset->target() : cv->second.canvas->target()) != e.layer->target()) {
+        *err = "the asset is on another target";
+        return false;
+    }
+    const std::pair<uint32_t, std::string> key(part, sampler);
+    if (!e.binds.count(key) && e.binds.size() >= kMaxBinds) {
+        *err = "at most " + std::to_string(kMaxBinds) + " binds a layer";
+        return false;
+    }
+    Target &t = targets_[e.layer->target()];
+    const int d = e.layer->drawable(part);
+    const int buf = bound_buffer(asset);
+    if (in)
+        in->canvas->touch();
+    if (t.graph && d && buf) {
+        if (!t.graph->texture(d, sampler.c_str(), buf)) {
+            *err = "the shader has no sampler " + sampler;
+            return false;
+        }
+        t.dirty = true;
+    }
+    e.binds[key] = asset;
+    return true;
+}
+
+void Compositor::touch(Layer *l)
+{
+    Target &t = targets_[l->target()];
+    if (t.graph)
+        t.dirty = true;
+    CanvasEntry *in = nullptr;
+    if (find(l->id(), &in) && in) {
+        in->canvas->touch();
+        return;
+    }
+    auto it = layers_.find(l->id());
+    if (it != layers_.end())
+        mark(it->second, l->id(), t);
+}
+
+void Compositor::mark(Entry &e, uint32_t id, Target &t)
+{
+    if (e.touched)
+        return;
+    e.touched = true;
+    t.touched.push_back(id);
+}
+
+uint32_t Compositor::add_scene(uint64_t owner, int target, const SceneSource &src, bool contend, std::string *err)
+{
+    if (target < 0 || target >= (int)targets_.size()) {
+        *err = "unknown target";
+        return 0;
+    }
+    for (const auto &kv : scenes_)
+        if (kv.second.target == target) {
+            *err = "the target has a scene file already";
+            return 0;
+        }
+    const uint32_t id = next_id_++;
+    SceneEntry &s = scenes_[id];
+    s.owner = owner;
+    s.target = target;
+    s.src = src;
+    s.contend = contend;
+    return id;
+}
+
+bool Compositor::replace_scene(uint64_t owner, uint32_t id, const SceneSource &src, bool contend)
+{
+    auto it = scenes_.find(id);
+    if (it == scenes_.end() || it->second.owner != owner)
+        return false;
+    SceneEntry &s = it->second;
+    s.src = src;
+    s.contend = contend;
+    s.error.clear();
+    s.edits = SceneEdits();
+    s.serial++;
+    /* its hosts go with its edits; the display decides on its layers again */
+    s.hosts.clear();
+    s.layers_error.clear();
+    host_serial_++;
+    return true;
+}
+
+void Compositor::set_layers(uint32_t id, const SceneLayers &l)
+{
+    auto it = scenes_.find(id);
+    if (it == scenes_.end())
+        return;
+    it->second.layers = l;
+    if (!l.on)
+        it->second.hosts.clear();
+    host_serial_++;
+}
+
+static bool inside(const Rect &r, const TargetSpec &t)
+{
+    return r.w && r.h && r.x >= 0 && r.y >= 0 && (uint64_t)r.x + r.w <= t.width && (uint64_t)r.y + r.h <= t.height;
+}
+
+bool Compositor::host(uint64_t owner, uint32_t id, int hosted, const Host &h, std::string *err)
+{
+    auto it = scenes_.find(id);
+    if (it == scenes_.end() || it->second.owner != owner) {
+        *err = "no such scene";
+        return false;
+    }
+    SceneEntry &s = it->second;
+    const std::vector<TargetSpec> &specs = slots_->targets();
+    /* A refusal ends the scene's host of that target, if it had one: the
+     * clients forget a refused host too (PROTOCOL.md "host"). */
+    auto refuse = [&](const std::string &why) {
+        *err = why;
+        if (s.hosts.erase(hosted))
+            host_serial_++;
+        return false;
+    };
+    if (!s.layers.on)
+        return refuse("a scene hosts only with layers 1");
+    if (!s.layers_error.empty())
+        return refuse("the display draws no layers over this scene: " + s.layers_error);
+    if (!s.error.empty())
+        return refuse("the scene's file did not load: " + s.error);
+    if (hosted == s.target)
+        return refuse("a scene hosts other targets, not its own");
+    for (const auto &kv : scenes_)
+        if (kv.first != id && kv.second.error.empty() && kv.second.hosts.count(hosted))
+            return refuse("target " + specs[hosted].name + " is hosted by another scene");
+    if (!inside(h.rect, specs[s.target]))
+        return refuse("x, y, w, h must lie inside " + specs[s.target].name);
+    if (!inside(h.src, specs[hosted]))
+        return refuse("src_x, src_y, src_w, src_h must lie inside " + specs[hosted].name);
+    s.hosts[hosted] = h;
+    host_serial_++;
+    return true;
+}
+
+void Compositor::unhost(uint64_t owner, uint32_t id, int hosted)
+{
+    auto it = scenes_.find(id);
+    if (it != scenes_.end() && it->second.owner == owner && it->second.hosts.erase(hosted))
+        host_serial_++;
+}
+
+bool Compositor::host_layers(uint64_t owner, int into, int hosted, const Host &h, std::string *err)
+{
+    const std::vector<TargetSpec> &specs = slots_->targets();
+    /* A refusal ends owner's host of the target, whatever its into: the
+     * clients forget it too (PROTOCOL.md "Hosting from layers"). */
+    auto refuse = [&](const std::string &why) {
+        *err = why;
+        unhost_layers(owner, hosted);
+        return false;
+    };
+    if (hosted == into)
+        return refuse("a host shows other targets, not its own");
+    if (!inside(h.rect, specs[into]))
+        return refuse("x, y, w, h must lie inside " + specs[into].name);
+    if (!inside(h.src, specs[hosted]))
+        return refuse("src_x, src_y, src_w, src_h must lie inside " + specs[hosted].name);
+    /* smaller, the producer draws nothing: the picture would be nowhere */
+    if (h.rect.w < kHostMinW || h.rect.h < kHostMinH || h.src.w < kHostMinW || h.src.h < kHostMinH)
+        return refuse("a host from layers is at least " + std::to_string(kHostMinW) + "x" + std::to_string(kHostMinH) +
+                      " (w, h and src_w, src_h)");
+    /* Sent again (also into another target): the same host; the next
+     * arrange() decides on it. */
+    LayerHost &l = layer_hosts_[std::make_pair(hosted, owner)];
+    if (!l.seq)
+        l.seq = ++layer_host_seq_;
+    l.owner = owner;
+    l.into = into;
+    l.host = h;
+    host_serial_++;
+    return true;
+}
+
+void Compositor::unhost_layers(uint64_t owner, int hosted)
+{
+    if (layer_hosts_.erase(std::make_pair(hosted, owner)))
+        host_serial_++;
+}
+
+bool Compositor::drawable(uint32_t id, const SceneEntry &s) const
+{
+    const Target &t = targets_[s.target];
+    return s.error.empty() && t.file && t.graph && t.file_of == id && t.file_serial == s.serial;
+}
+
+static bool overlaps(const Rect &a, const Rect &b)
+{
+    return (int64_t)a.x < (int64_t)b.x + b.w && (int64_t)b.x < (int64_t)a.x + a.w && (int64_t)a.y < (int64_t)b.y + b.h &&
+           (int64_t)b.y < (int64_t)a.y + a.h;
+}
+
+/* Something of l can be seen: a video or image not at opacity 0 (an effect
+ * or mesh draws what its shader does: taken as seen). */
+static bool seen(const Layer &l)
+{
+    const std::string kind = l.kind();
+    return (kind != "video" && kind != "image") || l.params.opacity > 0;
+}
+
+static bool listed(const std::vector<uint32_t> &v, uint32_t id)
+{
+    return std::find(v.begin(), v.end(), id) != v.end();
+}
+
+bool Compositor::seen_over(const Arrangement &a, size_t p, const Rect &r) const
+{
+    const Layer &l = *layers_.at(a.order[p]).layer;
+    return listed(a.drawn, a.order[p]) && seen(l) && overlaps(l.params.rect, r);
+}
+
+void Compositor::host_eligibility(LayerHost &lh) const
+{
+    const std::string &into = slots_->targets()[lh.into].name;
+    const Target &t = targets_[lh.into];
+    const TargetState st = slots_->status(lh.into).state;
+    lh.eligible = lh.over = false;
+    lh.wait.clear();
+    if (!lh.host.shown) {
+        lh.wait = "it shows the target nowhere (shown 0)";
+        return;
+    }
+    if (layers_wait(lh.into)) {
+        lh.wait = into + "'s layers wait for a scene file there";
+        return;
+    }
+    if (!t.graph || !(st == TargetState::Shown || st == TargetState::Lingering || slots_->kept(lh.into))) {
+        lh.wait = into + " is not on screen (" + target_state_name(st) + ")";
+        return;
+    }
+    /* The client's layers drawn and seen over the rect, from its topmost
+     * exclusive layer up (nothing of it below that is drawn once it is):
+     * the lowest is the anchor, the topmost decides who wins. */
+    const Arrangement &a = t.arr;
+    size_t from = 0;
+    for (size_t p = 0; p < a.order.size(); p++) {
+        const Entry &e = layers_.at(a.order[p]);
+        if (e.owner == lh.owner && e.layer->params.exclusive &&
+            (listed(a.drawn, a.order[p]) || listed(a.suspended, a.order[p])))
+            from = p;
+    }
+    for (size_t p = from; p < a.order.size(); p++) {
+        const Entry &e = layers_.at(a.order[p]);
+        if (e.owner != lh.owner || !seen_over(a, p, lh.host.rect))
+            continue;
+        if (!lh.eligible) {
+            lh.eligible = true;
+            lh.anchor = a.order[p];
+            lh.over = e.layer->params.exclusive;
+        }
+        lh.top_pos = p;
+    }
+    if (!lh.eligible)
+        lh.wait = "no layer of the client is drawn over its rect on " + into;
+}
+
+std::map<int, const Compositor::LayerHost *> Compositor::host_winners(const std::vector<bool> &by_scene) const
+{
+    /* On one into, the host whose client draws highest over its rect. Of
+     * several intos, the one holding the target (held_into_: the last live
+     * host's, also after it ended) keeps it while it has an eligible host;
+     * else the one whose host was sent first (sent again after unhost, a
+     * host is sent later). */
+    std::map<std::pair<int, int>, const LayerHost *> best;   /* by (target, into) */
+    for (const auto &kv : layer_hosts_) {
+        const LayerHost &lh = kv.second;
+        if (!lh.eligible || by_scene[kv.first.first])
+            continue;
+        const LayerHost *&b = best[std::make_pair(kv.first.first, lh.into)];
+        if (!b || lh.top_pos > b->top_pos)
+            b = &lh;
+    }
+    std::map<int, const LayerHost *> win;
+    for (const auto &kv : best) {
+        const int target = kv.first.first;
+        auto h = held_into_.find(target);
+        auto keep = h == held_into_.end() ? best.end() : best.find(std::make_pair(target, h->second));
+        if (keep != best.end()) {
+            win[target] = keep->second;
+            continue;
+        }
+        const LayerHost *&w = win[target];
+        if (!w || kv.second->seq < w->seq)
+            w = kv.second;
+    }
+    return win;
+}
+
+void Compositor::host_decided(int target, LayerHost &lh, const LayerHost *winner, bool by_scene)
+{
+    const std::string &name = slots_->targets()[target].name;
+    const bool live = winner == &lh;
+    uint64_t by = 0;
+    std::string why = lh.wait;
+    if (lh.eligible && by_scene) {
+        why = "target " + name + " is hosted by a scene";
+    } else if (lh.eligible && !live) {
+        by = winner->owner;
+        why = winner->into == lh.into ? "target " + name + " is hosted by another client's layers, drawn higher over it"
+                                      : "target " + name + " is hosted by another client's layers on " +
+                                            slots_->targets()[winner->into].name + ", there first";
+    }
+    if (live != lh.live || why != lh.why || by != lh.by) {
+        host_serial_++;
+        log_info("compositor: host of %s from client %llu's layers on %s: %s", name.c_str(),
+                 (unsigned long long)lh.owner, slots_->targets()[lh.into].name.c_str(), live ? "live" : why.c_str());
+    }
+    lh.live = live;
+    lh.why = why;
+    lh.by = by;
+}
+
+void Compositor::host_restack(int target, const LayerHost &lh)
+{
+    std::vector<StackItem> &items = items_[lh.into];
+    /* as made by now: an earlier restack into the same target moved layers */
+    const Arrangement &a = targets_[lh.into].arr;
+    size_t at = std::find(a.order.begin(), a.order.end(), lh.anchor) - a.order.begin();
+    if (at == a.order.size())
+        return;
+    /* By the anchor, but never under a layer the hosts it won over drew
+     * over the rect (seen, over their own rect too): no competing host's
+     * layers hide the picture. Any other client keeps its place. */
+    bool over = lh.over;
+    for (const auto &kv : layer_hosts_) {
+        const LayerHost &o = kv.second;
+        if (kv.first.first != target || o.owner == lh.owner || o.into != lh.into || !o.eligible)
+            continue;
+        for (size_t p = at + 1; p < a.order.size(); p++) {
+            const Entry &e = layers_.at(a.order[p]);
+            if (e.owner == o.owner && seen_over(a, p, o.host.rect) && seen_over(a, p, lh.host.rect)) {
+                at = p;
+                over = true;
+            }
+        }
+    }
+    auto anchor = std::find_if(items.begin(), items.end(), [&](const StackItem &it) { return it.id == a.order[at]; });
+    if (anchor == items.end())
+        return;
+    const StackItem key = *anchor;
+    bool moved = false;
+    for (StackItem &it : items) {
+        const Entry &e = layers_.at(it.id);
+        if (e.owner == lh.owner || std::strcmp(e.layer->kind(), "video") ||
+            e.layer->params.hosted != slots_->targets()[target].name)
+            continue;
+        it.klass = key.klass;
+        it.z = key.z;
+        it.seq = key.seq;
+        it.under = over ? -1 : 1;
+        moved = true;
+    }
+    if (moved)
+        targets_[lh.into].arr = crs::arrange(items);
+}
+
+void Compositor::arrange_layer_hosts()
+{
+    const std::vector<TargetSpec> &specs = slots_->targets();
+    /* A target a scene hosts (the clients are told so): the scene's. */
+    std::vector<bool> by_scene(specs.size(), false);
+    for (const auto &kv : scenes_)
+        if (drawable(kv.first, kv.second))
+            for (const auto &h : kv.second.hosts)
+                by_scene[h.first] = true;
+    for (auto &kv : layer_hosts_)
+        host_eligibility(kv.second);
+    const std::map<int, const LayerHost *> win = host_winners(by_scene);
+    /* The into that holds each target: the live host's, kept when that host
+     * ends, until no host on it is eligible. */
+    held_into_.clear();
+    for (const auto &kv : win)
+        held_into_[kv.first] = kv.second->into;
+    for (auto &kv : layer_hosts_) {
+        auto w = win.find(kv.first.first);
+        host_decided(kv.first.first, kv.second, w == win.end() ? nullptr : w->second, by_scene[kv.first.first]);
+    }
+    for (const auto &kv : win)
+        host_restack(kv.first, *kv.second);
+}
+
+const Compositor::LayerHost *Compositor::layer_host_of(int ti, const Entry &e) const
+{
+    if (std::strcmp(e.layer->kind(), "video") || e.layer->params.hosted.empty())
+        return nullptr;
+    const int hosted = slots_->index(e.layer->params.hosted);
+    for (const auto &kv : layer_hosts_) {
+        const LayerHost &lh = kv.second;
+        if (kv.first.first == hosted && lh.live && lh.into == ti && lh.owner != e.owner)
+            return &lh;
+    }
+    return nullptr;
+}
+
+std::vector<Compositor::Hosted> Compositor::hosts() const
+{
+    std::vector<Hosted> out;
+    for (const auto &kv : scenes_) {
+        const SceneEntry &s = kv.second;
+        if (s.hosts.empty() || !drawable(kv.first, s))
+            continue;
+        for (const auto &h : s.hosts) {
+            Hosted x;
+            x.target = h.first;
+            x.into = s.target;
+            x.host = h.second;
+            out.push_back(x);
+        }
+    }
+    for (const auto &kv : layer_hosts_) {
+        if (!kv.second.live)
+            continue;
+        Hosted x;
+        x.target = kv.first.first;
+        x.into = kv.second.into;
+        x.host = kv.second.host;
+        out.push_back(x);
+    }
+    return out;
+}
+
+SceneEdits *Compositor::edits(uint64_t owner, uint32_t id)
+{
+    auto it = scenes_.find(id);
+    return it == scenes_.end() || it->second.owner != owner ? nullptr : &it->second.edits;
+}
+
+std::string Compositor::scene_text(uint32_t id) const
+{
+    auto it = scenes_.find(id);
+    if (it == scenes_.end())
+        return std::string();
+    const SceneEntry &s = it->second;
+    std::string text = "on " + slots_->targets()[s.target].name + ": " + s.src.file + " and " +
+                       std::to_string(s.src.res.size()) + " resource files, " + std::to_string(s.src.bytes / 1024) +
+                       " KB; " + std::to_string(s.edits.kept()) + " edit lines kept";
+    if (s.layers.on)
+        text += "; layers over it" + (s.layers.order_set ? " from render order " + std::to_string(s.layers.order) : "") +
+                (s.layers.over_set ? ", overlay and alert from " + std::to_string(s.layers.over) : "");
+    for (const auto &kv : s.hosts) {
+        const Host &h = kv.second;
+        char b[160];
+        std::snprintf(b, sizeof b, "; hosts %s at %ux%u+%d+%d from %ux%u+%d+%d%s",
+                      slots_->targets()[kv.first].name.c_str(), h.rect.w, h.rect.h, h.rect.x, h.rect.y, h.src.w,
+                      h.src.h, h.src.x, h.src.y, h.shown ? "" : ", not shown");
+        text += b;
+        if (h.edge.on()) {
+            std::snprintf(b, sizeof b, ", its edge %u up and %u down (fade %u, dim %u, blur %u)%s", h.edge.top,
+                          h.edge.bottom, h.edge.fade, h.edge.dim, h.edge.blur,
+                          edge_tried_ && !edge_fx_[0] ? ", not drawn here" : "");
+            text += b;
+        }
+    }
+    return text;
+}
+
+uint32_t Compositor::content(int target) const
+{
+    for (const auto &kv : scenes_)
+        if (kv.second.target == target && kv.second.error.empty())
+            return kv.first;
+    return 0;
+}
+
+bool Compositor::layers_wait(int target) const
+{
+    const uint32_t sc = content(target);
+    if (!sc)
+        return false;
+    const Target &t = targets_[target];
+    return !scenes_.at(sc).layers.on || (t.file && !t.graph);
+}
+
+bool Compositor::stale(const TargetSpec &spec) const
+{
+    const int ti = slots_->index(spec.name);
+    const Target &t = targets_[ti];
+    return (t.graph || t.file) && content(ti) != (t.file ? t.file_of : 0);
+}
+
+bool Compositor::outdated(const TargetSpec &spec) const
+{
+    const Target &t = targets_[slots_->index(spec.name)];
+    auto s = scenes_.find(t.file_of);
+    return t.file && s != scenes_.end() && s->second.serial != t.file_serial;
+}
+
+Layer *Compositor::layer(uint64_t owner, uint32_t id)
+{
+    Entry *e = find(id);
+    return !e || e->owner != owner ? nullptr : e->layer.get();
+}
+
+uint64_t Compositor::owner_of(uint32_t id) const
+{
+    auto s = scenes_.find(id);
+    if (s != scenes_.end())
+        return s->second.owner;
+    const Entry *e = find(id);
+    return e ? e->owner : 0;
+}
+
+void Compositor::changed(Layer *l)
+{
+    Target &t = targets_[l->target()];
+    CanvasEntry *in = nullptr;
+    if (find(l->id(), &in) && in) {
+        l->place();
+        in->canvas->touch();
+        if (t.graph)
+            t.dirty = true;
+        return;
+    }
+    auto it = layers_.find(l->id());
+    /* A held layer takes the change when it is released (commit). */
+    if (it == layers_.end() || !it->second.held) {
+        l->place();
+        if (t.graph)
+            t.dirty = true;
+    }
+    if (it != layers_.end())
+        mark(it->second, l->id(), t);
+    if (std::string(l->kind()) == "video")
+        reconcile();
+}
+
+void Compositor::remove(uint64_t owner, uint32_t id)
+{
+    /* A scene content: its scene is stale now (the slot manager). */
+    auto s = scenes_.find(id);
+    if (s != scenes_.end()) {
+        if (s->second.owner == owner) {
+            scenes_.erase(s);
+            host_serial_++;
+        }
+        return;
+    }
+    for (auto &ck : canvases_) {
+        auto in = ck.second.layers.find(id);
+        if (in == ck.second.layers.end())
+            continue;
+        if (in->second.owner != owner)
+            return;
+        Target &t = targets_[in->second.layer->target()];
+        in->second.layer->detach(true);
+        if (t.graph)
+            t.dirty = true;
+        drop_effects(in->second);
+        ck.second.layers.erase(in);
+        ck.second.canvas->touch();
+        return;
+    }
+    auto it = layers_.find(id);
+    if (it == layers_.end() || it->second.owner != owner)
+        return;
+    const int ti = it->second.layer->target();
+    Target &t = targets_[ti];
+    const bool video = std::string(it->second.layer->kind()) == "video";
+    if (it->second.composited && t.composite)
+        t.composite->remove(id);
+    if (it->second.held)
+        t.held_n--;
+    if (it->second.flushed.drawn && it->second.flushed.exclusive)
+        t.exclusive_gone = true;
+    it->second.layer->detach(true);
+    if (t.graph)
+        t.dirty = true;
+    drop_effects(it->second);
+    layers_.erase(it);
+    if (video)
+        reconcile();
+}
+
+void Compositor::remove_owner(uint64_t owner)
+{
+    /* Layers first, those in canvases before the stack's: then no layer
+     * samples the assets and canvases. */
+    std::vector<uint32_t> ids;
+    for (const auto &ck : canvases_)
+        for (const auto &kv : ck.second.layers)
+            if (kv.second.owner == owner)
+                ids.push_back(kv.first);
+    for (const auto &kv : layers_)
+        if (kv.second.owner == owner)
+            ids.push_back(kv.first);
+    for (uint32_t id : ids)
+        remove(owner, id);
+    ids.clear();
+    for (const auto &kv : fonts_)
+        if (kv.second.owner == owner)
+            ids.push_back(kv.first);
+    for (const auto &kv : assets_)
+        if (kv.second.owner == owner)
+            ids.push_back(kv.first);
+    for (const auto &kv : canvases_)
+        if (kv.second.owner == owner)
+            ids.push_back(kv.first);
+    for (const auto &kv : values_)
+        if (kv.second.owner == owner)
+            ids.push_back(kv.first);
+    std::string err;
+    for (uint32_t id : ids)
+        remove_asset(owner, id, &err);
+    for (auto it = scenes_.begin(); it != scenes_.end();) {
+        if (it->second.owner != owner) {
+            ++it;
+            continue;
+        }
+        it = scenes_.erase(it);
+        host_serial_++;
+    }
+    for (auto it = layer_hosts_.begin(); it != layer_hosts_.end();) {
+        if (it->second.owner != owner) {
+            ++it;
+            continue;
+        }
+        it = layer_hosts_.erase(it);
+        host_serial_++;
+    }
+}
+
+void Compositor::arrange(int64_t now_ms)
+{
+    now_ms_ = now_ms;
+    for (const Target &t : targets_)
+        if ((t.remake_ms >= 0 && now_ms >= t.remake_ms) || (t.hold_ms >= 0 && now_ms >= t.hold_ms)) {
+            reconcile();
+            break;
+        }
+    items_.resize(targets_.size());
+    for (size_t ti = 0; ti < targets_.size(); ti++) {
+        Target &t = targets_[ti];
+        std::vector<StackItem> &items = items_[ti];
+        items.clear();
+        for (const auto &kv : layers_) {
+            const Entry &e = kv.second;
+            const Layer &l = *e.layer;
+            if (l.target() != (int)ti)
+                continue;
+            StackItem it;
+            it.id = kv.first;
+            it.klass = l.params.klass;
+            it.z = l.params.z;
+            it.seq = l.seq();
+            it.visible = l.params.visible && e.error.empty() && l.refusal().empty() && !asset_refused(e);
+            it.ready = l.ready(now_ms) && assets_have(e);
+            it.exclusive = l.params.exclusive;
+            it.prewarm = l.params.prewarm;
+            it.preload = l.params.preload;
+            it.contend = l.params.contend;
+            it.guide_hold = l.params.guide_hold;
+            it.yield = l.params.yield;
+            it.shown = l.on_display();
+            items.push_back(it);
+        }
+        t.arr = crs::arrange(items);
+    }
+    if (!layer_hosts_.empty())
+        arrange_layer_hosts();
+    else
+        held_into_.clear();
+    for (size_t ti = 0; ti < targets_.size(); ti++) {
+        Target &t = targets_[ti];
+        if (const uint32_t sc = content((int)ti)) {
+            /* The target's scene is the content's file: it wants the
+             * target, and every layer waits (state()) unless they are
+             * drawn over the file. */
+            if (layers_wait((int)ti))
+                t.arr.drawn.clear();
+            t.arr.wanted = true;
+            t.arr.contend = t.arr.contend || scenes_[sc].contend;
+        }
+        fade((int)ti, t, now_ms);
+        slots_->want((int)ti, t.arr.wanted, t.arr.contend, t.arr.guide_hold, t.arr.yield, t.arr.preload);
+        if (!t.graph)
+            continue;
+        const bool cv = t.composite && t.composite->attached();
+        t.videos = 0;
+        t.lowest = INT32_MAX;
+        t.top = INT32_MIN;
+        for (size_t pos = 0; pos < t.arr.order.size(); pos++) {
+            Entry &e = layers_[t.arr.order[pos]];
+            if (!e.composited && !e.layer->attached())
+                continue;
+            const bool drawn =
+                std::find(t.arr.drawn.begin(), t.arr.drawn.end(), t.arr.order[pos]) != t.arr.drawn.end() &&
+                assets_clean(e);
+            const int32_t order = draw_order(t.over, *e.layer, pos);
+            /* A composite not attached draws none of its sources. */
+            if (e.composited ? cv : !std::strcmp(e.layer->kind(), "video")) {
+                t.videos++;
+                t.lowest = std::min(t.lowest, order);
+            }
+            if (drawn && (!e.composited || cv))
+                t.top = std::max(t.top, order);
+            if (e.composited) {
+                if (t.composite)
+                    t.composite->arrange_source(t.arr.order[pos], drawn, order);
+                e.drawn = drawn;
+                e.order = order;
+                continue;
+            }
+            if (e.held) {
+                e.drawn = drawn;   /* the scene keeps the last flush's until it is released (commit) */
+                e.order = order;
+                continue;
+            }
+            if (drawn != e.drawn || order != e.order) {
+                e.layer->arrange(drawn, order);
+                e.drawn = drawn;
+                e.order = order;
+                t.dirty = true;
+                mark(e, t.arr.order[pos], t);
+            }
+            if (!std::strcmp(e.layer->kind(), "video")) {
+                VideoEdge ed = edge_for((int)ti, e);
+                if (ed.on() && !edge_effects())
+                    ed = VideoEdge();
+                if (static_cast<VideoLayer *>(e.layer.get())->set_edge(ed, edge_fx_[0], edge_fx_[1])) {
+                    t.dirty = true;
+                    mark(e, t.arr.order[pos], t);
+                }
+            }
+        }
+        if (t.composite && t.composite->arranged())
+            t.dirty = true;
+    }
+    cap_videos(now_ms);
+}
+
+uint32_t Compositor::fps_cap(uint64_t owner, const FpsRequest **by) const
+{
+    const FpsRequest *low = nullptr;
+    for (const FpsRequest &r : fps_requests_)
+        if (r.owner != owner && (!low || r.fps < low->fps))
+            low = &r;
+    if (by)
+        *by = low;
+    return low ? low->fps : 0;
+}
+
+void Compositor::cap_videos(int64_t now_ms)
+{
+    fps_requests_.clear();
+    for (const auto &kv : layers_) {
+        const Layer &l = *kv.second.layer;
+        if (!l.params.others_fps)
+            continue;
+        std::string reason;
+        if (state(kv.first, &reason) == LayerState::Shown)
+            fps_requests_.push_back(FpsRequest{kv.second.owner, kv.first,
+                                               l.params.others_fps < kOthersFpsFloor ? kOthersFpsFloor
+                                                                                     : l.params.others_fps});
+    }
+    if (fps_requests_.empty() && !capped_)
+        return;
+    /* the last tick of a hold puts every clock back */
+    capped_ = !fps_requests_.empty();
+    for (size_t ti = 0; ti < targets_.size(); ti++) {
+        /* a composite: the highest cap of its sources' clients, none when
+         * one of them is not held */
+        uint32_t composite_cap = 0;
+        bool sources = false, unheld = false;
+        for (auto &kv : layers_) {
+            Entry &e = kv.second;
+            if (e.layer->target() != (int)ti || std::strcmp(e.layer->kind(), "video"))
+                continue;
+            const uint32_t cap = fps_cap(e.owner);
+            /* a composite's source too, so it draws itself at its client's
+             * rate when the composite goes */
+            static_cast<VideoLayer *>(e.layer.get())->cap_fps(cap, now_ms);
+            if (e.composited) {
+                sources = true;
+                unheld = unheld || !cap;
+                composite_cap = std::max(composite_cap, cap);
+            }
+        }
+        if (targets_[ti].composite)
+            targets_[ti].composite->cap_fps(sources && !unheld ? composite_cap : 0, now_ms);
+    }
+}
+
+VideoEdge Compositor::edge_for(int ti, const Entry &e) const
+{
+    const Rect &r = e.layer->params.rect;
+    const int64_t x0 = r.x, y0 = r.y, x1 = x0 + r.w, y1 = y0 + r.h, th = slots_->targets()[ti].height;
+    /* held within the target, a fade at most half the video's height */
+    auto clamped = [&](VideoEdge v) {
+        v.top = (uint32_t)std::min<int64_t>(v.top, y0);
+        v.bottom = (uint32_t)std::min<int64_t>(v.bottom, std::max<int64_t>(0, th - y1));
+        v.fade = std::min(v.fade, r.h / 2);
+        return v;
+    };
+    for (const auto &kv : scenes_) {
+        const SceneEntry &s = kv.second;
+        if (s.target != ti || s.owner == e.owner || !s.error.empty())
+            continue;
+        for (const auto &hk : s.hosts) {
+            const Host &h = hk.second;
+            if (!h.shown || !h.edge.on() || x0 < h.rect.x || y0 < h.rect.y || x1 > (int64_t)h.rect.x + h.rect.w ||
+                y1 > (int64_t)h.rect.y + h.rect.h)
+                continue;
+            return clamped(h.edge);
+        }
+    }
+    const LayerHost *lh = layer_hosts_.empty() ? nullptr : layer_host_of(ti, e);
+    return lh && lh->host.edge.on() ? clamped(lh->host.edge) : VideoEdge();
+}
+
+void Compositor::fade(int ti, Target &t, int64_t now_ms)
+{
+    const int64_t dt = std::max<int64_t>(0, now_ms - t.fade_ms);
+    t.fade_ms = now_ms;
+    const TargetState st = slots_->status(ti).state;
+    /* A scene kept through a lock shows its last flush when it is back. */
+    const bool on_screen = t.graph && (st == TargetState::Shown || st == TargetState::Lingering || slots_->kept(ti));
+    const float step = fade_ms_ > 0 ? (float)dt / (float)fade_ms_ : 1.0f;
+    t.fading_out = false;
+    if (fade_ms_ <= 0) {
+        t.fade = 1.0f;
+    } else if (!on_screen) {
+        t.fade = 0.0f;   /* nothing of it is on screen, or the display took it: no fade */
+    } else if (t.arr.wanted) {
+        t.fade = std::min(1.0f, t.fade + step);
+    } else {
+        /* Nothing wants the target: the layers drawn when something last
+         * did stay drawn, and the target wanted, while they fade out. */
+        std::vector<uint32_t> held;
+        bool fades = false;
+        for (uint32_t id : t.last_drawn) {
+            auto it = layers_.find(id);
+            if (it == layers_.end() || !on_scene(it->second) || it->second.layer->target() != ti)
+                continue;
+            held.push_back(id);
+            fades = fades || it->second.layer->fades();
+        }
+        t.fade = fades ? std::max(0.0f, t.fade - step) : 0.0f;
+        if (t.fade > 0.0f) {
+            t.fading_out = true;
+            t.arr.drawn = held;
+            t.arr.wanted = true;
+            t.arr.contend = t.last_contend;
+            t.arr.guide_hold = t.last_guide_hold;
+            t.arr.yield = t.last_yield;
+        }
+    }
+    if (t.arr.wanted && !t.fading_out) {
+        t.last_drawn = t.arr.drawn;
+        t.last_contend = t.arr.contend;
+        t.last_guide_hold = t.arr.guide_hold;
+        t.last_yield = t.arr.yield;
+    }
+    /* The layers get it by steps, each in the target's next flush; 0 and 1
+     * go at once. */
+    if (t.fade != t.applied &&
+        (t.fade == 0.0f || t.fade == 1.0f || now_ms - t.applied_ms >= kFadeStepMs)) {
+        t.applied = t.fade;
+        t.applied_ms = now_ms;
+    }
+    /* A fade step held to keep tiles covered reaches the layers when it is
+     * released (commit). */
+    if (t.fade_held)
+        return;
+    for (auto &kv : layers_) {
+        Layer &l = *kv.second.layer;
+        if (l.target() != ti || l.fade() == t.applied)
+            continue;
+        l.set_fade(t.applied);
+        if (l.attached() && l.fades())
+            t.dirty = true;
+    }
+    if (t.composite && t.composite->fade() != t.applied) {
+        t.composite->set_fade(t.applied);
+        if (t.composite->attached())
+            t.dirty = true;
+    }
+}
+
+void Compositor::render(int64_t now_ms)
+{
+    now_ms_ = now_ms;
+    /* The HUD's share of the budget, while a target that writes from it is
+     * asked for and has a layer: up to kSharePct of each refill, what it does
+     * not spend going back at once. */
+    bool sharing = false;
+    for (const auto &kv : layers_) {
+        const int ti = kv.second.layer->target();
+        sharing = sharing || (slots_->targets()[ti].share && (slots_->requested(ti) || slots_->loaded(ti)));
+    }
+    pacer_.set_share(sharing ? kSharePct : 0);
+    /* Released, or kept through a lock: nothing of a target is asked for,
+     * and a kept scene keeps its last flush. Loaded (preload): its scene is
+     * fetched, not mapped, and stages as a shown one's. Parked or being mapped again
+     * after a lock: nothing of it is on screen, and the link carries the
+     * HMI's content too. It stages again once shown. Each target staging is told what covers its videos; one
+     * with held tiles to uncover, or an alert waiting for its first write,
+     * goes first, so that its write takes the next allowance before other
+     * targets' writes. */
+    render_order_.clear();
+    render_later_.clear();
+    for (size_t ti = 0; ti < targets_.size(); ti++) {
+        Target &t = targets_[ti];
+        /* Flushing again (shown after a park or a lock's re-map): a canvas
+         * drawn once is drawn again, as the display may have dropped its
+         * buffers while the scene was not mapped. */
+        const bool flushing = slots_->flushing((int)ti);
+        if (flushing && !t.flushing)
+            for (auto &ck : canvases_)
+                if (ck.second.canvas->target() == (int)ti)
+                    ck.second.canvas->touch();
+        t.flushing = flushing;
+        if ((!t.graph && !t.file) || !flushing)
+            continue;
+        t.uncover = false;
+        if (t.file && !t.graph) {
+            /* A scene file without layers over it: nothing to uncover. */
+            t.uncover_since = t.alert_since = -1;
+            render_later_.push_back((int)ti);
+            continue;
+        }
+        if (occluding(t)) {
+            occlude((int)ti, t);
+            t.uncover = uncovers(t);
+            t.quiet = t.quiet && !t.uncover && !t.held_n && !t.fade_held;
+        }
+        /* Since when its uncover has waited: kept while what the client set
+         * still uncovers tiles (its changes held back), until the write that
+         * carries them goes (render_target). */
+        if (!t.uncover)
+            t.uncover_since = -1;
+        else if (t.uncover_since < 0)
+            t.uncover_since = now_ms;
+        const bool alert = alert_waits((int)ti);
+        if (!alert)
+            t.alert_since = -1;
+        else if (t.alert_since < 0)
+            t.alert_since = now_ms;
+        (t.uncover || alert ? render_order_ : render_later_).push_back((int)ti);
+    }
+    /* The target that has waited longest first: none waits behind another's
+     * uncover or alert more than once. */
+    auto since = [this](int ti) {
+        const Target &t = targets_[ti];
+        return t.uncover_since < 0 ? t.alert_since
+               : t.alert_since < 0 ? t.uncover_since
+                                   : std::min(t.uncover_since, t.alert_since);
+    };
+    std::stable_sort(render_order_.begin(), render_order_.end(),
+                     [&since](int a, int b) { return since(a) < since(b); });
+    render_order_.insert(render_order_.end(), render_later_.begin(), render_later_.end());
+    refill_keys(now_ms);
+    for (int ti : render_order_) {
+        if (targets_[ti].file && !targets_[ti].graph)
+            render_file(ti, targets_[ti], now_ms);
+        else
+            render_target(ti, targets_[ti], now_ms);
+    }
+    /* Video objects waiting for another target's flush to drop buffers. */
+    for (const Target &t : targets_)
+        if (t.make_waiting) {
+            reconcile();
+            break;
+        }
+    if (governor_.tick(now_ms))
+        pace_writes(now_ms);
+}
+
+void Compositor::pace_writes(int64_t now_ms)
+{
+    /* the allowance brought up to now at the rate it had, then the new one */
+    pacer_.ready(now_ms);
+    pacer_.set_rate(keys_waiting_ ? writes_rate(governor_.cap()) : governor_.cap());
+}
+
+void Compositor::refill_keys(int64_t now_ms)
+{
+    if (targets_.empty())
+        return;
+    /* The buckets fill only over the time the writes ran at the cap less the
+     * keys' share (keys_waiting_ since the last refill): the two together
+     * never take more than the cap (compositor.h). */
+    const int64_t rate = int64_t(governor_.cap() / kKeyShare / targets_.size()), held = rate * kKeyHeldMs / 1000;
+    const int64_t gap = keys_refilled_ms_ < 0 ? 0 : std::min<int64_t>(now_ms - keys_refilled_ms_, 1000);
+    keys_refilled_ms_ = now_ms;
+    if (keys_waiting_ && gap > 0)
+        for (Target &t : targets_)
+            t.key_tokens = std::min(held, t.key_tokens + rate * gap / 1000);
+    /* Waiting only where a flush can make them: a target that is not
+     * flushing (parked, or its scene not shown) holds no other's writes. */
+    bool waiting = false;
+    for (int ti : render_order_)
+        waiting = waiting || (targets_[ti].graph && targets_[ti].graph->animations_due());
+    if (waiting != keys_waiting_) {
+        keys_waiting_ = waiting;
+        pace_writes(now_ms);
+    }
+}
+
+void Compositor::render_target(int ti, Target &t, int64_t now_ms)
+{
+    /* Held tiles a change uncovers go in the flush that carries the change.
+     * While the budget does not allow that write, the change waits (the
+     * scene keeps what the last flush showed for it) and everything else
+     * on the target goes as usual. */
+    bool uncover = t.uncover;
+    if (uncover && !pacer_for(ti).ready(now_ms))
+        uncover = !defer_uncover(ti, t);
+    commit(ti, t);
+    /* A layer whose failed write left its buffer half written holds the
+     * target: only its whole rewrite stages, and nothing flushes until
+     * that goes, so the cluster keeps showing the last frame. */
+    const bool hold = holds(t);
+    t.held_back = false;
+    std::vector<Layer *> staged;
+    std::vector<Asset *> staged_assets;
+    bool wrote = false, failed = false;
+    /* Assets first: the layers sampling them are drawn from them. A
+     * held target writes none: no flush would carry them. */
+    for (auto &kv : assets_) {
+        Asset &a = *kv.second.asset;
+        if (hold || a.target() != ti || !a.attached())
+            continue;
+        const int had = a.buffer();
+        const Stage s = a.stage(now_ms);
+        if (a.buffer() != had)   /* an immutable asset's texture, made now */
+            rebind(a.id());
+        if (s == Stage::Idle)
+            continue;
+        staged_assets.push_back(&a);
+        wrote = wrote || s == Stage::Wrote;
+        failed = failed || s == Stage::Failed;
+    }
+    /* Canvases and their layers, before the layers that sample them. A
+     * canvas drawn once draws again when one of its layers changed, or
+     * samples an asset written now or a canvas drawn now; a canvas samples
+     * only canvases made before it (bind()), which come first. */
+    std::vector<Canvas *> staged_canvases;
+    if (!hold) {
+        arrange_canvases(ti);
+        enable_canvases(ti, t);
+        std::set<uint32_t> changed;
+        for (const Asset *a : staged_assets)
+            changed.insert(a->id());
+        for (auto &ck : canvases_) {
+            Canvas &cv = *ck.second.canvas;
+            if (cv.target() != ti || !cv.attached())
+                continue;
+            for (auto &kv : ck.second.layers) {
+                Layer *l = kv.second.layer.get();
+                if (!l->attached())
+                    continue;
+                for (const auto &b : kv.second.binds)
+                    if (changed.count(b.second))
+                        cv.touch();
+                const Stage s = l->stage(now_ms);
+                if (s == Stage::Idle)
+                    continue;
+                cv.touch();
+                staged.push_back(l);
+                wrote = wrote || s == Stage::Wrote;
+                failed = failed || s == Stage::Failed;
+            }
+            if (cv.due())
+                changed.insert(ck.first);
+        }
+        for (auto &ck : canvases_) {
+            Canvas &cv = *ck.second.canvas;
+            if (cv.target() != ti)
+                continue;
+            const Stage s = cv.stage();
+            if (s == Stage::Idle)
+                continue;
+            staged_canvases.push_back(&cv);
+            wrote = wrote || s == Stage::Wrote;
+            failed = failed || s == Stage::Failed;
+        }
+    }
+    bool composite = false;
+    for (size_t pos = t.arr.order.size(); pos-- > 0;) {
+        auto it = layers_.find(t.arr.order[pos]);
+        if (it == layers_.end())
+            continue;
+        /* The composite stages at its top source's place: its sources'
+         * new frames composed first. */
+        Layer *l = it->second.layer.get();
+        if (it->second.composited) {
+            if (composite || !t.composite || !t.composite->attached())
+                continue;
+            composite = true;
+            t.composite->compose(now_ms);
+            l = t.composite.get();
+        } else if (!l->attached()) {
+            continue;
+        }
+        if (hold && !l->holds_flush() && !l->uncovering())
+            continue;
+        const uint64_t holds = l->write_stats().holds;
+        const Stage s = l->stage(now_ms);
+        t.held_back = t.held_back || l->write_stats().holds != holds;
+        if (l == t.composite.get() && t.composite->placed_now())
+            t.dirty = true;   /* quads moved over a canvas the display holds */
+        if (s == Stage::Idle)
+            continue;
+        staged.push_back(l);
+        wrote = wrote || s == Stage::Wrote;
+        failed = failed || s == Stage::Failed;
+    }
+    /* Layers over a scene file: its due edits go in the same flush. */
+    const bool edits = t.file && stage_edits(ti, t, now_ms);
+    if (!wrote && !failed && !t.dirty && !edits) {
+        settle(ti, t, false);
+        return;
+    }
+    uint64_t bytes = 0;
+    for (const Layer *l : staged)
+        bytes += l->staged_bytes();
+    for (const Asset *a : staged_assets)
+        bytes += a->staged_bytes();
+    const TargetSpec &spec = slots_->targets()[ti];
+    if (!spec.share)
+        load(bytes, now_ms);
+    bool ok = false;
+    if (failed)
+        evidence(spec, Evidence::WriteRefused, now_ms, spec.name);
+    const bool clear = !failed && !holds(t) && !(uncover && uncovers(t));
+    if (clear)
+        ok = flush(ti, t, now_ms);
+    /* A scene file's edits never wait for the layers over it: when its
+     * layers hold the flush (a half-written buffer, a write refused now, an
+     * uncover the budget defers), it goes for the edits all the same, and
+     * the layers take their writes as not gone (a video's next write is
+     * whole). What the layers wrote may show half done until then; the
+     * file's owner's content does not freeze behind another client's. */
+    const bool went = clear ? ok : edits && flush(ti, t, now_ms);
+    for (Asset *a : staged_assets)
+        a->committed(ok);
+    for (Canvas *c : staged_canvases)
+        c->committed(ok);
+    for (Layer *l : staged)
+        l->committed(ok, now_ms);
+    if (edits && went)
+        t.file_flush_ms = now_ms;
+    /* What the layers undid for a flush that did not go goes with the
+     * next one; animations the key allowance left, with the next flushes. */
+    t.dirty = !ok || (t.graph && t.graph->animations_due());
+    /* The uncover went with this flush: a later one waits from its own
+     * start. */
+    if (uncover && ok)
+        t.uncover_since = -1;
+    settle(ti, t, ok);
+}
+
+bool Compositor::flush(int ti, Target &t, int64_t now_ms)
+{
+    const TargetSpec &spec = slots_->targets()[ti];
+    const int64_t t0 = clock_us_();
+    /* Animation keys go to the renderer as scene data, made in this flush
+     * while the target's key bucket is above 0 and paid from it as made
+     * (refill_keys(), compositor.h); those left wait for the next flushes. */
+    const bool keyed = governor_.cap() != 0;
+    if (t.graph)
+        t.graph->key_allowance(!keyed ? UINT64_MAX : uint64_t(std::max<int64_t>(0, t.key_tokens)));
+    /* A graph over a file flushes the file's scene, edits and all. */
+    const bool ok = t.graph ? t.graph->flush(++t.tag) : t.file->flush(++t.tag);
+    if (t.graph) {
+        const uint64_t made = t.graph->take_animation_bytes();
+        if (made && keyed)
+            t.key_tokens -= int64_t(made);
+        if (made && !spec.share)
+            load(made, now_ms);
+    }
+    const int64_t took = clock_us_() - t0;
+    if (!ok)
+        evidence(spec, Evidence::FlushFailure, now_ms, spec.name);
+    else if (took >= slow_flush_us_)
+        evidence(spec, Evidence::SlowFlush, now_ms, spec.name + " " + std::to_string(took / 1000) + " ms");
+    if (!ok && !t.flush_failing)
+        log_error("target %s: flush %llu refused", spec.name.c_str(), (unsigned long long)t.tag);
+    else if (ok && t.flush_failing)
+        log_info("target %s: flushing again from %llu", spec.name.c_str(), (unsigned long long)t.tag);
+    t.flush_failing = !ok;
+    if (ok)
+        t.flushed_videos = video_buffers(ti);
+    return ok;
+}
+
+void Compositor::render_file(int ti, Target &t, int64_t now_ms)
+{
+    if (stage_edits(ti, t, now_ms) || t.dirty) {
+        t.dirty = !flush(ti, t, now_ms);
+        t.file_flush_ms = now_ms;
+    }
+}
+
+bool Compositor::stage_edits(int ti, Target &t, int64_t now_ms)
+{
+    /* The content gone, its scene stays as last flushed until released. */
+    auto s = scenes_.find(t.file_of);
+    if (s == scenes_.end() || s->second.serial != t.file_serial)
+        return false;
+    /* Once a tick: lines coming faster stay due (wake_in_ms). */
+    if (!t.dirty && file_tick_ms_ > 0 && t.file_flush_ms >= 0 && now_ms - t.file_flush_ms < file_tick_ms_)
+        return false;
+    const bool edited = s->second.edits.stage(t.file.get(), now_ms);
+    /* Sequences the service plays move on with the tick while the upload
+     * keeps up; with writes waiting on the budget a tick is left out, never
+     * holding them, and the next one catches up to its time. */
+    const bool ticked = t.file->ticking() && pacer_for(ti).ready(now_ms) && t.file->tick(now_ms);
+    return edited || ticked;
+}
+
+void Compositor::charge(int ti, uint64_t bytes, int64_t now_ms)
+{
+    crk::UploadPacer &pacer = pacer_for(ti);
+    pacer.ready(now_ms);
+    pacer.spend(bytes);
+    if (!slots_->targets()[ti].share)
+        load(bytes, now_ms);
+}
+
+crk::UploadPacer &Compositor::pacer_for(int target)
+{
+    return target >= 0 && target < (int)slots_->targets().size() && slots_->targets()[target].share ? share_ : pacer_;
+}
+
+void Compositor::evidence(const TargetSpec &t, Evidence e, int64_t now_ms, const std::string &detail)
+{
+    if (t.share)
+        log_info("target %s: %s (the HUD share's: the upload cap stays)", t.name.c_str(), detail.c_str());
+    else
+        governor_.evidence(e, now_ms, detail);
+}
+
+/* The link counts as carrying load (for the governor) from kLoadBytes a
+ * second written, whether or not the flush goes. */
+void Compositor::load(uint64_t bytes, int64_t now_ms)
+{
+    if (now_ms - second_ms_ >= 1000) {
+        second_ms_ = now_ms;
+        second_bytes_ = 0;
+    }
+    second_bytes_ += bytes;
+    if (second_bytes_ >= kLoadBytes)
+        governor_.activity(now_ms);
+}
+
+void Compositor::resent(const TargetSpec &spec, int64_t now_ms)
+{
+    const int ti = slots_->index(spec.name);
+    uint64_t bytes = targets_[ti].file ? targets_[ti].file_bytes : 0;
+    for (const auto &kv : layers_)
+        if (kv.second.layer->target() == ti)
+            bytes += kv.second.layer->buffer_bytes();
+    for (const auto &kv : assets_)
+        if (kv.second.asset->target() == ti && kv.second.asset->attached())
+            bytes += kv.second.asset->bytes();
+    if (targets_[ti].composite)
+        bytes += targets_[ti].composite->buffer_bytes();
+    if (!bytes)
+        return;
+    charge(ti, bytes, now_ms);
+    log_info("target %s: its scene goes whole to the renderer again: %llu KB charged to the upload budget",
+             spec.name.c_str(), (unsigned long long)(bytes / 1024));
+}
+
+bool Compositor::holds(const Target &t) const
+{
+    if (t.composite && t.composite->attached() && t.composite->holds_flush())
+        return true;
+    for (uint32_t id : t.arr.order) {
+        auto it = layers_.find(id);
+        if (it != layers_.end() && it->second.layer->attached() && it->second.layer->holds_flush())
+            return true;
+    }
+    return false;
+}
+
+Shown Compositor::shown_of(const Entry &e, const Target &t) const
+{
+    const Look k = e.eval_held ? e.flushed : look_of(e);
+    Shown s;
+    s.drawn = k.drawn;
+    s.rect = k.rect;
+    s.turned = k.rotate != 0 || k.sx != 1 || k.sy != 1;
+    s.opacity = k.opacity;
+    s.fade = t.eval_fade_held ? t.flushed_fade : t.applied;
+    s.animating = k.animating;
+    s.budget_ready = t.budget_ready;
+    return s;
+}
+
+bool Compositor::alert_waits(int ti) const
+{
+    for (uint32_t id : targets_[ti].arr.drawn) {
+        auto it = layers_.find(id);
+        if (it == layers_.end())
+            continue;
+        const Layer &l = *it->second.layer;
+        if ((l.params.klass == Klass::Alert || l.params.exclusive) && l.attached() && !l.on_display())
+            return true;
+    }
+    return false;
+}
+
+bool Compositor::occluding(const Target &t) const
+{
+    return !t.quiet || (t.videos && t.top > t.lowest);
+}
+
+void Compositor::occlude(int ti, Target &t)
+{
+    /* A composite not attached draws none of its sources: they are neither
+     * seen nor cover anything. */
+    CompositeVideo *cv = t.composite && t.composite->attached() ? t.composite.get() : nullptr;
+    t.budget_ready = pacer_for(ti).ready(now_ms_);
+    /* The lowest video's place in the draw order the next flush shows, and
+     * whether any layer is drawn above it. With none above, nothing is
+     * hidden: the videos are told so, and no walk is made. */
+    int32_t lowest = INT32_MAX, top = INT32_MIN;
+    bool videos = false;
+    for (uint32_t id : t.arr.order) {
+        auto it = layers_.find(id);
+        if (it == layers_.end())
+            continue;
+        const Entry &e = it->second;
+        if (e.composited ? !cv : !e.layer->attached())
+            continue;
+        const int32_t order = e.composited || !e.eval_held ? e.order : e.flushed.order;
+        const bool drawn = e.composited || !e.eval_held ? e.drawn : e.flushed.drawn;
+        if (e.composited || !std::strcmp(e.layer->kind(), "video")) {
+            videos = true;
+            lowest = std::min(lowest, order);
+        }
+        if (drawn)
+            top = std::max(top, order);
+    }
+    t.quiet = true;
+    if (!videos)
+        return;
+    const TargetSpec &spec = slots_->targets()[ti];
+    t.coverage.reset(spec.width, spec.height);
+    if (top <= lowest) {
+        for (uint32_t id : t.arr.order) {
+            auto it = layers_.find(id);
+            if (it == layers_.end() || it->second.composited || !it->second.layer->attached() ||
+                std::strcmp(it->second.layer->kind(), "video"))
+                continue;
+            VideoLayer *v = static_cast<VideoLayer *>(it->second.layer.get());
+            v->occluded(t.coverage, shown_of(it->second, t));
+            t.quiet = t.quiet && !v->holds_tiles();
+        }
+        if (cv) {
+            cv->hide(nullptr);
+            t.quiet = t.quiet && !cv->holds_tiles();
+        }
+        return;
+    }
+    t.quiet = false;
+    t.walk.clear();
+    for (uint32_t id : t.arr.order) {
+        auto it = layers_.find(id);
+        if (it == layers_.end())
+            continue;
+        const Entry &e = it->second;
+        if (e.composited ? !cv : !e.layer->attached())
+            continue;
+        const int32_t order = e.composited || !e.eval_held ? e.order : e.flushed.order;
+        if (order >= lowest)
+            t.walk.push_back(std::make_pair(order, id));
+    }
+    std::sort(t.walk.begin(), t.walk.end(),
+              [](const std::pair<int32_t, uint32_t> &a, const std::pair<int32_t, uint32_t> &b) {
+                  return a.first > b.first;
+              });
+    const float fade = t.eval_fade_held ? t.flushed_fade : t.applied;
+    if (cv)
+        cv->begin_hidden();
+    /* Top first. Layers at one place in the draw order (a held layer's old
+     * place and another's new one) are drawn in an order the renderer
+     * chooses: none of them covers another. */
+    for (size_t i = 0; i < t.walk.size();) {
+        size_t j = i;
+        while (j < t.walk.size() && t.walk[j].first == t.walk[i].first)
+            j++;
+        for (size_t k = i; k < j; k++) {
+            Entry &e = layers_[t.walk[k].second];
+            if (e.composited)
+                cv->see_source(t.walk[k].second, t.coverage);
+            else
+                e.layer->occluded(t.coverage, shown_of(e, t));
+        }
+        if (t.walk[i].first > lowest)
+            for (size_t k = i; k < j; k++) {
+                Entry &e = layers_[t.walk[k].second];
+                if (e.composited)
+                    cv->occlude_source(t.walk[k].second, &t.coverage, fade);
+                else
+                    e.layer->occlude(&t.coverage, shown_of(e, t));
+            }
+        i = j;
+    }
+    if (cv)
+        cv->end_hidden();
+}
+
+bool Compositor::uncovers(const Target &t) const
+{
+    if (t.composite && t.composite->attached() && t.composite->uncovering())
+        return true;
+    for (uint32_t id : t.arr.order) {
+        auto it = layers_.find(id);
+        if (it != layers_.end() && it->second.layer->attached() && it->second.layer->uncovering())
+            return true;
+    }
+    return false;
+}
+
+Compositor::Look Compositor::look_of(const Entry &e)
+{
+    Look k;
+    const Layer &l = *e.layer;
+    k.drawn = l.attached() && e.drawn;
+    k.order = e.order;
+    k.rect = l.params.rect;
+    k.opacity = l.params.opacity;
+    k.rotate = l.params.rotate;
+    k.sx = l.params.sx;
+    k.sy = l.params.sy;
+    k.px = l.params.px;
+    k.py = l.params.py;
+    k.pivot_x = l.params.pivot_x;
+    k.pivot_y = l.params.pivot_y;
+    k.animating = l.animating();
+    k.exclusive = l.params.exclusive;
+    return k;
+}
+
+bool Compositor::same(const Look &a, const Look &b)
+{
+    return a.drawn == b.drawn && a.order == b.order && a.rect == b.rect && a.opacity == b.opacity &&
+           a.rotate == b.rotate && a.sx == b.sx && a.sy == b.sy && a.px == b.px && a.py == b.py &&
+           a.pivot_x == b.pivot_x && a.pivot_y == b.pivot_y && a.animating == b.animating &&
+           a.exclusive == b.exclusive;
+}
+
+bool Compositor::evaluate(int ti, Target &t)
+{
+    occlude(ti, t);
+    return uncovers(t);
+}
+
+namespace {
+
+/* Whether a layer drawn as a may show pixels of b's place: their rects
+ * overlap, or either is turned (its place is then not its rect). */
+template <class L> bool may_overlap(const L &a, const L &b)
+{
+    const bool turned = a.rotate != 0 || a.sx != 1 || a.sy != 1 || b.rotate != 0 || b.sx != 1 || b.sy != 1;
+    return turned || !intersect(box_of(a.rect), box_of(b.rect)).empty();
+}
+
+}  // namespace
+
+bool Compositor::defer_uncover(int ti, Target &t)
+{
+    /* The changes since the last flush that went, as units that wait or go
+     * together: each layer of its own whose look changed, the fade, the
+     * composite's moves, shows and opacities. */
+    t.decided = true;
+    struct Unit {
+        std::vector<Entry *> layers;
+        bool fade = false, composite = false, held = true;
+        bool goes = false;   /* never held */
+    };
+    std::vector<Unit> units;
+    for (uint32_t id : t.arr.order) {
+        auto it = layers_.find(id);
+        if (it == layers_.end())
+            continue;
+        Entry &e = it->second;
+        if (!e.composited && e.layer->attached() && !same(look_of(e), e.flushed)) {
+            units.push_back(Unit());
+            units.back().layers.push_back(&e);
+        }
+    }
+    /* An exclusive layer coming or going and the layers it suspends or
+     * resumes go together: every change of what is drawn joins one unit
+     * with it, so no flush shows neither. One removed has gone already:
+     * what it resumes goes too. */
+    std::vector<Unit> merged;
+    Unit drawn_changes;
+    bool exclusive = false;
+    for (Unit &u : units) {
+        Entry &e = *u.layers[0];
+        const Look k = look_of(e);
+        if (k.drawn != e.flushed.drawn) {
+            exclusive = exclusive || k.exclusive || e.flushed.exclusive;
+            drawn_changes.layers.push_back(&e);
+        } else {
+            merged.push_back(u);
+        }
+    }
+    if ((exclusive || t.exclusive_gone) && !drawn_changes.layers.empty()) {
+        drawn_changes.goes = t.exclusive_gone;
+        merged.push_back(drawn_changes);
+    } else {
+        for (Entry *e : drawn_changes.layers) {
+            merged.push_back(Unit());
+            merged.back().layers.push_back(e);
+        }
+    }
+    units.swap(merged);
+    if (t.applied != t.flushed_fade) {
+        units.push_back(Unit());
+        units.back().fade = true;
+    }
+    if (t.composite && t.composite->attached() && t.composite->held_changes()) {
+        units.push_back(Unit());
+        units.back().composite = true;
+    }
+    auto apply = [&](Unit &u, bool held) {
+        u.held = held && !u.goes;
+        for (Entry *e : u.layers)
+            e->eval_held = u.held;
+        if (u.fade)
+            t.eval_fade_held = u.held;
+        if (u.composite)
+            t.composite->hold(u.held);
+    };
+    for (Unit &u : units)
+        apply(u, true);
+    if (!evaluate(ti, t)) {
+        /* Only the units that uncover wait. */
+        for (Unit &u : units) {
+            apply(u, false);
+            if (evaluate(ti, t))
+                apply(u, true);
+        }
+        /* A change going while one it would reveal waits would show a
+         * place neither the client's state nor the last flush shows: a
+         * layer moved or hidden off a place where a waiting layer is to be
+         * drawn waits with it. One that cannot wait (goes) makes them all
+         * go. */
+        bool must_go = false;
+        for (bool more = true; more && !must_go;) {
+            more = false;
+            for (Unit &h : units) {
+                if (!h.held)
+                    continue;
+                for (Entry *he : h.layers) {
+                    const Look want = look_of(*he);
+                    if (!want.drawn)
+                        continue;
+                    for (Unit &a : units) {
+                        if (a.held)
+                            continue;
+                        for (Entry *ae : a.layers)
+                            if (ae->flushed.drawn && may_overlap(ae->flushed, want)) {
+                                if (a.goes) {
+                                    must_go = true;
+                                } else {
+                                    apply(a, true);
+                                    more = true;
+                                }
+                                break;
+                            }
+                    }
+                }
+            }
+        }
+        if (!must_go) {
+            if (evaluate(ti, t)) {
+                for (Unit &u : units)
+                    apply(u, true);
+                evaluate(ti, t);
+            }
+            return true;
+        }
+    }
+    /* Not held back by that (a layer removed, an image hidden after a
+     * failed write, video objects made again, or a change that waits with
+     * one of these): the changes go, and the uncovering videos write now. */
+    for (Unit &u : units)
+        apply(u, false);
+    evaluate(ti, t);
+    if (t.composite && t.composite->attached() && t.composite->uncovering())
+        t.composite->force(true);
+    for (auto &kv : layers_)
+        if (kv.second.layer->target() == ti && kv.second.layer->attached() && kv.second.layer->uncovering())
+            static_cast<VideoLayer *>(kv.second.layer.get())->force(true);
+    return false;
+}
+
+void Compositor::commit(int ti, Target &t)
+{
+    if (t.decided || t.held_n) {
+        for (auto &kv : layers_) {
+            Entry &e = kv.second;
+            Layer &l = *e.layer;
+            if (l.target() != ti || e.composited || !l.attached())
+                continue;
+            if (e.eval_held && !e.held) {
+                /* The scene back to what the last flush showed, its fade
+                 * included; params stay what the client set. */
+                LayerParams p = l.params;
+                const Look &f = e.flushed;
+                p.rect = f.rect;
+                p.opacity = f.opacity;
+                p.rotate = f.rotate;
+                p.sx = f.sx;
+                p.sy = f.sy;
+                p.px = f.px;
+                p.py = f.py;
+                p.pivot_x = f.pivot_x;
+                p.pivot_y = f.pivot_y;
+                l.hold_scene(&p);
+                l.place();
+                l.arrange(f.drawn, f.order);
+                e.held = true;
+                t.held_n++;
+            } else if (!e.eval_held && e.held) {
+                l.hold_scene(nullptr);
+                l.place();
+                l.arrange(e.drawn, e.order);
+                e.held = false;
+                t.held_n--;
+                t.dirty = true;
+            }
+            if (!e.held && l.start_pending())
+                t.dirty = true;
+        }
+    } else {
+        for (uint32_t id : t.touched) {
+            auto it = layers_.find(id);
+            if (it != layers_.end() && !it->second.composited && it->second.layer->start_pending())
+                t.dirty = true;
+        }
+    }
+    if (t.eval_fade_held != t.fade_held) {
+        const float f = t.eval_fade_held ? t.flushed_fade : t.applied;
+        for (auto &kv : layers_)
+            if (kv.second.layer->target() == ti)
+                kv.second.layer->set_fade(f);
+        if (t.composite)
+            t.composite->set_fade(f);
+        t.fade_held = t.eval_fade_held;
+        t.dirty = t.dirty || !t.fade_held;
+    }
+    if (t.composite && t.composite->attached() && !t.composite->held() && t.composite->show_opacity())
+        t.dirty = true;
+}
+
+void Compositor::settle(int ti, Target &t, bool ok)
+{
+    if (t.decided) {
+        for (auto &kv : layers_) {
+            Entry &e = kv.second;
+            if (e.layer->target() != ti || e.composited)
+                continue;
+            e.eval_held = false;
+            if (!std::strcmp(e.layer->kind(), "video"))
+                static_cast<VideoLayer *>(e.layer.get())->force(false);
+        }
+        if (t.composite) {
+            t.composite->force(false);
+            t.composite->hold(false);
+        }
+        t.decided = false;
+    }
+    t.eval_fade_held = false;
+    if (!ok)
+        return;
+    t.exclusive_gone = false;
+    /* What the flush showed of the layers whose look changed: their look,
+     * but a held one's (it stays in the list). */
+    size_t kept = 0;
+    for (uint32_t id : t.touched) {
+        auto it = layers_.find(id);
+        if (it == layers_.end() || it->second.layer->target() != ti)
+            continue;
+        Entry &e = it->second;
+        if (e.held) {
+            t.touched[kept++] = id;
+            continue;
+        }
+        e.flushed = look_of(e);
+        e.flushed.animating = e.layer->animations_started();
+        e.touched = false;
+    }
+    t.touched.resize(kept);
+    if (!t.fade_held)
+        t.flushed_fade = t.applied;
+}
+
+int64_t Compositor::wake_in_ms(int64_t now_ms) const
+{
+    int64_t best = -1;
+    auto at = [&](int64_t w) {
+        if (w > 0 && (best < 0 || w < best))
+            best = w;
+    };
+    for (const auto &kv : layers_)
+        if (slots_->requested(kv.second.layer->target()) || slots_->loaded(kv.second.layer->target()))
+            at(kv.second.layer->wake_in_ms(now_ms));
+    for (const auto &ck : canvases_)
+        for (const auto &kv : ck.second.layers)
+            if (slots_->requested(kv.second.layer->target()) || slots_->loaded(kv.second.layer->target()))
+                at(kv.second.layer->wake_in_ms(now_ms));
+    for (size_t ti = 0; ti < targets_.size(); ti++) {
+        const Target &t = targets_[ti];
+        if (t.composite && (slots_->requested((int)ti) || slots_->loaded((int)ti)))
+            at(t.composite->wake_in_ms(now_ms));
+        if (t.remake_ms >= 0)
+            at(std::max<int64_t>(1, t.remake_ms - now_ms));
+        if (t.hold_ms >= 0)
+            at(std::max<int64_t>(1, t.hold_ms - now_ms));
+        if (t.graph && (t.fading_out || (t.fade > 0.0f && t.fade < 1.0f) || t.fade != t.applied))
+            at(std::max<int64_t>(1, t.applied_ms + kFadeStepMs - now_ms));
+        /* due edits of a scene render() stages (flushing), and the
+         * sequences it plays */
+        auto s = t.file ? scenes_.find(t.file_of) : scenes_.end();
+        if (s != scenes_.end() && s->second.serial == t.file_serial && slots_->flushing((int)ti) &&
+            (s->second.edits.due() || t.file->ticking()))
+            at(std::max<int64_t>(1, t.file_flush_ms + file_tick_ms_ - now_ms));
+    }
+    return best;
+}
+
+LayerState Compositor::state(uint32_t id, std::string *reason) const
+{
+    reason->clear();
+    auto sc = scenes_.find(id);
+    if (sc != scenes_.end()) {
+        const SceneEntry &s = sc->second;
+        if (!s.error.empty()) {
+            *reason = s.error;
+            return LayerState::Error;
+        }
+        const TargetStatus &ts = slots_->status(s.target);
+        const Target &t = targets_[s.target];
+        const bool loaded = t.file && t.file_of == id && t.file_serial == s.serial;
+        /* Where the service sees the renderer's subscriptions: once it has
+         * this scene (a file replaced in place is taken again). */
+        if (ts.state == TargetState::Shown && loaded && ts.rendering != Rendering::Checking)
+            return LayerState::Shown;
+        *reason = ts.state == TargetState::Shown && loaded
+                      ? "target shown, its renderer not subscribed to the scene yet"
+                      : std::string("target ") + target_state_name(ts.state) + (ts.reason.empty() ? "" : ": " + ts.reason);
+        return LayerState::Waiting;
+    }
+    const CanvasEntry *in = nullptr;
+    const Entry *en = find(id, &in);
+    if (!en)
+        return LayerState::Hidden;
+    const Entry &e = *en;
+    const Layer &l = *e.layer;
+    if (!e.error.empty() || !l.refusal().empty()) {
+        *reason = e.error.empty() ? l.refusal() : e.error;
+        return LayerState::Error;
+    }
+    if (in) {
+        /* In a canvas: shown once drawn in it, whether or not a layer on
+         * screen samples the canvas. */
+        if (const uint32_t refused = asset_refused(e)) {
+            *reason = refused_reason(refused);
+            return LayerState::Error;
+        }
+        if (!in->canvas->refused().empty()) {
+            *reason = "canvas " + std::to_string(in->canvas->id()) + ": " + in->canvas->refused();
+            return LayerState::Error;
+        }
+        if (!l.params.visible)
+            return LayerState::Hidden;
+        if (!l.ready(now_ms_) || !assets_have(e))
+            return LayerState::Stalled;
+        if (e.drawn)
+            return LayerState::Shown;
+        if (in->canvas->attached() && !assets_clean(e)) {
+            *reason = "an asset it samples is not written yet";
+            return LayerState::Waiting;
+        }
+        const TargetStatus &ts = slots_->status(l.target());
+        *reason = std::string("target ") + target_state_name(ts.state) + (ts.reason.empty() ? "" : ": " + ts.reason);
+        return LayerState::Waiting;
+    }
+    if (e.composited && !targets_[l.target()].composite_error.empty()) {
+        *reason = targets_[l.target()].composite_error;
+        return LayerState::Error;
+    }
+    if (const uint32_t refused = asset_refused(e)) {
+        *reason = refused_reason(refused);
+        return LayerState::Error;
+    }
+    if (!l.params.visible)
+        return LayerState::Hidden;
+    if (!l.ready(now_ms_) || !assets_have(e))
+        return LayerState::Stalled;
+    if (layers_wait(l.target())) {
+        *reason = "scene";
+        return LayerState::Waiting;
+    }
+    const Target &t = targets_[l.target()];
+    if (t.graph && std::string(l.kind()) == "video" &&
+        (e.composited ? !(t.composite && t.composite->attached()) : !l.attached())) {
+        *reason = "the display's video buffers: another target's are still going";
+        return LayerState::Waiting;
+    }
+    if (std::find(t.arr.suspended.begin(), t.arr.suspended.end(), id) != t.arr.suspended.end())
+        return LayerState::Suspended;
+    const TargetStatus &ts = slots_->status(l.target());
+    if (ts.state == TargetState::Shown && e.drawn)
+        return LayerState::Shown;
+    if (ts.state == TargetState::Shown && t.graph && !assets_clean(e)) {
+        *reason = "an asset it samples is not written yet";
+        return LayerState::Waiting;
+    }
+    *reason = std::string("target ") + target_state_name(ts.state) + (ts.reason.empty() ? "" : ": " + ts.reason);
+    return LayerState::Waiting;
+}
+
+std::vector<const Layer *> Compositor::layers() const
+{
+    std::vector<const Layer *> out;
+    for (const auto &kv : layers_)
+        out.push_back(kv.second.layer.get());
+    for (const auto &ck : canvases_)
+        for (const auto &kv : ck.second.layers)
+            out.push_back(kv.second.layer.get());
+    return out;
+}
+
+WriteStats Compositor::write_stats(int target) const
+{
+    WriteStats sum;
+    for (const auto &kv : layers_) {
+        if (kv.second.layer->target() != target)
+            continue;
+        const WriteStats w = kv.second.layer->write_stats();
+        sum.frames += w.frames;
+        sum.age_ms += w.age_ms;
+        sum.bytes += w.bytes;
+        sum.failed += w.failed;
+        sum.holds += w.holds;
+    }
+    if (target >= 0 && target < (int)targets_.size() && targets_[target].composite) {
+        const WriteStats w = targets_[target].composite->write_stats();
+        sum.frames += w.frames;
+        sum.age_ms += w.age_ms;
+        sum.bytes += w.bytes;
+        sum.failed += w.failed;
+        sum.holds += w.holds;
+    }
+    return sum;
+}
+
+std::vector<const Asset *> Compositor::assets() const
+{
+    std::vector<const Asset *> out;
+    for (const auto &kv : assets_)
+        out.push_back(kv.second.asset.get());
+    return out;
+}
+
+bool Compositor::publish(const TargetSpec &spec, std::string *err)
+{
+    const int ti = slots_->index(spec.name);
+    Target &t = targets_[ti];
+    t.over = false;
+    if (const uint32_t id = content(ti)) {
+        SceneEntry &s = scenes_[id];
+        t.file = gpu_->load(spec, s.src.file, s.src.res, err);
+        if (!t.file) {
+            /* The client's file: it wants nothing more; the layers come back,
+             * and what it hosted ends. */
+            s.error = *err;
+            if (!s.hosts.empty()) {
+                s.hosts.clear();
+                host_serial_++;
+            }
+            log_warn("target %s: scene file %s refused: %s", spec.name.c_str(), s.src.file.c_str(), err->c_str());
+            return false;
+        }
+        t.file_of = id;
+        t.file_serial = s.serial;
+        t.file_bytes = s.src.bytes;
+        t.tag = 0;
+        t.flush_failing = false;
+        t.dirty = true;
+        s.edits.reset();   /* every kept line in the first flush (render()) */
+        charge(ti, t.file_bytes, now_ms_);
+        log_info("target %s: scene file %s published, %llu KB with its resource files, %zu edit lines kept",
+                 spec.name.c_str(), s.src.file.c_str(), (unsigned long long)(t.file_bytes / 1024), s.edits.kept());
+        if (!s.layers.on)
+            return true;
+        /* The layers over the file, in its scene; without that graph they
+         * wait, the file shown all the same, and it hosts nothing. */
+        host_serial_++;
+        t.graph = t.file->layers(s.layers.order_set ? &s.layers.order : nullptr, err);
+        t.over = t.graph && s.layers.over_set && t.graph->band(s.layers.over);
+        if (!t.graph) {
+            log_warn("target %s: no layers over scene file %s: %s", spec.name.c_str(), s.src.file.c_str(),
+                     err->c_str());
+            s.layers_error = *err;
+            s.hosts.clear();
+            err->clear();
+            return true;
+        }
+    } else {
+        t.graph = gpu_->scene(spec, err);
+        if (!t.graph)
+            return false;
+    }
+    t.tag = 0;
+    t.flush_failing = false;
+    /* A new scene shows nothing until its first flush. */
+    t.flushed_fade = t.applied;
+    t.fade_held = false;
+    t.quiet = false;
+    t.uncover_since = t.alert_since = -1;
+    for (auto &kv : assets_)
+        if (kv.second.asset->target() == ti)
+            kv.second.asset->attach(t.graph.get());
+    /* Values before the layers linked to them. */
+    for (auto &kv : values_)
+        if (kv.second.target == ti)
+            make_value(t, kv.second);
+    /* Canvases before the layers that sample them; their own layers once
+     * every canvas is made, so a bind of one made later is applied too. */
+    for (auto &ck : canvases_)
+        if (ck.second.canvas->target() == ti)
+            ck.second.canvas->attach(t.graph.get());
+    for (auto &ck : canvases_)
+        if (ck.second.canvas->target() == ti)
+            for (auto &kv : ck.second.layers)
+                attach_in(kv.second, ck.second);
+    arrange_canvases(ti);
+    for (auto &kv : layers_) {
+        Entry &e = kv.second;
+        if (e.layer->target() != ti || e.composited)
+            continue;
+        if (std::string(e.layer->kind()) == "video" && !may_make_video(ti)) {
+            e.placed = false;   /* reconcile_make attaches it */
+            t.make_waiting = true;
+            continue;
+        }
+        attach(e, t);
+    }
+    if (t.composite) {
+        if (may_make_video(ti))
+            attach_composite(t);
+        else
+            t.make_waiting = true;
+    }
+    for (auto &kv : layers_)
+        if (kv.second.layer->target() == ti)
+            apply_binds(kv.second);
+    /* Drawn in the scene's first flush, before the display fetches it;
+     * layers sampling assets once those are written. */
+    for (size_t pos = 0; pos < t.arr.order.size(); pos++) {
+        Entry &e = layers_[t.arr.order[pos]];
+        if (!e.composited && !e.layer->attached())
+            continue;
+        const bool drawn =
+            std::find(t.arr.drawn.begin(), t.arr.drawn.end(), t.arr.order[pos]) != t.arr.drawn.end() &&
+            assets_clean(e);
+        const int32_t order = draw_order(t.over, *e.layer, pos);
+        if (e.composited && t.composite)
+            t.composite->arrange_source(t.arr.order[pos], drawn, order);
+        else
+            e.layer->arrange(drawn, order);
+        e.drawn = drawn;
+        e.order = order;
+    }
+    if (t.composite)
+        t.composite->arranged();
+    return true;
+}
+
+void Compositor::unpublish(const TargetSpec &spec)
+{
+    const int ti = slots_->index(spec.name);
+    Target &t = targets_[ti];
+    for (auto &kv : layers_)
+        if (kv.second.layer->target() == ti) {
+            kv.second.layer->detach(false);
+            kv.second.drawn = false;
+            kv.second.order = -1;
+        }
+    for (auto &kv : assets_)
+        if (kv.second.asset->target() == ti)
+            kv.second.asset->detach(false);
+    for (auto &kv : values_)
+        if (kv.second.target == ti) {
+            kv.second.handle = 0;
+            for (auto &a : kv.second.anims)
+                a.second.handle = 0;
+        }
+    for (auto &ck : canvases_) {
+        if (ck.second.canvas->target() != ti)
+            continue;
+        for (auto &kv : ck.second.layers) {
+            kv.second.layer->detach(false);
+            kv.second.drawn = false;
+            kv.second.order = -1;
+        }
+        ck.second.canvas->detach(false);
+    }
+    if (t.composite)
+        t.composite->detach(false);
+    if (t.file)
+        host_serial_++;   /* what it hosted is not drawable any more */
+    t.file.reset();    /* before a graph that borrows its scene */
+    t.graph.reset();
+    t.file_of = 0;
+    t.dirty = false;
+    t.flushed_videos = 0;
+}
+
+const CompositeVideo *Compositor::composite(int target) const
+{
+    return target >= 0 && target < (int)targets_.size() ? targets_[target].composite.get() : nullptr;
+}
+
+bool Compositor::on_scene(const Entry &e) const
+{
+    if (e.composited) {
+        const Target &t = targets_[e.layer->target()];
+        return t.composite && t.composite->attached();
+    }
+    return e.layer->attached();
+}
+
+bool Compositor::composable_now(const Entry &e, const LayerParams &p, const VideoParams &vp, bool *held) const
+{
+    const bool is = composable(p, vp);
+    *held = e.placed && is != e.composable && now_ms_ - targets_[e.layer->target()].members_ms < kRemakeMs;
+    return *held ? e.composable : is;
+}
+
+std::vector<Compositor::VideoSpec> Compositor::video_specs(bool real) const
+{
+    std::vector<VideoSpec> out;
+    for (const auto &kv : layers_) {
+        if (std::string(kv.second.layer->kind()) != "video")
+            continue;
+        VideoSpec s;
+        s.id = kv.first;
+        s.target = kv.second.layer->target();
+        s.params = kv.second.layer->params;
+        s.vp = static_cast<const VideoLayer *>(kv.second.layer.get())->video();
+        s.composable = real ? composable(s.params, s.vp) : composable_now(kv.second, s.params, s.vp, &s.held);
+        out.push_back(s);
+    }
+    return out;
+}
+
+namespace {
+
+uint32_t up(uint32_t v, uint32_t m) { return (v + m - 1) / m * m; }
+
+}  // namespace
+
+Compositor::VideoPlan Compositor::compose_plan(int ti, const std::vector<VideoSpec> &specs, const Rect *with) const
+{
+    VideoPlan pl;
+    std::vector<const VideoSpec *> group;
+    for (const VideoSpec &s : specs) {
+        if (s.target != ti)
+            continue;
+        if (s.composable)
+            group.push_back(&s);
+        else
+            pl.buffers++;
+    }
+    if (group.size() < 2) {
+        pl.buffers += (uint32_t)group.size();
+        return pl;
+    }
+    pl.buffers++;
+    /* The canvas: the sources' rectangles together, within the target (to
+     * even pixels), widened to what an atlas and packing take. */
+    const TargetSpec &spec = slots_->targets()[ti];
+    int64_t x0 = INT32_MAX, y0 = INT32_MAX, x1 = INT32_MIN, y1 = INT32_MIN;
+    VideoParams vp;
+    vp.level_bits = 0;
+    vp.dirty_threshold = UINT32_MAX;
+    vp.dirty_settle_ms = 0;
+    vp.fps = 0;
+    vp.pan_blocks = true;
+    vp.always_packed = true;   /* only if every video it draws is */
+    vp.stall_ms = 0;
+    bool unclocked = false;
+    for (const VideoSpec *s : group) {
+        /* What is drawn: its frame at its size, at even x and y (a video
+         * held composited after it stopped being composable included). */
+        Rect r;
+        r.x = s->params.rect.x & ~1;
+        r.y = s->params.rect.y & ~1;
+        r.w = s->vp.w;
+        r.h = s->vp.h;
+        x0 = std::min<int64_t>(x0, r.x);
+        y0 = std::min<int64_t>(y0, r.y);
+        x1 = std::max<int64_t>(x1, (int64_t)r.x + r.w);
+        y1 = std::max<int64_t>(y1, (int64_t)r.y + r.h);
+        vp.dirty_threshold = std::min(vp.dirty_threshold, s->vp.dirty_threshold);
+        if (s->vp.dirty_settle_ms > 0 && (vp.dirty_settle_ms == 0 || s->vp.dirty_settle_ms < vp.dirty_settle_ms))
+            vp.dirty_settle_ms = s->vp.dirty_settle_ms;
+        unclocked = unclocked || s->vp.fps == 0;
+        vp.fps = std::max(vp.fps, s->vp.fps);
+        vp.pan_blocks = vp.pan_blocks && s->vp.pan_blocks;
+        vp.always_packed = vp.always_packed && s->vp.always_packed;
+        vp.stall_ms = std::max(vp.stall_ms, s->vp.stall_ms);
+        pl.composited.push_back(s->id);
+    }
+    if (unclocked)
+        vp.fps = 0;
+    vp.always_packed = vp.always_packed && vp.pan_blocks;   /* as the composite takes it */
+    if (with && with->w && with->h) {
+        x0 = std::min<int64_t>(x0, with->x);
+        y0 = std::min<int64_t>(y0, with->y);
+        x1 = std::max<int64_t>(x1, (int64_t)with->x + with->w);
+        y1 = std::max<int64_t>(y1, (int64_t)with->y + with->h);
+    }
+    x0 = std::max<int64_t>(x0, 0);
+    y0 = std::max<int64_t>(y0, 0);
+    x1 = std::min<int64_t>(x1, spec.width & ~1u);
+    y1 = std::min<int64_t>(y1, spec.height & ~1u);
+    if (x0 >= x1 || y0 >= y1)
+        x0 = y0 = x1 = y1 = 0;   /* nothing of them is on the target */
+    pl.x = (int32_t)x0;
+    pl.y = (int32_t)y0;
+    pl.clip.x = pl.x;
+    pl.clip.y = pl.y;
+    pl.clip.w = (uint32_t)(x1 - x0);
+    pl.clip.h = (uint32_t)(y1 - y0);
+    vp.w = up(std::max<uint32_t>(pl.clip.w, 64), 4);
+    vp.h = up(std::max<uint32_t>(pl.clip.h, 32), 4);
+    if (VideoLayer::size_error(vp.w, vp.h))
+        pl.error = "the target's videos together span more than 1920x720";
+    /* Its videos are drawn anywhere on the canvas within the target. */
+    pl.clip.w = (uint32_t)std::min<int64_t>(vp.w, (int64_t)(spec.width & ~1u) - pl.x);
+    pl.clip.h = (uint32_t)std::min<int64_t>(vp.h, (int64_t)(spec.height & ~1u) - pl.y);
+    pl.vp = vp;
+    pl.bytes = (uint64_t)vp.w * crk::atlas_height(vp.h) * 4 + (vp.pan_blocks ? crk::block_bytes(vp.w, vp.h) : 0);
+    return pl;
+}
+
+std::vector<Compositor::VideoPlan> Compositor::plan_videos(const std::vector<VideoSpec> &specs,
+                                                            std::string *err) const
+{
+    /* Every video separate while the display holds them all. */
+    std::vector<VideoPlan> plans(targets_.size());
+    uint32_t buffers = 0;
+    for (const VideoSpec &s : specs) {
+        plans[s.target].buffers++;
+        buffers++;
+    }
+    err->clear();
+    if (buffers <= limits_.videos)
+        return plans;
+    /* Past it, the targets whose composite saves the most buffers compose,
+     * as few as it takes. */
+    std::vector<VideoPlan> composed(targets_.size());
+    std::vector<std::pair<uint32_t, int>> saves;
+    const char *span = nullptr;
+    for (size_t ti = 0; ti < targets_.size(); ti++) {
+        composed[ti] = compose_plan((int)ti, specs);
+        if (composed[ti].composited.size() < 2)
+            continue;
+        if (composed[ti].error)
+            span = composed[ti].error;
+        else
+            saves.push_back(std::make_pair(plans[ti].buffers - composed[ti].buffers, (int)ti));
+    }
+    std::stable_sort(saves.begin(), saves.end(),
+                     [](const std::pair<uint32_t, int> &a, const std::pair<uint32_t, int> &b) { return a.first > b.first; });
+    for (const auto &sv : saves) {
+        if (buffers <= limits_.videos)
+            break;
+        buffers -= sv.first;
+        plans[sv.second] = composed[sv.second];
+    }
+    if (buffers > limits_.videos)
+        *err = span ? span
+                    : "too many video buffers on the display (at most " + std::to_string(limits_.videos) +
+                          "): a target's videos share one past it, but a video turned, scaled or at an odd x or y "
+                          "needs its own";
+    return plans;
+}
+
+bool Compositor::videos_fit(const std::vector<VideoSpec> &specs, uint64_t *bytes, std::string *err)
+{
+    const std::vector<VideoPlan> plans = plan_videos(specs, err);
+    if (!err->empty())
+        return false;
+    bool composite = false;
+    for (const VideoPlan &pl : plans)
+        composite = composite || !pl.composited.empty();
+    *bytes = composites_cost(plans);
+    return !composite || view_effects(err);
+}
+
+bool Compositor::videos_fit_both(const std::vector<VideoSpec> &held, const std::vector<VideoSpec> &real,
+                                 uint64_t *bytes, std::string *err)
+{
+    uint64_t later = 0;
+    if (!videos_fit(held, bytes, err) || !videos_fit(real, &later, err))
+        return false;
+    *bytes = std::max(*bytes, later);
+    return true;
+}
+
+uint64_t Compositor::composites_cost(const std::vector<VideoPlan> &plans) const
+{
+    uint64_t bytes = 0;
+    for (size_t ti = 0; ti < targets_.size(); ti++)
+        bytes += std::max(plans[ti].bytes, targets_[ti].composite_bytes);
+    return bytes;
+}
+
+bool Compositor::view_effects(std::string *err)
+{
+    if (!atlas_view_fx_)
+        atlas_view_fx_ = gpu_->effect(kQuadVertexShader, kAtlasViewFragmentShader, err);
+    if (atlas_view_fx_ && !block_view_fx_)
+        block_view_fx_ = gpu_->effect(kQuadVertexShader, kBlockViewFragmentShader, err);
+    return block_view_fx_ != 0;
+}
+
+bool Compositor::check(const Layer *l, const LayerParams &p, std::string *err)
+{
+    if (std::string(l->kind()) != "video")
+        return true;
+    std::vector<VideoSpec> specs = video_specs(), real = video_specs(true);
+    for (VideoSpec &s : specs)
+        if (s.id == l->id()) {
+            s.params = p;
+            s.composable = composable_now(layers_.at(s.id), p, s.vp, &s.held);
+        }
+    for (VideoSpec &s : real)
+        if (s.id == l->id()) {
+            s.params = p;
+            s.composable = composable(p, s.vp);
+        }
+    uint64_t composites = 0, now_composites = 0;
+    if (!videos_fit_both(specs, real, &composites, err))
+        return false;
+    for (const Target &t : targets_)
+        now_composites += t.composite_bytes;
+    if (memory() - now_composites + composites > limits_.pixel_bytes) {
+        *err = "the service's pixel memory is full";
+        return false;
+    }
+    return true;
+}
+
+void Compositor::attach_composite(Target &t)
+{
+    std::string err;
+    if (!t.composite->attach(t.graph.get(), now_ms_, &err)) {
+        t.composite_error = err;
+        log_error("composite on %s: %s", slots_->targets()[t.composite->target()].name.c_str(), err.c_str());
+    } else {
+        t.composite_error.clear();
+    }
+    t.dirty = true;
+}
+
+void Compositor::reconcile()
+{
+    std::string err;
+    const std::vector<VideoSpec> specs = video_specs();
+    std::vector<VideoPlan> plans = plan_videos(specs, &err);
+    if (!err.empty()) {
+        /* Videos that do not fit (a change let in past what fits): no buffer
+         * changes, every video keeps its mode, until a change fits again. */
+        if (err != plan_error_)
+            log_error("videos: %s; the display's videos stay as they are", err.c_str());
+        plan_error_ = err;
+        for (Target &t : targets_)
+            t.hold_ms = t.remake_ms = -1;
+        return;
+    }
+    plan_error_.clear();
+    /* Each target's scene reaches the display with its own flush. A shown
+     * target whose plan takes more video buffers than its scene holds keeps
+     * its videos as they are until the display can hold its plan with every
+     * other target's scene as flushed or as planned, whichever holds more
+     * (another's dropped buffers go with that target's flush). */
+    const size_t n = targets_.size();
+    std::vector<uint32_t> after(n);
+    std::vector<bool> grows(n), waits(n);
+    for (size_t ti = 0; ti < n; ti++) {
+        grows[ti] = targets_[ti].graph && plans[ti].buffers > video_buffers((int)ti);
+        after[ti] = plans[ti].buffers;
+    }
+    for (size_t ti = 0; ti < n; ti++) {
+        if (!grows[ti])
+            continue;
+        uint32_t sum = 0;
+        for (size_t j = 0; j < n; j++)
+            sum += video_hold((int)j, after[j]);
+        if (sum > limits_.videos) {
+            waits[ti] = true;
+            after[ti] = video_buffers((int)ti);
+        }
+    }
+    /* What goes, on every target first: so the display never holds more
+     * video buffers than the plans allow. */
+    for (size_t ti = 0; ti < n; ti++)
+        if (!waits[ti])
+            reconcile_drop((int)ti, plans[ti]);
+    for (size_t ti = 0; ti < n; ti++) {
+        if (waits[ti]) {
+            /* render() reconciles again each tick while it waits. */
+            targets_[ti].make_waiting = true;
+            targets_[ti].remake_ms = -1;
+        } else {
+            reconcile_make((int)ti, plans[ti]);
+        }
+    }
+    for (Target &t : targets_)
+        t.hold_ms = -1;
+    for (const VideoSpec &s : specs) {
+        if (waits[s.target])
+            continue;
+        layers_[s.id].composable = s.composable;
+        if (s.held)
+            targets_[s.target].hold_ms = targets_[s.target].members_ms + kRemakeMs;
+    }
+}
+
+static bool planned(const std::vector<uint32_t> &composited, uint32_t id)
+{
+    return std::find(composited.begin(), composited.end(), id) != composited.end();
+}
+
+static bool inside(const Rect &in, const Rect &out)
+{
+    return in.x >= out.x && in.y >= out.y && (int64_t)in.x + in.w <= (int64_t)out.x + out.w &&
+           (int64_t)in.y + in.h <= (int64_t)out.y + out.h;
+}
+
+bool Compositor::keep_composite(int ti, VideoPlan *pl)
+{
+    Target &t = targets_[ti];
+    const CompositeVideo *c = t.composite.get();
+    t.remake_ms = -1;
+    if (!c || pl->composited.empty())
+        return false;
+    const VideoParams &cv = c->video();
+    const bool settings = cv.fps == pl->vp.fps && cv.dirty_threshold == pl->vp.dirty_threshold &&
+                          cv.dirty_settle_ms == pl->vp.dirty_settle_ms && cv.pan_blocks == pl->vp.pan_blocks &&
+                          cv.always_packed == pl->vp.always_packed && cv.stall_ms == pl->vp.stall_ms;
+    if (settings && c->x() == pl->x && c->y() == pl->y && c->clip() == pl->clip && cv.w == pl->vp.w &&
+        cv.h == pl->vp.h) {
+        t.smaller_since_ms = -1;
+        return true;
+    }
+    int64_t due;
+    if (settings && inside(pl->clip, c->clip())) {
+        /* Its videos fit in a smaller one: made so once that has held. */
+        if (t.smaller_since_ms < 0 || t.smaller != pl->clip) {
+            t.smaller_since_ms = now_ms_;
+            t.smaller = pl->clip;
+        }
+        due = std::max(t.smaller_since_ms + kShrinkMs, t.composite_made_ms + kRemakeMs);
+    } else {
+        /* Grown past it, or a joining video's settings: made over the old
+         * rect and the new one, when the memory allows. */
+        t.smaller_since_ms = -1;
+        due = t.composite_made_ms + kRemakeMs;
+        if (now_ms_ >= due) {
+            std::vector<VideoSpec> specs = video_specs();
+            const VideoPlan grown = compose_plan(ti, specs, &c->clip());
+            if (!grown.error && memory() - t.composite_bytes + grown.bytes <= limits_.pixel_bytes) {
+                const uint32_t buffers = pl->buffers;
+                *pl = grown;
+                pl->buffers = buffers;
+            }
+        }
+    }
+    if (now_ms_ >= due)
+        return false;
+    t.remake_ms = due;
+    return true;
+}
+
+void Compositor::reconcile_drop(int ti, VideoPlan &pl)
+{
+    Target &t = targets_[ti];
+    CompositeVideo *c = t.composite.get();
+    if (c && !keep_composite(ti, &pl)) {
+        if (c->attached()) {
+            c->detach(true);
+            t.dirty = true;
+        }
+        for (auto &kv : layers_)
+            if (kv.second.layer->target() == ti)
+                kv.second.composited = false;
+        t.composite.reset();
+        t.composite_bytes = 0;
+        t.composite_error.clear();
+        t.smaller_since_ms = t.remake_ms = -1;
+        c = nullptr;
+    }
+    for (auto &kv : layers_) {
+        Entry &e = kv.second;
+        if (e.layer->target() != ti || std::string(e.layer->kind()) != "video")
+            continue;
+        VideoLayer *v = static_cast<VideoLayer *>(e.layer.get());
+        if (planned(pl.composited, kv.first)) {
+            if (!v->source()) {
+                if (v->attached()) {
+                    v->detach(true);
+                    t.dirty = true;
+                }
+                v->to_source();
+                t.members_ms = now_ms_;
+                /* Drawn by the composite from now: its own held look goes
+                 * with its objects, and the composite's deferred moves
+                 * place its quads from what the client set. */
+                if (e.held) {
+                    e.held = false;
+                    t.held_n--;
+                    v->hold_scene(nullptr);
+                }
+                /* Its own objects' refusal goes with them. */
+                e.error.clear();
+                e.drawn = false;
+                e.order = -1;
+            }
+        } else if (e.composited) {
+            c->remove(kv.first);
+            e.composited = false;
+            t.dirty = true;
+        }
+    }
+}
+
+void Compositor::reconcile_make(int ti, const VideoPlan &pl)
+{
+    Target &t = targets_[ti];
+    t.make_waiting = false;
+    /* A new video, or a source drawing itself again, is attached once the
+     * display can hold its buffers; a refusal stands until the scene is
+     * published again, as for any layer. */
+    std::vector<uint32_t> waiting;
+    for (auto &kv : layers_) {
+        Entry &e = kv.second;
+        if (e.layer->target() != ti || std::string(e.layer->kind()) != "video" || planned(pl.composited, kv.first))
+            continue;
+        VideoLayer *v = static_cast<VideoLayer *>(e.layer.get());
+        const bool moved = v->source() || !e.placed;
+        if (v->source()) {
+            v->direct();
+            t.members_ms = now_ms_;
+        }
+        if (moved && t.graph && !v->attached()) {
+            if (may_make_video(ti)) {
+                attach(e, t);
+            } else {
+                waiting.push_back(kv.first);
+                t.make_waiting = true;
+            }
+        }
+    }
+    for (auto &kv : layers_)
+        if (kv.second.layer->target() == ti && !planned(waiting, kv.first))
+            kv.second.placed = true;
+    if (pl.composited.empty())
+        return;
+    CompositeVideo *c = t.composite.get();
+    if (!c) {
+        std::string err;
+        if (!view_effects(&err))
+            log_error("composite on %s: %s", slots_->targets()[ti].name.c_str(), err.c_str());
+        t.composite.reset(new CompositeVideo(ti, pacer_for(ti), atlas_view_fx_, block_view_fx_, pl.vp, pl.x, pl.y,
+                                             pl.clip, now_ms_));
+        t.composite_bytes = pl.bytes;
+        t.composite_made_ms = now_ms_;
+        t.composite->set_fade(t.applied);
+        c = t.composite.get();
+        log_info("target %s: %zu videos composed into one %ux%u at %d,%d", slots_->targets()[ti].name.c_str(),
+                 pl.composited.size(), pl.vp.w, pl.vp.h, pl.x, pl.y);
+    }
+    for (uint32_t id : pl.composited) {
+        if (c->has(id))
+            continue;
+        Entry &e = layers_[id];
+        c->add(id, static_cast<VideoLayer *>(e.layer.get()));
+        e.composited = true;
+        t.dirty = t.dirty || c->attached();
+    }
+    if (t.graph && !c->attached()) {
+        if (may_make_video(ti))
+            attach_composite(t);
+        else
+            t.make_waiting = true;
+    }
+}
+
+uint32_t Compositor::video_buffers(int ti) const
+{
+    const Target &t = targets_[ti];
+    uint32_t n = t.composite && t.composite->attached() ? 1 : 0;
+    for (const auto &kv : layers_)
+        n += kv.second.layer->target() == ti && !kv.second.composited &&
+             std::string(kv.second.layer->kind()) == "video" && kv.second.layer->attached();
+    return n;
+}
+
+uint32_t Compositor::video_hold(int ti, uint32_t pending) const
+{
+    /* A scene kept through a lock holds its flushed buffers on the display. */
+    const bool flushes = targets_[ti].graph && (slots_->flushing(ti) || slots_->kept(ti));
+    return flushes ? std::max(targets_[ti].flushed_videos, pending) : pending;
+}
+
+bool Compositor::may_make_video(int ti) const
+{
+    uint32_t n = 0;
+    for (size_t i = 0; i < targets_.size(); i++)
+        n += video_hold((int)i, video_buffers((int)i) + ((int)i == ti ? 1 : 0));
+    return n <= limits_.videos;
+}
+
+}  // namespace crs

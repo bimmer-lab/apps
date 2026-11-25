@@ -1,0 +1,289 @@
+{
+  "id": "waze-on-cluster",
+  "kind": "tool",
+  "version": "0.14.15",
+  "title": "Maps on cluster",
+  "description": "Runs the cluster map in the background. It is installed with the Maps on cluster app, which you use to control it.",
+  "files": [
+    {
+      "path": "waze-on-cluster",
+      "mode": "0755",
+      "from": "files/waze-on-cluster"
+    },
+    {
+      "path": "waze-on-cluster.conf",
+      "mode": "0644",
+      "from": "files/waze-on-cluster.conf"
+    },
+    {
+      "path": "carplay_patch.js",
+      "mode": "0644",
+      "from": "files/carplay_patch.js"
+    },
+    {
+      "path": "carplay_locate.js",
+      "mode": "0644",
+      "from": "files/carplay_locate.js"
+    },
+    {
+      "path": "aapd_patch.js",
+      "mode": "0644",
+      "from": "files/aapd_patch.js"
+    },
+    {
+      "path": "aapd_locate.js",
+      "mode": "0644",
+      "from": "files/aapd_locate.js"
+    },
+    {
+      "path": "x86_flow.js",
+      "mode": "0644",
+      "from": "files/x86_flow.js"
+    },
+    {
+      "path": "aapd_conf.js",
+      "mode": "0644",
+      "from": "files/aapd_conf.js"
+    },
+    {
+      "path": "patchd.js",
+      "mode": "0644",
+      "from": "files/patchd.js"
+    },
+    {
+      "path": "recovery.js",
+      "mode": "0644",
+      "from": "files/recovery.js"
+    },
+    {
+      "path": "inmem.js",
+      "mode": "0644",
+      "from": "files/inmem.js"
+    },
+    {
+      "path": "libwocpatch.so",
+      "mode": "0644",
+      "from": "files/libwocpatch.so"
+    },
+    {
+      "path": "patch_record.js",
+      "mode": "0644",
+      "from": "files/patch_record.js"
+    },
+    {
+      "path": "file_mode.js",
+      "mode": "0644",
+      "from": "files/file_mode.js"
+    },
+    {
+      "path": "remount_lock.js",
+      "mode": "0644",
+      "from": "files/remount_lock.js"
+    },
+    {
+      "path": "recmgr_list.js",
+      "mode": "0644",
+      "from": "files/recmgr_list.js"
+    },
+    {
+      "path": "head_unit.js",
+      "mode": "0644",
+      "from": "files/head_unit.js"
+    },
+    {
+      "path": "boot_id.js",
+      "mode": "0644",
+      "from": "files/boot_id.js"
+    },
+    {
+      "path": "shutdown_mark.sh",
+      "mode": "0755",
+      "from": "files/shutdown_mark.sh"
+    },
+    {
+      "path": "woc-patch.sh",
+      "mode": "0755",
+      "from": "files/woc-patch.sh"
+    },
+    {
+      "path": "dlt_capture.js",
+      "mode": "0644",
+      "from": "files/dlt_capture.js"
+    },
+    {
+      "path": "journal_keep.js",
+      "mode": "0644",
+      "from": "files/journal_keep.js"
+    },
+    {
+      "path": "logs.js",
+      "mode": "0644",
+      "from": "files/logs.js"
+    },
+    {
+      "path": "logs_fw.js",
+      "mode": "0644",
+      "from": "files/logs_fw.js"
+    },
+    {
+      "path": "logs_extra.js",
+      "mode": "0644",
+      "from": "files/logs_extra.js"
+    },
+    {
+      "path": "wifi_band.js",
+      "mode": "0644",
+      "from": "files/wifi_band.js"
+    },
+    {
+      "path": "group_dir.js",
+      "mode": "0644",
+      "from": "files/group_dir.js"
+    },
+    {
+      "path": "collect-logs.sh",
+      "mode": "0755",
+      "from": "files/collect-logs.sh"
+    },
+    {
+      "path": "LICENSE",
+      "mode": "0644",
+      "from": "files/LICENSE"
+    }
+  ],
+  "units": [
+    {
+      "name": "waze-on-cluster.socket",
+      "from": "units/waze-on-cluster.socket"
+    },
+    {
+      "name": "waze-on-cluster.service",
+      "from": "units/waze-on-cluster.service"
+    },
+    {
+      "name": "waze-on-cluster-patchd.service",
+      "from": "units/waze-on-cluster-patchd.service"
+    },
+    {
+      "name": "waze-on-cluster-boot.service",
+      "runsInSafeMode": true,
+      "from": "units/waze-on-cluster-boot.service"
+    },
+    {
+      "name": "waze-on-cluster-aa-boot.service",
+      "runsInSafeMode": true,
+      "from": "units/waze-on-cluster-aa-boot.service"
+    },
+    {
+      "name": "waze-on-cluster-recovery.service",
+      "runsInSafeMode": true,
+      "from": "units/waze-on-cluster-recovery.service"
+    },
+    {
+      "name": "waze-on-cluster-journal.service",
+      "from": "units/waze-on-cluster-journal.service"
+    },
+    {
+      "name": "waze-on-cluster-journal.timer",
+      "from": "units/waze-on-cluster-journal.timer"
+    },
+    {
+      "name": "waze-on-cluster-logs.socket",
+      "from": "units/waze-on-cluster-logs.socket"
+    },
+    {
+      "name": "waze-on-cluster-logs.service",
+      "from": "units/waze-on-cluster-logs.service"
+    },
+    {
+      "name": "waze-on-cluster-logs-fw.service",
+      "from": "units/waze-on-cluster-logs-fw.service"
+    }
+  ],
+  "enable": [
+    {
+      "unit": "waze-on-cluster.socket",
+      "target": "sockets.target"
+    },
+    {
+      "unit": "waze-on-cluster.service",
+      "target": "multi-user.target"
+    },
+    {
+      "unit": "waze-on-cluster-patchd.service",
+      "target": "multi-user.target"
+    },
+    {
+      "unit": "waze-on-cluster-boot.service",
+      "target": "multi-user.target"
+    },
+    {
+      "unit": "waze-on-cluster-aa-boot.service",
+      "target": "multi-user.target"
+    },
+    {
+      "unit": "waze-on-cluster-recovery.service",
+      "target": "multi-user.target"
+    },
+    {
+      "unit": "waze-on-cluster-journal.timer",
+      "target": "timers.target"
+    },
+    {
+      "unit": "waze-on-cluster-logs.socket",
+      "target": "sockets.target"
+    }
+  ],
+  "recmgr": [
+    "carplay",
+    "aapd",
+    "waze-on-cluster",
+    "waze-on-cluster-patchd",
+    "waze-on-cluster-boot",
+    "waze-on-cluster-aa-boot",
+    "waze-on-cluster-recovery",
+    "waze-on-cluster-capture",
+    "waze-on-cluster-journal",
+    "waze-on-cluster-logs",
+    "waze-on-cluster-logs-fw"
+  ],
+  "restart": [
+    "waze-on-cluster.service",
+    "waze-on-cluster-patchd.service",
+    "waze-on-cluster-recovery.service",
+    "waze-on-cluster-journal.service"
+  ],
+  "dropins": [
+    {
+      "unit": "var-opt-ro.service",
+      "name": "50-waze-on-cluster.conf",
+      "from": "dropins/var-opt-ro.service.d/50-waze-on-cluster.conf"
+    },
+    {
+      "unit": "carplay.service",
+      "name": "50-waze-on-cluster.conf",
+      "from": "dropins/carplay.service.d/50-waze-on-cluster.conf"
+    },
+    {
+      "unit": "aapd.service",
+      "name": "50-waze-on-cluster.conf",
+      "from": "dropins/aapd.service.d/50-waze-on-cluster.conf"
+    }
+  ],
+  "mguHmi": [
+    "ID7"
+  ],
+  "crashNames": [
+    "aapd"
+  ],
+  "activate": [
+    "node",
+    "patchd.js",
+    "activate"
+  ],
+  "deactivate": [
+    "node",
+    "patchd.js",
+    "deactivate"
+  ]
+}

@@ -1,0 +1,54 @@
+{
+  "id": "mgu-render-id7-touch",
+  "kind": "tool",
+  "version": "1.4.0",
+  "title": "Full-width touch",
+  "description": "Lets full-screen apps (RideTube, Moonride) use the screen's left edge: both renderers get the whole screen as their touch area, so a tap on the strip where the back arrow usually is reaches the app instead of closing it. Leave such an app with the BACK or MENU button. Other apps keep the back arrow. Removing it takes effect at the next start of the head unit.",
+  "files": [
+    {
+      "path": "touch-guard.sh",
+      "mode": "0755",
+      "from": "files/touch-guard.sh"
+    },
+    {
+      "path": "renderd-touch.sh",
+      "mode": "0755",
+      "from": "files/renderd-touch.sh"
+    },
+    {
+      "path": "apply.sh",
+      "mode": "0755",
+      "from": "files/apply.sh"
+    },
+    {
+      "path": "deactivate.sh",
+      "mode": "0755",
+      "from": "files/deactivate.sh"
+    }
+  ],
+  "units": [],
+  "enable": [],
+  "recmgr": [],
+  "restart": [],
+  "dropins": [
+    {
+      "unit": "mgu-render.service",
+      "name": "mgu-render-id7-touch.conf",
+      "from": "dropins/mgu-render.service.d/mgu-render-id7-touch.conf"
+    },
+    {
+      "unit": "idrive7-renderd.service",
+      "name": "mgu-render-id7-touch.conf",
+      "from": "dropins/idrive7-renderd.service.d/mgu-render-id7-touch.conf"
+    }
+  ],
+  "mguHmi": [
+    "ID7"
+  ],
+  "activate": [
+    "apply.sh"
+  ],
+  "deactivate": [
+    "deactivate.sh"
+  ]
+}

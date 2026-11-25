@@ -293,6 +293,26 @@ def build_ui(spec, language='en'):
         ui['containers'][str(cid)] = cont
         if main_id is None:
             main_id = cid
+    # (from JustAnotherPU/mgu-apps' kit, MIT) optional pop-ups (app.json "popups"): a container of the pop-up type with one dynamic text label,
+    # <name>_TEXT, and an optional button, <name>_OK; stackConsumer="false" as BMW's x_call does, so the
+    # pop-up never joins the HMI's screen stack (the app's own screen visibility stays as it was)
+    for pop in spec.get('popups', []):
+        cid = nid()
+        state_ids[pop['name']] = cid
+        lid, lx, lc = comp(pop.get('label', 'text3'), pop['name'] + '_TEXT', rows=[{'Text': {'value': '', 'type': 'Text'}}])
+        cx_all, comps = lx, {str(lid): lc}
+        if pop.get('button'):   # x_call's button: visible, focusable 3, enabled
+            bid, bx, bc = comp('button', pop['name'] + '_OK', rows=[text_row(pop['name'] + '_OK', pop['button'])], extra_props={3: 3, 1: 1})
+            cx_all, comps[str(bid)] = cx_all + bx, bc
+        # every BMW pop-up gives its label and button a focusId (the HMI puts the focus there); without one the
+        # HMI closed ours again at once. Ours: 0x7000 + the component id, clear of BMW's 2xxxx range
+        cx_all = [l.replace('" widget=', f'" focusId="{28672 + int(l.split(chr(34))[1])}" widget=', 1) if '<component id=' in l else l for l in cx_all]
+        gid, tgid, tid = nid(), nid(), nid()
+        comps[str(tid)] = {'type': 'title', 'name': pop['name'] + '_TITLE', 'rows': [text_row(pop['name'] + '_TITLE', pop.get('title', spec['title']))]}
+        xml += [f'    <container id="{cid}" type="{pop["type"]}" widget="{pop["widget"]}" stackConsumer="false">',
+                f'        <layoutGroup id="{gid}" name="List">', '            <property id="3" value="1"/>'] + cx_all + ['        </layoutGroup>',
+                f'        <layoutGroup id="{tgid}" name="Titlebar">', f'            <component id="{tid}" type="title"/>', '        </layoutGroup>', '    </container>']
+        ui['containers'][str(cid)] = {'type': pop['type'], 'name': pop['name'], 'components': comps}
     xml.append('</application>')
     return '\n'.join(xml) + '\n', ui, strings, state_ids
 
@@ -533,10 +553,19 @@ def build(app_id, language='en'):
             'userLoginRequired': False, 'backgroundPriority': 200, 'someipManifest': 'manifest.json',
         },
     }
-    # app.json "autostart": the platform starts the app by itself (the Store's deploy tool lists it so); its
-    # impl.background runs then, without screens (from the upstream MGU App Kit)
-    if spec.get('autostart'):
-        pkg['mguAppStartType'] = 'autostart'
+    # app.json "autostart": true (upstream MGU App Kit), or "startType" (autostart, lum or manually):
+    # package.json "mguAppStartType", which the Store's deploy tool lists for MainApp; impl.background runs
+    # then, without screens. "manually" (the default) waits for a tap on its tile.
+    start = spec.get('startType')
+    if start is None and spec.get('autostart'):
+        start = 'autostart'
+    # app.json "mguInternet": true: the app gets the internet through the Store's mgu-uplink (mgu-store PUBLISHING.md)
+    if spec.get('mguInternet') is True:
+        pkg['mguInternet'] = True
+    if start is not None:
+        if start not in ('autostart', 'lum', 'manually'):
+            sys.exit('app.json "startType" must be autostart, lum or manually, not ' + repr(start))
+        pkg['mguAppStartType'] = start
     json.dump(pkg, open(os.path.join(src, 'package.json'), 'w', encoding='utf-8', newline='\n'), indent=2)
     json.dump(manifest, open(os.path.join(src, 'manifest.json'), 'w', encoding='utf-8', newline='\n'), indent=2)
     shutil.copy(os.path.join(KIT, 'platform', 'permissions.json'), os.path.join(src, 'permissions.json'))
@@ -564,6 +593,10 @@ def build(app_id, language='en'):
         elif f.endswith(('.wasm', '.wad')) or f in ('LICENSE', 'NOTICE'):
             # files the app reads as they are (doom: the game as WebAssembly, its data, its licences)
             shutil.copy(os.path.join(adir, f), os.path.join(src, 'javascript', f))
+        elif f == 'voces' and os.path.isdir(os.path.join(adir, f)):
+            # 46Wen: sound files the head unit's media player opens by path (Copiloto de voz): as they are, not packed
+            shutil.copytree(os.path.join(adir, f), os.path.join(src, 'javascript', f),
+                            ignore=lambda d, names: [n for n in names if not os.path.isdir(os.path.join(d, n)) and not n.lower().endswith(('.m4a', '.mp3', '.aac', '.wav'))])
         elif os.path.isdir(os.path.join(adir, f)):
             # data folders go along as one compressed file, read with kit/runtime/pack.js
             # (e.g. dtc_scanner/dtc_db, the fault text database -> dtc_db.pack)
@@ -589,6 +622,12 @@ def build(app_id, language='en'):
             shutil.copytree(p, os.path.join(src, 'javascript', 'kit', f))
         else:
             shutil.copy(p, os.path.join(src, 'javascript', 'kit', f))
+    if spec.get('fonts') == 'es':
+        # 46Wen: app.json "fonts": "es" - the Latin atlases with the Spanish letters (á é í ó ú ñ ¿ ¡), from
+        # cauliflowermossgrape/idrive7-apps (kit/localization/fonts/es, MIT); their own cacheKey keeps them apart
+        # from the English atlases in the shared renderer
+        for name in ('label.json', 'bold.json', 'light.json', 'num.json'):
+            shutil.copy(os.path.join(KIT, 'localization', 'fonts', 'es', name), os.path.join(src, 'javascript', 'kit', 'fonts', name))
     if missing:
         # what fit_to_unit took out: the app logs it at each start (kit/runtime/mgu.js)
         json.dump(missing, open(os.path.join(src, 'javascript', 'kit', 'missing-interfaces.json'), 'w', encoding='utf-8', newline='\n'), indent=1)
@@ -613,7 +652,7 @@ def build(app_id, language='en'):
             body = file.read()
         with open(entry, 'wb') as file:
             file.write(comment.encode('utf-8') + body)
-    rt_spec = {k: spec.get(k) for k in ('id', 'title', 'version', 'screens', 'settings', 'config', 'startWidget')}
+    rt_spec = {k: spec.get(k) for k in ('id', 'title', 'version', 'screens', 'popups', 'settings', 'config', 'startWidget')}
     rt_spec['stateIds'] = state_ids
     json.dump(rt_spec, open(os.path.join(src, 'javascript', 'kit', 'app-spec.json'), 'w', encoding='utf-8', newline='\n'), indent=1)
     locale = {'language': language, 'strings': load_locale(language)}
@@ -639,6 +678,10 @@ def build(app_id, language='en'):
             }],
         },
     }
+    # app.json "hidden": true - no tile in the apps menu (an app that only works in the background, as BMW's own
+    # start widgets have no entry point either): autostart runs its background() at every start
+    if spec.get('hidden') is True:
+        app_json['application']['entryPoints'] = []
     pr = os.path.join(src, 'rhmiData')
     os.makedirs(os.path.join(pr, 'uiDescriptions', 'ID7'))
     os.makedirs(os.path.join(pr, 'variantGroups', 'Common', 'texts'))
