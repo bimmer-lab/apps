@@ -8,6 +8,8 @@
  *   node bench/fake-waze.js bench/.data/waze [--state showing|idle] [--target map|panel] [--busy N]
  *   kill -USR1 <pid>   flips the state between showing and idle (the phone's map coming and going)
  *   then run the bench with WAZE_STATUS=<dir>/status.json WAZE_CTL=<dir>/ctl.sock
+ * Hosting (waze-on-cluster 0.14.5): with BENCH_HOST_LAYERS=1 the bench writes <dir>/hosted (1 or 0) as cluster-render's
+ * "host" event says, and the status says "hosted": 1 while it is 1, as the real tool does once its map is in a theme.
  * Bench only; never on the car.
  */
 const fs = require('fs');
@@ -24,8 +26,13 @@ fs.mkdirSync(dir, { recursive: true });
 const sockPath = path.join(dir, 'ctl.sock'), statusPath = path.join(dir, 'status.json');
 try { fs.unlinkSync(sockPath); } catch (e) { /* none */ }
 
+function hosted() { try { return fs.readFileSync(path.join(dir, 'hosted'), 'utf8').trim() === '1'; } catch (e) { return false; } }
+let wasHosted = false;
 function writeStatus() {
     const s = { state, target, page: state === 'showing' ? 'Waze map, 15 frames/s' : null, reason: state === 'idle' ? 'Waiting for the phone\'s map' : null };
+    const h = hosted();
+    if (h) s.hosted = 1;
+    if (h !== wasHosted) { wasHosted = h; log(h ? 'map hosted (status "hosted": 1)' : 'map on its own slot'); }
     fs.writeFileSync(statusPath + '.tmp', JSON.stringify(s) + '\n', { mode: 0o644 });
     fs.renameSync(statusPath + '.tmp', statusPath);
 }

@@ -47,7 +47,7 @@
       "id": "clock",
       "type": "text",
       "z": 10,
-      "x": 508,
+      "x": 498,
       "y": 152,
       "w": 120,
       "h": 27,
@@ -66,9 +66,9 @@
       "id": "ampm",
       "type": "text",
       "z": 10,
-      "x": 634,
+      "x": 624,
       "y": 158,
-      "w": 36,
+      "w": 48,
       "h": 20,
       "text": "{{slotUnit:1}}",
       "font": "label",
@@ -92,7 +92,8 @@
       "align": "right",
       "spacing": 1.5,
       "toggle": "showOil",
-      "class": "content"
+      "class": "content",
+      "showWhen": "abnormal"
     },
     {
       "id": "oil",
@@ -111,6 +112,34 @@
       "fit": [
         "label"
       ],
+      "class": "overlay",
+      "showWhen": "abnormal"
+    },
+    {
+      "id": "nav",
+      "type": "nav",
+      "x": 470,
+      "y": 232,
+      "w": 200,
+      "h": 76,
+      "toggle": "!navDirections=off",
+      "class": "overlay",
+      "z": 20
+    },
+    {
+      "id": "greeting",
+      "type": "text",
+      "z": 10,
+      "x": 300,
+      "y": 155,
+      "w": 200,
+      "h": 20,
+      "text": "{{greeting}}",
+      "font": "label",
+      "color": "greet",
+      "align": "center",
+      "spacing": 1,
+      "navHide": true,
       "class": "overlay"
     }
   ]

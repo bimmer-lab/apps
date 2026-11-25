@@ -1171,6 +1171,8 @@ up	升挡
 down	降挡
 skip	跳挡降挡
 m ago	分钟前
+
+# Cluster Themes translations on current upstream
 Cluster Themes	仪表主题
 Theme (when not by drive mode)	主题（未按驾驶模式切换时）
 Off (BMW's own cluster)	关闭（宝马原厂仪表）
@@ -1189,7 +1191,7 @@ Change with SPORT / COMFORT / ECO PRO	随驾驶模式切换
 In Comfort	舒适模式
 In Sport	运动模式
 In Eco Pro	节能模式
-Show Waze map inside the theme	在主题中显示 Waze 地图
+Show Waze map inside the theme	在主题内显示 Waze 地图
 Clock	时钟
 12-hour	12 小时制
 24-hour	24 小时制
@@ -1240,8 +1242,8 @@ None of these themes has readout slots.	这些主题没有可配置的读数位�
 Slot	读数位
 pick a sensor	选择传感器
 Navigation map on the cluster	仪表导航地图
-Waze map · on	Waze 地图 · 已开启
-Waze map · off	Waze 地图 · 已关闭
+Waze map · on	Waze 地图 · 开启
+Waze map · off	Waze 地图 · 关闭
 Not available in this app	此应用不支持
 This theme has no map version (GT3, Sport and M do)	此主题不支持地图（GT3、运动和 M 主题支持）
 Waze on Cluster isn't running	Waze on Cluster 尚未运行
@@ -1327,3 +1329,9 @@ Turn HUD off	关闭 HUD
 has the screen	正在占用显示
 pick one to take it back	选择主题以切回
 DEMO DATA	演示数据
+This theme has no map version (GT3, Sport, M, M view and Vector do)	此主题没有地图版；GT3、运动、M、M View 和 Vector 支持
+On: GT3, Sport, M, M view and Vector open a window in the middle and Waze's map shows in it,	开启时，兼容的仪表主题会在中间打开窗口显示 Waze 地图，
+above BMW's own map view, so nothing shows twice. When the map goes away the theme fills back in.	覆盖原车地图区域，避免重复显示。地图关闭后恢复完整主题。
+Needs robertnisipeanu's Waze on Cluster 0.14.5 or newer with cluster-render 0.8.2 or newer.	需要 Waze on Cluster 0.14.5 及 cluster-render 0.8.2 或更新版本。
+Turning this off gives Waze its usual place back.	关闭后，Waze 地图恢复原来的显示位置。
+Boost gauge max	增压表最大值

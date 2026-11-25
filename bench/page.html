@@ -210,6 +210,7 @@
   let view = 'hud', VW = 800, VH = 480;
   // what the driver sees, from the server's hello (shared/visible.js, measured from car photos Nov 5 2026)
   let geo = null;
+  let settingVals = {};            // the app's settings as last sent (the car view's camera notch follows one)
   function hoodY(x) {
     const H = geo.HOOD;
     if (x <= H[0][0]) return H[0][1];
@@ -235,16 +236,19 @@
       ctx.lineTo(VW, hoodY(VW));
       ctx.strokeStyle = '#ff8c1a'; ctx.lineWidth = 1.5; ctx.stroke();
       labelBox('hood (hidden above the line)', 150, 60, '#ff8c1a');   // inside the masked corner (hoodY(150) is 111)
-      // BMW's gear box: solid black, as the car paints it over us
-      const [bx0, by0, bx1, by1] = geo.BLACK_BOX;
-      ctx.fillStyle = '#000'; ctx.fillRect(bx0, by0, bx1 - bx0, by1 - by0);
-      ctx.strokeStyle = '#ff8c1a'; ctx.lineWidth = 1; ctx.strokeRect(bx0 + .5, by0 + .5, bx1 - bx0 - 1, by1 - by0 - 1);
-      labelBox('BMW gear box', bx0 + 2, by0 + 2, '#ff8c1a');
       // the seat-belt warning light
       const [sx0, sy0, sx1, sy1] = geo.BELT;
       ctx.fillStyle = 'rgba(232,55,44,.55)'; ctx.fillRect(sx0, sy0, sx1 - sx0, sy1 - sy0);
       ctx.strokeStyle = '#ff8c1a'; ctx.strokeRect(sx0 + .5, sy0 + .5, sx1 - sx0 - 1, sy1 - sy0 - 1);
       labelBox('belt light', sx0 - 10, sy0 - 18, '#ff8c1a');
+      // the driver camera on newer cars (where the model badge sits on cars without it): solid while the app's
+      // "Leave room for the driver camera" is on, so the bench shows what those drivers see; else only outlined
+      if (geo.CAMERA) {
+        const [cx0, cy0, cx1, cy1] = geo.CAMERA;
+        if (settingVals.cameraNotch === true) { ctx.fillStyle = '#000'; ctx.fillRect(cx0, cy0, cx1 - cx0, cy1 - cy0); }
+        ctx.setLineDash([5, 4]); ctx.strokeStyle = '#ff8c1a'; ctx.strokeRect(cx0 + .5, cy0 + .5, cx1 - cx0 - 1, cy1 - cy0 - 1); ctx.setLineDash([]);
+        labelBox('driver camera (newer cars)', cx0 + 4, cy1 + 4, '#ff8c1a');
+      }
     } else if (view === 'hud') {
       // only the window is visible through the windshield; mask the rest
       const w = geo.HUD_WINDOW;
@@ -285,16 +289,16 @@
     ctx.fillStyle = 'rgba(255,255,255,.55)'; ctx.font = '28px sans-serif'; ctx.fillText('map window', 860, 370);
     [[210, 1], [1710, -1]].forEach(([cx, side]) => {
       ctx.strokeStyle = '#c9ced6'; ctx.lineWidth = 6; ctx.beginPath();
-      ctx.moveTo(cx - 120 * side, 60); ctx.lineTo(cx + 60 * side, 60); ctx.lineTo(cx + 150 * side, 360); ctx.lineTo(cx + 60 * side, 660); ctx.lineTo(cx - 120 * side, 660); ctx.stroke();
+      ctx.moveTo(cx - 120 * side, 60); ctx.lineTo(cx + 60 * side, 60); ctx.lineTo(cx + 150 * side, 360); ctx.lineTo(cx + 60 * side, 640); ctx.lineTo(cx - 120 * side, 640); ctx.stroke();
       ctx.strokeStyle = '#e8372c'; ctx.lineWidth = 18; ctx.beginPath(); ctx.moveTo(cx + 100 * side, 200); ctx.lineTo(cx + 140 * side, 340); ctx.stroke();
     });
     ctx.fillStyle = '#f2c94c'; ctx.beginPath(); ctx.arc(70, 640, 14, 0, 7); ctx.fill();
     ctx.fillStyle = '#e8372c'; ctx.beginPath(); ctx.arc(1850, 640, 14, 0, 7); ctx.fill();
-    ctx.fillStyle = 'rgba(255,255,255,.55)'; ctx.font = '20px sans-serif'; ctx.fillText('warning lights', 20, 700); ctx.fillText('warning lights', 1770, 700);
-    // BMW's gear slot: a solid black box the car paints over everything (measured Nov 5 2026)
-    const box = geo ? geo.BLACK_BOX : [1406, 342, 1597, 419];
-    ctx.fillStyle = '#000'; ctx.fillRect(box[0], box[1], box[2] - box[0], box[3] - box[1]);
-    ctx.fillStyle = 'rgba(255,255,255,.55)'; ctx.font = '24px sans-serif'; ctx.fillText('D 7', box[0] + 60, box[1] + 50);
+    ctx.fillStyle = 'rgba(255,255,255,.55)'; ctx.font = '20px sans-serif'; ctx.fillText('warning lights', 20, 615); ctx.fillText('warning lights', 1770, 615);
+    // BMW's own bottom strip (y ~662..720; car photo Nov 13 2026 with "Leave BMW's bottom strip clear" on): range, clock,
+    // the street, the drive mode, the gear letter, outside temperature. It sits UNDER our layers: a theme drawn over it hides it.
+    ctx.fillStyle = 'rgba(235,238,242,.8)'; ctx.font = '30px sans-serif';
+    [['138 mi', 180], ['4:24 pm', 355], ['Main St', 860], ['COMFORT', 1180], ['P', 1372], ['+54 \u00b0F', 1475]].forEach(([t, x]) => ctx.fillText(t, x, 700));
   }
 
   // ?clean=1: no outlines, for screenshots
@@ -478,6 +482,7 @@
   });
   document.getElementById('mManual').onclick = () => setMode('manual');
   function renderSettings(m) {
+    settingVals = m.values || {}; dirty = true;
     const box = document.getElementById('settings');
     box.innerHTML = '';
     m.schema.forEach((s) => {

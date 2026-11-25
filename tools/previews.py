@@ -28,7 +28,9 @@ CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
 SKIP = {'off', 'grid', 'mapcal', 'wincal'}           # calibration layouts get no picture
 # the values every picture shows: 3rd gear at 4200 rpm, 61 mph, warm engine, a little boost, braking into a left turn
 SIGNALS = {'rpm': 4200, 'speed': 98, 'gear': 3, 'oil': 95, 'coolant': 90, 'boost': 1.1, 'torque': 290,
-           'fuelL': 38, 'range': 310, 'ambient': 18, 'tyreP': 2.4, 'tyreT': 30, 'gLat': 0.42, 'gLong': -0.3}
+           'fuelL': 38, 'range': 310, 'ambient': 18, 'tyreP': 2.4, 'tyreT': 30, 'gLat': 0.42, 'gLong': -0.3,
+           # a made-up song for the Vector layouts' music panel (the bench feeds it as the head unit's now playing)
+           'mediaTitle': 'Demo Song', 'mediaArtist': 'Artist Name', 'mediaElapsed': 83, 'mediaTotal': 250}
 # picture sizes in device px (the page is drawn at logical px and scaled about 1.165 on the car's screen)
 SIZES = {
     'panel': {'src': (1920, 720), 'crop': (0, 0, 1920, 720), 'big': (888, 333), 'small': (280, 105)},

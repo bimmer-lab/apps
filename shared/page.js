@@ -37,6 +37,9 @@ const RAIL = { x: 16, y: 54, w: 252, h: 66, gap: 8 };
 const RAIL7 = { x: 16, y: 54, w: 252, h: 58, gap: 6 };     // seven tabs or more: a little shorter, so they fit
 const CX = 300, CR = 1584, CW = CR - CX;
 const MODES = [['inComfort', 'Comfort'], ['inSport', 'Sport'], ['inEco', 'Eco Pro']];
+// a plug-in hybrid's own (Cluster Themes; shown once the car has sent a plug-in hybrid mode, or one is set)
+const PHEV_MODES = [['inHybrid', 'Hybrid'], ['inElectric', 'Electric']];
+const PHEV_KEY = { hybrid: 'inHybrid', electric: 'inElectric' };
 const MODE_KEY = { comfort: 'inComfort', sport: 'inSport', eco: 'inEco' };
 const TAB = {
     look: { icon: 'screen' },
@@ -85,12 +88,22 @@ class Page {
         return o ? o[1] : String(v);
     }
     /** a layout's short name: "Off (BMW's own cluster)" -> "BMW's own" */
-    layoutName(v) { return v === 'off' ? "BMW's own" : this.optLabel('hudLayout', v); }
+    layoutName(v) { return v === 'off' ? "BMW's own" : v === 'same' ? 'Same' : this.optLabel('hudLayout', v); }
+    /** The drive mode cells: Comfort, Sport, Eco Pro, and Hybrid / Electric on a plug-in hybrid (Cluster Themes). */
+    modes() {
+        const phev = this.item('inHybrid') && (this.hud.phevSeen || this.get('inHybrid') !== 'same' || this.get('inElectric') !== 'same');
+        return phev ? MODES.concat(PHEV_MODES) : MODES;
+    }
+    /** The key of the cell the car is in now: Hybrid / Electric when that has its own theme, else the drive mode's. */
+    nowKey() {
+        const pk = PHEV_KEY[this.hud.drivePhev];
+        return pk && this.item(pk) && this.get(pk) !== 'same' ? pk : MODE_KEY[this.hud.driveMode];
+    }
     valueText(k) {
         const s = this.item(k), v = this.get(k);
         if (!s) return '';
         if (s.type === 'bool') return v ? 'On' : 'Off';
-        if (s.type === 'number' && WARN_KEYS.indexOf(k) >= 0) return warnText(k, v, this.get('units') === 'us');
+        if (s.type === 'number' && WARN_KEYS.indexOf(k) >= 0) return warnText(k, v, sensors.imperial((x) => this.get(x), k === 'warnBoost' ? 'pressure' : 'temp'));
         if (k === 'timeZone') return tzText(v);
         if (k === 'tankLitres') return fmtInt(v) + ' L';
         if (s.type === 'number') return k === 'shiftBefore' ? (v ? fmtInt(v) + ' rpm before' : 'At the redline') : fmtInt(v) + ' rpm';
@@ -131,8 +144,8 @@ class Page {
 
     /** the key a tap on a theme sets: the drive mode's own while it changes with the drive mode */
     lookKey() {
-        const m = this.hud.driveMode;
-        return this.get('byMode') === true && MODE_KEY[m] ? MODE_KEY[m] : 'hudLayout';
+        const k = this.nowKey();
+        return this.get('byMode') === true && k ? k : 'hudLayout';
     }
 
     /* ---------- drawing ---------- */
@@ -143,9 +156,9 @@ class Page {
         cv.clear(C.bg);
         cv.gradientRect(0, 0, W, h, [[0, C.glow], [0.55, '#070a10'], [1, C.bg]]);
         const on = this.hud.activeName && this.hud.activeName !== 'off';
-        const demo = this.hud.car && this.hud.car.data().demo;
+        const dd = this.hud.car && this.hud.car.data(), demo = dd && dd.demo;
         G.frame(cv, this.theme(), [], -1, [
-            demo ? { text: 'DEMO DATA', color: '#ffb020' } : null,
+            demo ? { text: dd.demoShow ? 'DEMO' : 'DEMO DATA', color: '#ffb020' } : null,
             { text: on ? 'ON THE ' + this.cfg.what.toUpperCase() : this.cfg.what.toUpperCase() + ' OFF', color: on ? '#3ddc84' : C.dim },
         ]);
         // the page under an open list takes no taps: the list (and a tap beside it to close) does
@@ -154,12 +167,37 @@ class Page {
         this.rail(cv, bottom);
         const body = { look: this.lookTab, readouts: this.readoutsTab, position: this.positionTab, map: this.mapTab, colours: this.coloursTab, badge: this.badgeTab, alerts: this.alertsTab, gmeter: this.gmeterTab, settings: this.settingsTab }[this.tab];
         if (body) body.call(this, cv, bottom);
+        this.demoButton(cv);
         cv.target = target;
         if (this.picker) this.drawPicker(cv, bottom);
         if (this.confirm) this.drawConfirm(cv, bottom);
         return this.ctx.ui.image('MAIN_GFX', cv);
     }
     theme() { return this.ctx.theme(); }
+
+    /**
+     * "Play demo", top right on every tab: about a minute of a scripted drive on the real HUD / cluster
+     * (hud.playDemo, demo_script.js), only while the car stands; "Stop demo" while it plays.
+     */
+    demoButton(cv) {
+        const hud = this.hud;
+        if (!hud.playDemo) return;
+        const playing = hud.demoPlaying(), why = playing ? null : hud.demoBlocked();
+        const text = playing ? 'Stop demo' : 'Play demo', h = 36, y = 44;
+        const w = cv.textWidth(text, 16, { font: 'bold', literal: true }) + 62, x = CR - w;
+        cv.roundRect(x, y, w, h, h / 2, playing ? '#ffffff14' : why ? '#ffffff12' : C.blue);
+        if (playing) cv.strokeRoundRect(x, y, w, h, h / 2, 1, A(C.blueHi, 0.6));
+        const ic = why ? C.dim : '#ffffff', ix = x + 22, iy = y + h / 2;
+        if (playing) cv.fillRect(ix - 6, iy - 6, 12, 12, ic);
+        else cv.quad([[ix - 5, iy - 8], [ix + 8, iy], [ix + 8, iy], [ix - 5, iy + 8]], ic);
+        cv.text(text, x + 36 + (w - 36) / 2 - 10, y + 24, 16, why ? C.dim : '#ffffff', { align: 'center', font: 'bold', literal: true });
+        const what = this.cfg.what === 'cluster' ? 'cluster' : 'HUD';
+        const info = playing ? 'Playing on the ' + what + ' · ' + Math.ceil(hud.demoLeft() / 1000) + ' s'
+            : why === 'moving' ? 'Stop the car to play the demo' : why === 'off' ? 'Pick a ' + (what === 'HUD' ? 'layout' : 'theme') + ' to play the demo'
+                : why ? 'The ' + what + ' is not drawing yet' : '';
+        if (info) cv.text(info, x - 16, y + 24, 15, playing ? C.blueHi : C.dim, { align: 'right', literal: true });
+        if (!why) cv.target(x, y, w, h, () => { if (hud.demoPlaying()) hud.stopDemo(); else hud.playDemo(); this.kick(); }, 'demo:play', h / 2);
+    }
 
     rail(cv, bottom) {
         cv.fillRect(RAIL.x + RAIL.w + 15, 50, 1, bottom - 56, C.line);
@@ -212,8 +250,9 @@ class Page {
         cv.text(this.yieldNote() || this.tag(shown), rx, py + 58, 17, this.yieldNote() ? '#e0a340' : C.dim, {});
         const y = this.toggleRow(cv, rx, py + 72, rw, 'Change with the drive mode', 'byMode', 46);
         if (this.get('byMode') === true) {
-            const now = MODE_KEY[this.hud.driveMode], cw = (rw - 24) / 3;
-            MODES.forEach((m, i) => this.modeCell(cv, rx + i * (cw + 12), y, cw, m[1] + (m[0] === now ? '  ·  now' : ''), m[0]));
+            // five cells on a plug-in hybrid: narrower, the one the car is in lit instead of "· now"
+            const now = this.nowKey(), modes = this.modes(), cw = (rw - 12 * (modes.length - 1)) / modes.length, five = modes.length > 3;
+            modes.forEach((m, i) => this.modeCell(cv, rx + i * (cw + 12), y, cw, m[1] + (m[0] === now && !five ? '  ·  now' : ''), m[0], five && m[0] === now));
         } else this.pickRow(cv, rx, y, rw, 'Theme', 'hudLayout', (v) => this.layoutName(v), 52);
         // the gallery, two rows: a tap shows that theme (in the drive mode the car is in, when it changes with it)
         const looks = this.looks(), cols = Math.max(5, Math.ceil(looks.length / 2)), gap = 12, gy = py + ph + 16;
@@ -230,11 +269,14 @@ class Page {
     }
 
     /** A drive mode's theme as a small two-line cell (name over value), a tap opens the list. */
-    modeCell(cv, x, y, w, name, key) {
+    modeCell(cv, x, y, w, name, key, lit) {
         const h = 52;
-        glass(cv, x, y, w, h, false);
-        cv.text(name, x + 14, y + 20, 14, C.dim, {});
-        cv.text(this.layoutName(this.get(key)), x + 14, y + 42, 18, C.blueHi, { font: 'bold' });
+        glass(cv, x, y, w, h, !!lit);
+        cv.text(name, x + 14, y + 20, 14, C.dim, { literal: false });
+        // cut to the cell (a narrow one on a plug-in hybrid), leaving room for the chevron
+        let v = this.layoutName(this.get(key));
+        if (cv.textWidth) while (v.length > 3 && cv.textWidth(v, 18, { font: 'bold', literal: false }) > w - 40) v = v.slice(0, -2) + '…';
+        cv.text(v, x + 14, y + 42, 18, C.blueHi, { font: 'bold', literal: false });
         chevron(cv, x + w - 18, y + h / 2, C.dim);
         cv.target(x, y, w, h, () => { this.picker = { key, title: name, fmt: (v) => this.layoutName(v) }; this.kick(); }, 'set:' + key, 14);
     }
@@ -399,16 +441,16 @@ class Page {
         // live state from waze.js: the map showing, waiting, the Waze app busy, Waze on Cluster missing
         const info = this.hud.waze ? this.hud.waze.info() : { text: 'Not available in this app', up: false, ok: false };
         let text = info.text;
-        if (this.get('mapInTheme') && !this.hud.mapLayout && this.hud.activeName !== 'off') text = 'This theme has no map version (GT3, Sport and M do)';
+        if (this.get('mapInTheme') && !this.hud.mapLayout && this.hud.activeName !== 'off') text = 'This theme has no map version (GT3, Sport, M, M view and Vector do)';
         glass(cv, CX, y, w, 46, false);
         cv.circle(CX + 26, y + 23, 7, info.up ? C.live : info.ok ? C.dim : '#e0a340');
         cv.text(text, CX + 46, y + 30, 18, info.up ? C.live : C.text, {});
         y += 54;
         note(cv, CX, y + 26, [
-            'On: GT3, Sport and M open a window in the middle and Waze on Cluster draws its map in it, above',
-            'BMW\'s own map view, so nothing shows twice. When the map goes away the theme fills back in.',
-            'While on, Waze\'s map on the HUD is off (the cluster and the HUD share one picture).',
-            'Needs robertnisipeanu\'s Waze on Cluster. Turning this off gives Waze its usual place back.',
+            'On: GT3, Sport, M, M view and Vector open a window in the middle and Waze\'s map shows in it,',
+            'above BMW\'s own map view, so nothing shows twice. When the map goes away the theme fills back in.',
+            'Needs robertnisipeanu\'s Waze on Cluster 0.14.5 or newer with cluster-render 0.8.2 or newer.',
+            'Turning this off gives Waze its usual place back.',
         ]);
     }
 
@@ -470,6 +512,29 @@ class Page {
             'Runs the rpm up to the shift point for about 4 seconds: the lights fill, go red and flash.',
             'Only while the car stands. Set a limit to 0 (Off) to turn that warning off.',
         ]);
+        this.cueColumn(cv, CX + w + 24, CW - w - 24);
+    }
+    /** Alerts, right column: how the shift lights work (shift_cue.js), temperatures only when they matter (smart_temps.js)
+     *  and, in HUD Widgets, the turn-by-turn directions ("navDirections"; the nav widget, hud.js). */
+    cueColumn(cv, x, w) {
+        let y = 84;
+        if (this.item('shiftCue')) {
+            label(cv, x, 70, 'Shift lights');
+            y = this.pickRow(cv, x, y, w, 'Shift lights', 'shiftCue', (v) => (v === 'rpm' ? 'Rpm band' : 'Count-in'));
+            note(cv, x, y + 22, this.get('shiftCue') === 'rpm' ? ['From a fixed rpm up to the shift point.'] : ['Fill over the last second, flash early', 'by your reaction time.']);
+            y += 84;
+        }
+        if (this.item('smartTemps')) {
+            label(cv, x, y, 'Temperatures');
+            y = this.toggleRow(cv, x, y + 14, w, 'Only when they matter', 'smartTemps');
+            note(cv, x, y + 22, ['Oil and coolant show only while cold,', 'warming up or hot. Outside: blue at ' + (sensors.imperial((x) => this.get(x), 'temp') ? '37 °F.' : '3 °C.')]);
+            y += 84;
+        }
+        if (this.item('navDirections')) {
+            label(cv, x, y, 'Directions');
+            y = this.pickRow(cv, x, y + 14, w, this.item('navDirections').label, 'navDirections');
+            note(cv, x, y + 22, ['The next turn, its distance and the lanes.', 'CarPlay with Apple Maps. Waze sends no turns.']);
+        }
     }
 
     /* ---------- G-meter (both) ---------- */
@@ -558,21 +623,39 @@ class Page {
     settingsTab(cv, bottom) {
         label(cv, CX, 70, 'Settings');
         const keys = this.cfg.settings.filter((k) => this.item(k));
-        const colW = (CW - 24) / 2, per = Math.ceil(keys.length / 2);
+        const colW = (CW - 24) / 2, half = Math.ceil(keys.length / 2);
+        // issue #8: the drive mode check (raw signal values, only the signals this app listens to: cfg.modeCheck)
+        // under the right column while "Change with the drive mode" is on
+        const diag = this.hud.modeDiagLines ? this.hud.modeDiagLines(this.cfg.modeCheck || []) : [];
+        // the page's room depends on the screen (bottom 512 without extra room below it): compact rows (46 high,
+        // 52 apart) when the full ones, the drive mode check and the status line don't all fit, tight ones (40, 46)
+        // when even those don't, and last one more row on the left with the rows 44 apart, so the check has room
+        // under the right column (Cluster Themes' 16 rows with the check on)
+        const fits = (h, pitch, per) => 84 + (per - 1) * pitch + h <= bottom - 24 &&
+            84 + (keys.length - per) * pitch + 10 + 20 * diag.length <= bottom - 24;
+        const tiers = [[56, 64, half], [46, 52, half], [40, 46, half], [40, 44, half + 1]];
+        const [h, pitch, per] = tiers.find((t) => fits(t[0], t[1], t[2])) || tiers[tiers.length - 1];
         keys.forEach((k, i) => {
-            const x = CX + (i < per ? 0 : colW + 24), y = 84 + (i % per) * 64;
-            if (y + 56 > bottom) return;
+            const x = CX + (i < per ? 0 : colW + 24), y = 84 + (i % per) * pitch;
+            if (y + h > bottom) return;
             const s = this.item(k);
-            if (s.type === 'bool') this.toggleRow(cv, x, y, colW, s.label, k);
-            else if (s.type === 'number') this.stepRow(cv, x, y, colW, s.label, k);
-            else this.pickRow(cv, x, y, colW, s.label, k);
+            if (s.type === 'bool') this.toggleRow(cv, x, y, colW, s.label, k, h);
+            else if (s.type === 'number') this.stepRow(cv, x, y, colW, s.label, k, null, h);
+            else this.pickRow(cv, x, y, colW, s.label, k, null, h);
         });
         // what the engine says it is doing (layers, pixel memory, why nothing shows): for checking on the car
-        cv.text(this.hud.lastStatus || '', CX, bottom - 6, 15, C.label, {});
+        cv.text(this.hud.lastStatus || '', CX, bottom - 6, 15, C.label, { literal: true });
+        const dy = 84 + (keys.length - per) * pitch + 10;
+        diag.forEach((t, i) => {
+            if (dy + 20 * i > bottom - 24) return;
+            // cut to the column (a long value would run off the screen)
+            while (t.length > 8 && cv.textWidth(t, 15, { literal: true }) > colW) t = t.slice(0, -1);
+            cv.text(t, CX + colW + 24, dy + 20 * i, 15, C.label, { literal: true });
+        });
     }
 
     /* ---------- rows ---------- */
-    /** A row's card (h: 56, or 46 for the compact ones); returns its text baseline. */
+    /** A row's card (h: 56, or 46 / 40 for the compact and tight ones); returns its text baseline. */
     rowBox(cv, x, y, w, name, h) {
         glass(cv, x, y, w, h, false);
         const base = y + h / 2 + 7;
@@ -597,14 +680,15 @@ class Page {
         cv.target(x, y, w, h, () => { this.picker = { key, title: name, fmt }; this.kick(); }, 'set:' + key, 14);
         return y + h + (h < 56 ? 6 : 8);
     }
-    stepRow(cv, x, y, w, name, key, fmt) {
-        this.rowBox(cv, x, y, w, name, 56);
+    stepRow(cv, x, y, w, name, key, fmt, h) {
+        h = h || 56;
+        const base = this.rowBox(cv, x, y, w, name, h);
         const s = this.item(key), steps = s.steps || [], i = steps.indexOf(this.get(key));
-        const bx = x + w - 66, ax = bx - 236;
-        stepBtn(cv, ax, y + 9, '-', i > 0, () => this.set(key, steps[i - 1]), 'dn:' + key);
-        cv.text(fmt ? fmt(this.get(key)) : this.valueText(key), ax + 140, y + 35, 19, C.blueHi, { align: 'center', font: 'bold' });
-        stepBtn(cv, bx, y + 9, '+', i < steps.length - 1, () => this.set(key, steps[i + 1]), 'up:' + key);
-        return y + 64;
+        const bx = x + w - 66, ax = bx - 236, by = y + (h - 38) / 2;
+        stepBtn(cv, ax, by, '-', i > 0, () => this.set(key, steps[i - 1]), 'dn:' + key);
+        cv.text(fmt ? fmt(this.get(key)) : this.valueText(key), ax + 140, base, 19, C.blueHi, { align: 'center', font: 'bold', literal: true });
+        stepBtn(cv, bx, by, '+', i < steps.length - 1, () => this.set(key, steps[i + 1]), 'up:' + key);
+        return y + h + (h < 56 ? 6 : 8);
     }
     chipRow(cv, x, y, w, name, key) {
         glass(cv, x, y, w, 64, false);
@@ -661,7 +745,7 @@ class Page {
 }
 
 /* ---------- small pieces ---------- */
-const LOOK_KEYS = ['hudLayout', 'inComfort', 'inSport', 'inEco'];
+const LOOK_KEYS = ['hudLayout', 'inComfort', 'inSport', 'inEco', 'inHybrid', 'inElectric'];
 const WARN_KEYS = ['warnOil', 'warnCoolant', 'warnBoost'];
 /** A warning limit as the page shows it, in the display units: "266 °F", "1.2 bar", "Off". */
 function warnText(k, v, us) {

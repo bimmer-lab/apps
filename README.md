@@ -1,6 +1,6 @@
 <h1 align="center">bimmer-lab apps</h1>
 
-[简体中文](README.zh-CN.md)
+[简体中文构建说明](README.zh-CN.md)
 
 <p align="center">Apps for BMW iDrive 7 head units (MGU), installed through the community MGU Store.</p>
 
@@ -10,7 +10,7 @@
 
 <img src="apps/cluster_themes/icon.png" width="72" align="left" alt="Cluster Themes icon">
 
-Redraws the whole instrument cluster in a theme of your choice: a GT3 race dash, an M-style cluster, a Sport view, Minimal, Roadster round dials, Track, Drag with a 0 to 60 timer, Rally with a G-meter, Retro 80s, Cruise, or Dyno, a tile dash in BMW M colours. Pick the theme on the center screen, or let it follow the SPORT / COMFORT / ECO PRO buttons. [Read more](apps/cluster_themes/README.md)
+Redraws the whole instrument cluster in a theme of your choice: a GT3 race dash, an M-style cluster, an M view like the newer M cars, Vector with a music panel, a Sport view, Minimal, Track, Drag with a 0 to 60 timer, Rally with a G-meter, Retro 80s, Cruise, Dyno, a tile dash in BMW M colours, or Ribbon, with holiday editions. Pick the theme on the center screen, or let it follow the SPORT / COMFORT / ECO PRO buttons. [Read more](apps/cluster_themes/README.md)
 
 <p align="center"><img src="docs/images/cluster-gt3-shift.png" width="900" alt="GT3 theme at the shift point"></p>
 <p align="center"><img src="docs/images/cluster-m.png" width="900" alt="M theme"></p>
@@ -49,7 +49,7 @@ Each app has its own page on the center screen, opened from the apps menu. Pick 
 
 1. Install **cluster-render** first. Both apps draw through it. It comes from the `robertnisipeanu/idrive-apps` Store source. With version 0.5.1 or newer, a cluster theme and a HUD layout can show at the same time.
 2. In the Store, go to **Settings, Add source**, enter **`bimmer-lab/apps`**, and install the apps you want.
-3. Open the app from the apps menu on the center screen to pick a theme or layout.
+3. Open the app from the apps menu on the center screen to pick a theme or layout. After that, both apps start with the car by themselves; you only open them again to change something. To have an app wait until you open it, turn off **Start with the car** on its Settings tab.
 4. The head unit's clock runs on UTC, so set **Settings, Time zone (clock)** to your zone once (for example US Eastern). Named zones change for daylight saving by themselves.
 
 The Store builds each app on the car from this repo. No BMW code is in it. Both apps are tested on a 2020 X3 M40i; each app's page says what has been checked on the car and what is still open. Version history is in [CHANGELOG.md](CHANGELOG.md).

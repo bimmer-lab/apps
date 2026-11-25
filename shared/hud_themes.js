@@ -76,6 +76,16 @@ const THEMES = {
         ink: [12, 12, 14, 255], accent: [226, 36, 44, 255], well: [0, 0, 0, 255], redTrack: [90, 16, 20, 255],
         chrome: [182, 188, 198, 255], grey: [160, 166, 176, 255], grey2: [104, 110, 122, 255], faint: [96, 104, 118, 255],
     },
+    // Vector (layout vector.json, design/gen_vector.py): black with grey bracket lines, white numbers, coloured rings.
+    vector: {
+        name: 'Vector',
+        fg: [238, 241, 246, 255], dim: [140, 148, 160, 255], track: [40, 43, 50, 255], arc: [238, 241, 246, 255],
+        glow: 0, stripe: false,
+        bar: { low: [238, 241, 246], mid: [238, 241, 246], high: [242, 31, 36], midAt: 'shift' },
+        rev: { from: [242, 31, 36], to: [242, 31, 36] },
+        bg: [0, 0, 0, 255], panel: [0, 0, 0, 255], line: [128, 135, 148, 255], head: [226, 228, 232, 255],
+        ink: [12, 12, 14, 255], accent: [242, 31, 36, 255], well: [0, 0, 0, 255], faint: [96, 104, 118, 255],
+    },
     // Minimal (layout minimal.json): white on black, nothing but the speed, the gear and a fuel line.
     minimal: {
         name: 'Minimal',
@@ -85,17 +95,6 @@ const THEMES = {
         rev: { from: [240, 243, 248], to: [240, 243, 248] },
         bg: [0, 0, 0, 255], panel: [0, 0, 0, 255], line: [70, 74, 82, 255], head: [226, 228, 232, 255],
         ink: [12, 12, 14, 255], accent: [240, 243, 248, 255], well: [0, 0, 0, 255],
-    },
-    // Roadster (layout roadster.json): two classic round dials, ivory numbers, a chrome ring, an orange needle.
-    roadster: {
-        name: 'Roadster',
-        fg: [246, 238, 222, 255], dim: [150, 146, 138, 255], track: [52, 50, 48, 255], arc: [255, 120, 40, 255],
-        glow: 0, stripe: false,
-        bar: { low: [246, 238, 222], mid: [255, 170, 60], high: [255, 42, 42], midAt: 'shift' },
-        rev: { from: [246, 238, 222], to: [246, 238, 222] },
-        bg: [0, 0, 0, 255], panel: [0, 0, 0, 255], line: [222, 226, 232, 255], head: [226, 228, 232, 255],
-        ink: [12, 12, 14, 255], accent: [255, 120, 40, 255], well: [0, 0, 0, 255],
-        chrome: [222, 226, 232, 255], chrome2: [96, 100, 108, 255], needle: [255, 96, 32, 255], face: [6, 6, 8, 255],
     },
     // Track (layout track.json): the race-dash frame of GT3 with amber headers, tyres and temps round a big gear.
     track: {
@@ -160,6 +159,77 @@ const THEMES = {
         bg: [0, 0, 0, 255], panel: [14, 17, 23, 255], line: [46, 56, 72, 255], head: [0, 150, 224, 255],
         ink: [12, 12, 14, 255], accent: [0, 150, 224, 255], well: [0, 0, 0, 255],
         bar1: [0, 150, 224, 255], bar2: [40, 92, 200, 255], warn: [226, 39, 46, 255],
+    },
+    // Ribbon (layout ribbon.json, Nov 13 2026): calm and premium. One ribbon of light under the hood line fills with the
+    // revs (cool white, warming to amber, red at the top), a huge thin speed, thin side columns. Extra roles: gear (the
+    // gear number), ribbon (the line's gradient), greeting (the {{holiday}} text). holidays: true = the holiday
+    // editions below (ribbon_<key>, shared/holidays.js) replace it while the "holiday" setting picks one.
+    ribbon: {
+        name: 'Ribbon',
+        fg: [244, 241, 234, 255], dim: [107, 122, 140, 255], track: [29, 39, 51, 255], arc: [201, 180, 138, 255],
+        glow: 0, stripe: false,
+        bar: { low: [159, 211, 255], mid: [255, 196, 107], high: [255, 42, 42], midAt: 'shift' },
+        rev: { from: [159, 211, 255], to: [255, 196, 107] },
+        bg: [0, 0, 0, 255], panel: [0, 0, 0, 255], line: [107, 122, 140, 255], head: [201, 180, 138, 255],
+        ink: [12, 12, 14, 255], accent: [201, 180, 138, 255], well: [0, 0, 0, 255], gear: [233, 215, 173, 255],
+        ribbon: { stops: [[159, 211, 255], [255, 255, 255], [255, 196, 107], [255, 90, 60], [255, 42, 42]], at: [0.55, 0.8, 0.93, 1] },
+        holidays: true,
+        deco: 0,
+        greeting: '',
+    },
+    ribbon_xmas: {
+        name: 'Ribbon · Christmas',
+        fg: [246, 241, 230, 255], dim: [127, 154, 136, 255], track: [29, 39, 51, 255], arc: [232, 194, 90, 255],
+        glow: 0, stripe: false,
+        bar: { low: [255, 58, 58], mid: [255, 211, 107], high: [255, 42, 42], midAt: 'shift' },
+        rev: { from: [255, 58, 58], to: [255, 211, 107] },
+        bg: [0, 0, 0, 255], panel: [0, 0, 0, 255], line: [127, 154, 136, 255], head: [232, 194, 90, 255],
+        ink: [12, 12, 14, 255], accent: [232, 194, 90, 255], well: [0, 0, 0, 255], gear: [232, 194, 90, 255],
+        ribbon: { stops: [[255, 58, 58], [47, 220, 106], [255, 211, 107], [79, 163, 255], [255, 26, 26]], at: [0.5, 0.8, 0.86, 1] },
+        bulbs: true,
+        wire: [31, 58, 42],
+        deco: 1,
+        decoColors: [[255, 255, 255], [255, 255, 255], [255, 255, 255]],
+        greeting: 'MERRY CHRISTMAS',
+    },
+    ribbon_thanks: {
+        name: 'Ribbon · Thanksgiving',
+        fg: [251, 238, 221, 255], dim: [160, 138, 112, 255], track: [29, 39, 51, 255], arc: [224, 135, 58, 255],
+        glow: 0, stripe: false,
+        bar: { low: [201, 162, 74], mid: [255, 154, 60], high: [255, 42, 42], midAt: 'shift' },
+        rev: { from: [201, 162, 74], to: [255, 154, 60] },
+        bg: [0, 0, 0, 255], panel: [0, 0, 0, 255], line: [160, 138, 112, 255], head: [224, 135, 58, 255],
+        ink: [12, 12, 14, 255], accent: [224, 135, 58, 255], well: [0, 0, 0, 255], gear: [224, 135, 58, 255],
+        ribbon: { stops: [[201, 162, 74], [255, 217, 160], [255, 154, 60], [224, 69, 31], [255, 42, 26]], at: [0.5, 0.8, 0.93, 1] },
+        deco: 5,
+        decoColors: [[224, 135, 58], [201, 80, 42], [217, 164, 65]],
+        greeting: 'HAPPY THANKSGIVING',
+    },
+    ribbon_newyear: {
+        name: 'Ribbon · New Year',
+        fg: [255, 248, 232, 255], dim: [154, 146, 126, 255], track: [29, 39, 51, 255], arc: [242, 207, 114, 255],
+        glow: 0, stripe: false,
+        bar: { low: [185, 162, 106], mid: [255, 210, 74], high: [255, 42, 42], midAt: 'shift' },
+        rev: { from: [185, 162, 106], to: [255, 210, 74] },
+        bg: [0, 0, 0, 255], panel: [0, 0, 0, 255], line: [154, 146, 126, 255], head: [242, 207, 114, 255],
+        ink: [12, 12, 14, 255], accent: [242, 207, 114, 255], well: [0, 0, 0, 255], gear: [242, 207, 114, 255],
+        ribbon: { stops: [[185, 162, 106], [255, 244, 214], [255, 210, 74], [255, 106, 58], [255, 42, 42]], at: [0.5, 0.8, 0.93, 1] },
+        deco: 4,
+        decoColors: [[242, 207, 114], [255, 255, 255], [217, 176, 74]],
+        greeting: 'HAPPY NEW YEAR',
+    },
+    ribbon_july4: {
+        name: 'Ribbon · Fourth of July',
+        fg: [244, 246, 255, 255], dim: [125, 140, 171, 255], track: [29, 39, 51, 255], arc: [255, 75, 75, 255],
+        glow: 0, stripe: false,
+        bar: { low: [58, 107, 255], mid: [255, 128, 128], high: [255, 42, 42], midAt: 'shift' },
+        rev: { from: [58, 107, 255], to: [255, 128, 128] },
+        bg: [0, 0, 0, 255], panel: [0, 0, 0, 255], line: [125, 140, 171, 255], head: [255, 75, 75, 255],
+        ink: [12, 12, 14, 255], accent: [255, 75, 75, 255], well: [0, 0, 0, 255], gear: [255, 75, 75, 255],
+        ribbon: { stops: [[58, 107, 255], [255, 255, 255], [255, 128, 128], [255, 51, 51], [255, 26, 26]], at: [0.5, 0.8, 0.93, 1] },
+        deco: 3,
+        decoColors: [[255, 75, 75], [111, 149, 255], [255, 255, 255]],
+        greeting: 'FOURTH OF JULY',
     },
 };
 // every theme: the shift-point red, used by "hot" (the gear and SHIFT at the shift point, the rev bar past it)

@@ -35,8 +35,11 @@ process.on('uncaughtException', (e) => { log.error('uncaught (the car would exit
 
 try { fs.mkdirSync(dataDir); } catch (e) { /* there */ }
 const { headUnit } = require(path.join(__dirname, '..', 'kit', 'tools', 'hu-stub.js'));
-const hu = headUnit(stage, { live: true, dataDir, log, image: () => Promise.resolve() });
+// BENCH_NO_SCREENS=1: started as the car starts an "autostart" app, without its screens (issue #16)
+const hu = headUnit(stage, { live: true, dataDir, log, image: () => Promise.resolve(), noScreens: process.env.BENCH_NO_SCREENS === '1' });
 const { spec, settings, ui } = hu;
+// a stand-in for BMW's guidance service (the HUD's directions), driven by POST /nav (fake-nav.js)
+const fakeNav = require('./fake-nav').install(hu, log);
 
 // the app's HudApp instance, for the values the page shows (hud.js is loaded by the app's main.js)
 let hud = null;
@@ -97,10 +100,24 @@ setInterval(() => {
     hu.feed('de.bmw.infotainment.drivingexcitement.FES', 'statusActualValueTorque2', { actualValueTorqueCrankshaft: raw('torque', num('torque', 0)) });
     hu.feed('de.bmw.infotainment.drivingexcitement.FES', 'statusSwitchDriveDynamicSport2', { displayBoostPressure: raw('boost', Math.max(0, num('boost', 0))) });
     hu.feed('de.bmw.infotainment.KombiIF', 'statusRangeTankStatus', { fluidLevelFuelTank: Math.round(num('fuelL', 40)), range: Math.round(num('range', 450)) });
+    // BMW's vehicle state (the switch-off guard, shared/vehicle_state.js), only when the POST carries `condition`
+    // (a number such as 10, 12, 5, or a name such as 'FAHREN'): without it the app sees no state, as on an older car
+    if (manual.condition !== undefined && manual.condition !== null) hu.feed('de.bmw.infrastructure.VehicleCondition', 'VehicleCondition', { statusConditionVehicle: manual.condition });
     hu.feed('de.bmw.infrastructure.EnvironmentalInformation', 'ExteriorTemperature', { temperatureExterior: Math.round((num('ambient', 22) + 40) / 0.5) });
     // the car's display units (bar, C), so the tyre values below read as 0.1 bar and C + 40; the shifter programme from `program` (S / M)
     hu.feed('de.bmw.infotainment.vehicle.Vehicle', 'statusNewCurrentUnitsStatusExt', { unitOfMeasurementAirPressure: 1, unitOfMeasurementTemperature: 1 });
+    // an M car's M Setup engine mode (issue #8), only when the POST carries `mEngine` (1 / 'KOMFORT', 2 / 'SPORT', 3 / 'SPORT_PLUS')
+    if (manual.mEngine !== undefined && manual.mEngine !== null) hu.feed('de.bmw.infotainment.misc.MDrive', 'controlDisplayMSystems', { controlDisplayEngineMode: manual.mEngine });
     hu.feed('de.bmw.infotainment.misc.MDrive', 'dataDisplayGearbox', { displayProgramGearbox: manual.program === 'S' ? 'S_MINUS_PROGRAMM' : manual.program === 'M' ? 'M_MINUS_PROGRAMM' : 'D_PROGRAMM' });
+    // now playing (HmiMediaState, as the head unit sends it), only when the POST carries `mediaTitle`;
+    // mediaElapsed / mediaTotal in seconds, sent as ms
+    if (typeof manual.mediaTitle === 'string') {
+        const MS = 'de.bmw.infotainment.hmi.hmimediastate.HmiMediaState';
+        hu.feed(MS, 'playerMetadata', { sink: 'FRONT', menuEntry: 1, trackId: 7, uiType: 'TWO_LINES', firstLineText: manual.mediaTitle,
+            firstLineType: 'TITLE', secondLineText: String(manual.mediaArtist || ''), secondLineType: 'ARTIST', threeRowText: '' });
+        hu.feed(MS, 'trackProgress', { sink: 'FRONT', menuEntry: 1, trackId: 7, elapsed: Math.round(num('mediaElapsed', 0) * 1000),
+            total: Math.round(num('mediaTotal', 0) * 1000), hasProgress: true, isSeekable: true });
+    }
     // tyres (TPMS, the fields the car answers a read with): pressure in 0.1 bar, temperature raw - 40 C; the rear pair a notch higher
     const tp = Math.round(num('tyreP', 2.3) * 10), tt = Math.round(num('tyreT', 24) + 40);
     hu.feed('de.bmw.infotainment.vehicle.TPMS', 'statusTyrePressure', { actualValuePressureTyreFLH: tp, actualValuePressureTyreFRH: tp, actualValuePressureTyreRLH: tp + 2, actualValuePressureTyreRRH: tp + 2 });
@@ -124,10 +141,15 @@ process.on('message', (m) => {
         manual = m.values || {};
         // demo drive = the kit's sim; manual = live data (auto: the sim gives way once data arrives)
         const want = mode === 'manual' ? 'off' : 'on';
+        // back to the demo drive: the manual car "stops" first (speed 0), else car.js would keep its last manual speed
+        // and, over 5 km/h, take it for a moving car (Demo data On gives way to a moving car)
+        if (mode !== 'manual') hu.feed('de.bmw.infotainment.vehicle.Vehicle2', 'statusCarSpeed2', { speedVehicleCentreOfGravity: 0 });
         if (settings.get('demo') !== want) press('demo', want);
     } else if (m.t === 'set') press(m.key, m.value);
     else if (m.t === 'drive') drive = m.value;
     else if (m.t === 'shiftTest' && hud) hud.testShift();
+    else if (m.t === 'nav') fakeNav.set(m.scenario);
+    else if (m.t === 'demo' && hud) { if (m.play) log.info('bench: play demo ' + (hud.playDemo(m.at) ? 'started' : 'refused (' + hud.demoBlocked() + ')')); else hud.stopDemo(); }
 });
 process.on('disconnect', () => process.exit(0));
 process.on('SIGTERM', () => process.exit(0));

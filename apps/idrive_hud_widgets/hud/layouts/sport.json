@@ -44,7 +44,7 @@
       "z": 10,
       "x": 130,
       "y": 164,
-      "w": 68,
+      "w": 108,
       "h": 17,
       "text": "{{slotHeadU:1}}",
       "font": "small",
@@ -52,13 +52,14 @@
       "align": "left",
       "spacing": 1.5,
       "toggle": "showOil",
-      "class": "content"
+      "class": "content",
+      "showWhen": "abnormal"
     },
     {
       "id": "oil",
       "type": "text",
       "z": 10,
-      "x": 205,
+      "x": 244,
       "y": 156,
       "w": 80,
       "h": 27,
@@ -71,7 +72,8 @@
       "fit": [
         "label"
       ],
-      "class": "overlay"
+      "class": "overlay",
+      "showWhen": "abnormal"
     },
     {
       "id": "coolant_label",
@@ -79,7 +81,7 @@
       "z": 10,
       "x": 130,
       "y": 200,
-      "w": 68,
+      "w": 108,
       "h": 17,
       "text": "{{slotHeadU:2}}",
       "font": "small",
@@ -87,13 +89,14 @@
       "align": "left",
       "spacing": 1.5,
       "toggle": "showCoolant",
-      "class": "content"
+      "class": "content",
+      "showWhen": "abnormal"
     },
     {
       "id": "coolant",
       "type": "text",
       "z": 10,
-      "x": 205,
+      "x": 244,
       "y": 192,
       "w": 80,
       "h": 27,
@@ -106,7 +109,8 @@
       "fit": [
         "label"
       ],
-      "class": "overlay"
+      "class": "overlay",
+      "showWhen": "abnormal"
     },
     {
       "id": "gear",
@@ -181,6 +185,33 @@
       "spacing": 1.5,
       "toggle": "showBoost",
       "class": "content"
+    },
+    {
+      "id": "nav",
+      "type": "nav",
+      "x": 470,
+      "y": 300,
+      "w": 200,
+      "h": 76,
+      "toggle": "!navDirections=off",
+      "class": "overlay",
+      "z": 20
+    },
+    {
+      "id": "greeting",
+      "type": "text",
+      "z": 10,
+      "x": 360,
+      "y": 330,
+      "w": 300,
+      "h": 20,
+      "text": "{{greeting}}",
+      "font": "label",
+      "color": "greet",
+      "align": "center",
+      "spacing": 1,
+      "navHide": true,
+      "class": "overlay"
     }
   ]
 }

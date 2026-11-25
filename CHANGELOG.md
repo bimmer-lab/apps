@@ -2,6 +2,117 @@
 
 Newest first. Dates are when the build was pushed.
 
+## Nov 24 2026
+
+- **Cluster Themes 0.19.10, HUD Widgets 0.15.9:** "Show Waze map inside the theme" works again. Waze on Cluster 0.10.10 and newer stopped taking the way the theme used to move its map, so no theme showed the map and the Map tab stayed on "Moving the map into the theme". The theme now asks cluster-render to show the map in its window, a way robertnisipeanu added after we asked (robertnisipeanu/idrive-apps#250). It needs Waze on Cluster 0.14.5 or newer and cluster-render 0.8.2 or newer. GT3, Sport, M, M view and Vector show the same part of the map as before. The holiday lights show again when a badge is set (on some themes they found no room). M view's top line now runs into its corner in one smooth sweep instead of bending suddenly. Not yet tested on a car.
+
+## Nov 22 2026
+
+- **Cluster Themes 0.19.9, HUD Widgets 0.15.8:** M view's scale lines are now perfectly round curves (before, they bent in small corners you could see on the car). The holiday lights were redone on every theme: they never cross a theme's own lines, hang the same on both sides, and leave out the short pieces that looked broken. On M view they hang between the two dials under the M stripes, and on Vector they no longer run into the rev counter or the music panel. Not yet tested on a car.
+
+## Nov 21 2026
+
+- **Cluster Themes 0.19.8:** Cruise's clock, range and outside temperature along the bottom are now as big as the fuel and oil figures, about twice their old height, so they read at a glance (issue #33). Not yet tested on a car.
+- **Cluster Themes 0.19.7, HUD Widgets 0.15.7:** plug-in hybrids get **In Hybrid** and **In Electric** next to Comfort, Sport and Eco Pro on the Themes tab (issue #31). Hybrid, Hybrid Eco Pro and Battery Control use the Hybrid theme, Electric uses the Electric one. Both start on "Same as the drive mode", so nothing changes until you pick one. They show once the car has sent a plug-in hybrid mode. The idea comes from FDX100's KurdBimmer Themes. Not yet tested on a car.
+- **Cluster Themes 0.19.6, HUD Widgets 0.15.6:** a **Start with the car** switch on the Settings tab, on by default. Turn it off and the app waits until you open it before it draws anything, as it did before 0.19.4. On smaller screens the Settings tab's rows sit a little closer together so all of them fit.
+- **Cluster Themes 0.19.5, HUD Widgets 0.15.5:** in Adaptive, the themes and layouts now say ADAPTIVE next to the gear instead of COMFORT (issue #29). Adaptive still uses your Comfort theme or layout.
+- **Cluster Themes 0.19.4, HUD Widgets 0.15.4: both apps start with the car** (issue #16). The car now starts them by itself when it starts, so the theme and the HUD layout come up without you opening the app first. You only need to open them to change something. Not yet tested on a car: if the theme doesn't come up by itself, or the app's page won't open after that, please say so in #16.
+- **Cluster Themes 0.19.3, HUD Widgets 0.15.3:** a safety net for installing. When the Store builds the app on your car, anything your car's software doesn't have (a signal, or one way of reading it) is now left out of that build, instead of the Store refusing the whole app as it did with 0.19.0. The app then runs without that one readout and says so in its log. Nothing changes on cars that have everything. This comes from the MGU App Kit, which alexpereap pointed to in #26. Not yet tested on a car.
+
+## Nov 20 2026
+
+- **Cluster Themes 0.19.2, HUD Widgets 0.15.2:**
+  - **Plug-in hybrids switch with the drive mode** (issue #31): Sport and Sport Plus pick your Sport theme or layout, Hybrid, Electric and Battery Control count as Comfort, and Hybrid Eco Pro as Eco Pro. Before, a plug-in hybrid's modes weren't recognised and nothing switched. Thanks to the reporter of #31 for finding the values on a 330e. Other cars switch as before.
+  - **Temperature and pressure units of their own** (issues #24, #32): two new settings under Units in Cluster Themes, Temperature (°C or °F) and Pressure (bar or psi), for mph with °C and psi as in the UK. Both start on Match speed, so nothing changes until you pick one. HUD Widgets keeps its one Units setting.
+  - **Leave BMW's bottom strip clear** (Cluster Themes, off by default): for cars where BMW still draws two black boxes over the theme, like M cars and the G22 4 Series (issues #11, #1). The theme then ends just above BMW's bottom strip, and BMW shows its own clock, range and outside temperature there. Nothing is squeezed or shrunk.
+  - The Settings tab's rows get a little shorter on smaller screens so all of them fit.
+  - Not yet tested on a car.
+- **Cluster Themes 0.19.1, HUD Widgets 0.15.1:** fixes the Store refusing to install 0.19.0 and 0.15.0 on some cars ("instance "1" is not on this unit"). The music panel now asks the car for the front screen's now playing by the name the car uses. Nothing else changes. Not yet tested on a car.
+
+## Nov 15 2026
+
+- **Cluster Themes 0.19.0, HUD Widgets 0.15.0:**
+  - **New theme: Vector,** a race-sim style dash with angled frames: a round segmented rev counter with the speed and gear inside, ring gauges for coolant, oil, fuel and boost, and boost, torque and power bars in the middle. With "Show Waze map inside the theme" on, the map shows in the middle instead of the bars.
+  - **Music panel (experimental):** Vector shows the song that is playing, with the title, artist and time, read from the car's own now playing. When nothing is playing, or your car doesn't send it, the panel shows average speed, peak boost and lateral G instead. So far this has only been tried on the bench, so please tell us in an issue whether it works with radio, Bluetooth, USB and CarPlay on your car.
+  - **M view:** closer to BMW's own M view. Dark panels inside both scales, the map window is now an oval that fades into the black, the speed in the other unit sits under the line (km/h under mph, or the other way round), and the red glow by the needle shows even when parked.
+  - **HUD Widgets: two new layouts.** M view: the rev bar, a big gear with the drive mode, and the speed in the other unit next to BMW's own. Vector: shift lights, oil, coolant and boost rings, and the song playing (or range and outside temperature when nothing plays).
+  - Not yet tested on a car.
+- **HUD Widgets 0.14.9:** on Redline, two readouts showing the same long name (like TORQUE LB-FT in both) no longer run together into one line.
+- **Cluster Themes 0.18.1, HUD Widgets 0.14.8:**
+  - **Every theme redrawn for full screen.** Now that leaving BMW's gear letter uncovered keeps its black box away (0.17.8), the themes no longer leave room for it: the right side of each theme lines up with the left again, and everything reaches down to the theme's own clock, range and outside temperature row.
+  - **GT3:** the right column mirrors the left, the boxes are a little taller, and the Waze map window is wider.
+  - **Sport:** the brackets are taller, and the boost and coolant bar sits right above the bottom row.
+  - **Dyno:** Power and Torque are each two rows tall, in line with the grid.
+  - **Drag, Track, Rally, Retro 80s and Ribbon:** the right side mirrors the left, so the theme sits centred.
+  - **Retro 80s:** the clock, range and outside temperature are in seven-segment digits.
+  - **M, M view, Cruise and Minimal:** the range is centred in the bottom row.
+  - HUD Widgets: no change you will see.
+  - Not yet tested on a car.
+- **Cluster Themes 0.18.0, HUD Widgets 0.14.7:**
+  - **New theme: M view,** after the M view of the M3 / M5 Live Cockpit in Sport (issue #15). Speed on the left (0 to 200 mph or 0 to 330 km/h) and revs on the right (0 to 8000), each scale lit up to its needle, with the speed and gear in big figures, the drive mode under the gear, and fuel and oil temperature dials at the far edges. Pick it on the Themes tab.
+  - **M view and the Waze map:** the middle of the theme is a window for the map. It opens when the map shows and closes when it goes, without the theme redrawing.
+  - Thanks to Asksket, who drew the first version of this theme on their own branch; its shape and look are used here.
+  - The theme previews on the Themes tab now leave the same small gap over BMW's gear letter that the cluster does.
+  - HUD Widgets: no change you will see.
+  - Not yet tested on a car.
+
+## Nov 14 2026
+
+- **Cluster Themes 0.17.8, HUD Widgets 0.14.6:**
+  - **Roadster is gone.** If it was your theme, the cluster switches to GT3; pick another on the Themes tab.
+  - **M:** SPORT PLUS in the setup rows no longer gets cut off (it read SPORT PLL).
+  - **Full screen** covers a little more of BMW's drive mode, so no letter of it shows next to the gear letter.
+  - HUD Widgets: no change you will see.
+  - Not yet tested on a car.
+- **Cluster Themes 0.17.7, HUD Widgets 0.14.5:**
+  - **Full screen leaves only BMW's gear letter uncovered.** On a test car, 0.17.6 kept BMW's black box away by leaving the drive mode and gear letter open; now the theme also covers the drive mode and leaves just the gear letter. The theme's own drive mode still shows next to its gear.
+  - **Leave BMW's bottom strip clear is gone.** With BMW's gear letter uncovered, BMW no longer draws its black box (issue #5), so the switch has nothing left to fix. If you had it on, your theme goes full screen.
+  - HUD Widgets: no change you will see.
+  - Not yet tested on a car.
+- **Cluster Themes 0.17.6, HUD Widgets 0.14.4:**
+  - **Full screen leaves BMW's drive mode and gear letter uncovered.** On a test car, BMW drew its black box whenever a theme covered the gear letter in its bottom strip, and it went away once the strip was clear. Full screen now covers the strip on both sides of the drive mode and gear letter but leaves that spot open, to see if full screen can work without the box. If the box still shows on your car, turn on Leave BMW's bottom strip clear (issue #5); it goes away at the next gear change.
+  - **M:** the fuel and oil dials are cleaner. A sharp red line marks the level inside the glass, the unlit glass shows faintly above it, the glass and the bezel end on the same line, and the °F and oil can sit clear of the bezel.
+  - **Sport:** the theme reaches further down, so the gap above BMW's strip is gone. The boost and coolant bar sits just above it.
+  - HUD Widgets only gets the shared engine change.
+  - Not yet tested on a car.
+- **Cluster Themes 0.17.5, HUD Widgets 0.14.3:** **full screen is back as the default, and Leave BMW's bottom strip clear is back as a switch.** Every theme fills the whole cluster again and shows its own clock, range and outside temperature along the bottom, in the theme's style. Turn on Leave BMW's bottom strip clear on the Settings tab and the theme ends just above BMW's own strip (the 0.17 look), without the squeeze that uncovered BMW's gauges before 0.17.4. If BMW draws a black box over the theme on your car, try the switch: owners found that leaving the strip clear stops it (issue #5). Both apps also stop logging a false "still stalled" warning after cluster-render restarts (a car log showed the layers were on screen the whole time); that is the only change in HUD Widgets. Not yet tested on a car.
+- **Cluster Themes 0.17.4, HUD Widgets 0.14.2:** M cars now switch with the drive mode (issue #8). The apps read the mode M Setup shows, so Efficient uses your In Comfort pick and Sport and Sport+ use In Sport. Thanks to the reporter of issue #8 for pointing to the signal, found by the idv7lol project and tested there on an X4 M Competition. On other cars nothing changes. The drive mode check on the Settings tab now shows that signal. **Leave BMW's bottom strip clear is gone:** since 0.17.0 every theme already ends above BMW's strip, and the setting only squeezed the theme further up, which uncovered the bottoms of BMW's own gauges. If you had it on, the theme goes back to its normal size. Not yet tested on a car.
+- **Cluster Themes 0.17.3, HUD Widgets 0.14.1:** fixes from a code review.
+  - **Readout names and values no longer get cut off.** Some picks on the Readouts tab could lose letters or digits: a clock or 4-digit value in M's readouts, LAST SHIFT in M, TORQUE LB-FT in GT3, Rally and the HUD's Sport and Redline, LB-FT next to a value in GT3 and the HUD's Daily. Every box now fits every readout. On M, Last shift is called SHIFTED, the readouts sit a little further left so LB-FT clears the rev blade, and with the Waze map on a clock or 4-digit value uses smaller digits. On the HUD's Sport layout the values sit a little further right.
+  - **Drive mode check (issue #8):** all four lines now fit on every screen; before, only the first one showed on some screens. The Settings rows get slightly shorter to make room when needed. HUD Widgets lists only the two signals it reads, and the check does no work while Change with the drive mode is off.
+  - **Play demo on the calibration screens** (Calibration grid and Map calibration, the HUD's grid and Window calibration) shows the DEMO tag again.
+  - Not yet tested on a car.
+
+## Nov 13 2026
+
+- **Cluster Themes 0.17.2:** a drive mode check for M cars (issue #8). With Change with the drive mode on, the Settings tab lists what the car sends on four signals, so an M owner can photograph it in Efficient, Sport and Sport+ and the M modes can be added. Nothing else changes.
+- **Cluster Themes 0.17.1:** Badge: added the 545e (issue #10).
+- **Cluster Themes 0.17.0, HUD Widgets 0.14.0:**
+  - **Cleaner cluster themes:** every theme now ends just above BMW's own bottom strip, so the car's range, clock, street, drive mode and outside temperature always show and no theme repeats them. Every theme shows the drive mode next to the gear. Readouts that used to show the clock, range or outside temperature now show fuel (GT3, Roadster, Rally), torque and power (Roadster), or your shift point and last shift (Dyno). Ribbon shows your average speed in their place, Cruise shows oil, coolant and rpm, and Drag, Track and Minimal gained fuel, oil or coolant.
+  - **M:** the tyre block is gone. In its place are four readouts, boost, coolant, oil and intake air out of the box, each one changeable on the Readouts tab. The four setup rows sit together where the M8 has them, and the badge moved off the M stripes. With the Waze map on, the blades keep their shape and numbers and move out to the sides, the map fills the middle, and the gear, speed and drive mode sit in a row under it.
+  - **Sport:** a big speed in the middle with the gear and drive mode under it, over a road like BMW's own Sport view whose lane dashes run towards you at your speed. The fuel and oil bars moved up the brackets, and the boost and coolant bar sits higher, clear of BMW's strip.
+  - **M and Sport no longer leave a gap for BMW's black gear box.** It may be a leftover of a coding change; if your car still draws it, it can cover part of the right side.
+  - **Holiday lights:** a string of glowing lights along the top of every cluster theme and the HUD while a holiday edition is on (Christmas, Thanksgiving, New Year, Fourth of July). They twinkle gently only while you're stopped. The Cluster Themes setting is now called **Holiday editions** and covers every theme, not just Ribbon.
+  - **Play demo starts faster:** it no longer reloads the layout to start or stop.
+  - **Time zone names:** BMW's own settings list now shows the zone names (Not set (UTC), US Eastern, UTC+5:30 and so on) instead of number codes.
+  - Not yet tested on a car.
+- **Cluster Themes 0.16.0, HUD Widgets 0.13.0:**
+  - **Directions on the HUD:** while a route runs, the next turn, its distance and the street or lanes show in a corner of every HUD layout, with "then" for a turn close behind and roundabout exits. Ported from Redline (cauliflowermossgrape/idrive7-apps, MIT). Works with CarPlay and Apple Maps; Waze over CarPlay sends the car no turns. Setting: While a route runs / Near turns / Off.
+  - **Play demo:** a button on both apps' pages plays a 60-second show on the HUD or cluster while the car stands, with a DEMO tag. It stops as soon as the car moves, and nothing from it is kept. **Demo data On** now also switches back to the car's own data as soon as the car moves faster than 5 km/h.
+  - **Shift lights count in:** they fill over about the last second before the shift point however fast the revs climb, and flash early by your reaction time, learned from your upshifts. The old fixed rpm band is still a choice. From Redline.
+  - **Temperatures only when they matter** (off by default): oil and coolant only while cold, warming up or hot, coloured blue, yellow or red. The outside temperature turns blue at 3°C (37°F) and under.
+  - **Holiday colours on the HUD:** Christmas (red, green and gold, the shift lights as a string of bulbs, MERRY CHRISTMAS while stopped), Thanksgiving, New Year and the Fourth of July, by the date. Nothing moves on the glass.
+  - **Switch-off guard:** nothing new is put on the HUD or cluster while the car switches on or off, and the layers come down at switch-off, so cluster-render never counts a strike against the display. From Redline.
+  - **Lighter G-meter:** the same picture with less than half the GPU uniforms, kept well inside what the cluster's graphics handle safely.
+  - **Halloween is gone** from Ribbon's holiday editions. If you had picked it, Ribbon shows in its normal colours.
+- **Cluster Themes 0.15.0, HUD Widgets 0.12.9:** a new Ribbon theme, calm and premium. One ribbon of light runs along under the top edge of the cluster and fills with the revs, cool white warming to amber and red, with a dot and a number at every thousand. The speed sits in the middle in big thin numbers, the gear in a small frame above it, and oil, coolant and boost on the left with range, fuel and outside temperature on the right. Ribbon has holiday editions: Christmas (the ribbon becomes a string of coloured bulbs that light up with the revs, with falling snow), Halloween, Thanksgiving, New Year and the Fourth of July, each with its own colours, a little artwork and a greeting. A new setting, **Holiday editions**, picks one or leaves it on Auto (the default), which puts on the right one by the date and goes back to plain Ribbon after. With Leave room for the driver camera on, the ribbon dips under the camera instead of being cut. The numbers use the Outfit font (SIL OFL, credit in NOTICE). HUD Widgets only gets the shared engine update. Not yet tested on a car.
+- **Cluster Themes 0.14.9, HUD Widgets 0.12.8:** quieter logs. A layer that takes a moment to appear after a theme or layout loads (its pixels are still on their way to cluster-render) is normal and is no longer logged as a warning. The apps now warn only when a layer is still missing after 5 seconds, naming the part of the layout, and note when it shows up.
+- **Cluster Themes 0.14.8:** a new setting, off by default: **Leave room for the driver camera**, for newer cars with a camera in the top middle of the cluster. The shift lights and rev bars of GT3, Track, Dyno and Rally become two mirrored wings either side of the camera that fill from the outer ends in towards it, Track's rpm numbers are left out and M's logo is hidden. Not yet tested on a car with a camera; please report how it lines up on yours.
+
+## Nov 12 2026
+
+- **Cluster Themes 0.14.7, HUD Widgets 0.12.7:** shift grades updated to match Redline 2.0.40. LIMITER now means within 25 rpm of the redline (it was 60, which caught good shifts near the shift point). Only shifts aimed at the shift point are graded: an everyday shift more than 1500 rpm under it, or one the gearbox made itself in D or S, is left out and the last grade stays on screen. When Redline 2.0.28 or newer is running, the shift lights and grades use Redline's own shift point for the gear you're in (it learns one per gear) and its grade, read from the file Redline shares for other apps (thanks @biscotit, issue #4). Without Redline, nothing changes.
+
 ## Nov 11 2026
 
 - **Cluster Themes 0.14.6, HUD Widgets 0.12.6:** the Time zone (clock) setting now also lists named zones (US Eastern, Central, Mountain, Pacific, Alaska, Hawaii, Arizona, Canada Atlantic, Mexico, UK / Ireland / Portugal, Central Europe, Eastern Europe). A named zone switches to and from daylight saving by itself, so you set it once. The plain UTC offsets are still there for everywhere else. Night colours (Auto) now works out sunset for the zone you pick instead of one fixed US city. The apps' reads from the car's control units (boost, intake, fuel %, hybrid battery) now go through the kit's read-only link, which refuses anything that isn't a read before it leaves the head unit. New Cluster Themes setting, off by default: **Leave BMW's bottom strip clear** draws the theme only above BMW's own bottom strip (range, clock, belt light, P), squeezed to fit. One M car owner found that leaving the strip clear stopped BMW drawing black boxes over the theme (issue #5). Not yet tested on a car with this setting; please report how it works on yours. HUD Widgets now makes way for Redline: while Redline holds the HUD, HUD Widgets draws nothing, and it comes back by itself when Redline lets go (it uses the kit's HUD claim, the same one Cluster functions uses).
